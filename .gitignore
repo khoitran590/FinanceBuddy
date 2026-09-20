@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit/*
+!.streamlit/config.toml
+data/*.db
+.DS_Store
