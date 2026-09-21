@@ -1,23 +1,36 @@
 from __future__ import annotations
 
 import json
+import time
+import uuid
 from datetime import date
 
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 
 from src.domain.models import Budget, CategoryRule, SavingsGoal
+from src.repositories.plaid_repo import PlaidRepository
 from src.repositories.transaction_repo import TransactionRepository
 from src.services.analytics import AnalyticsService
 from src.services.categorizer import CATEGORIES, categorize_with_custom_rules
 from src.services.parser import BankStatementParser
+from src.services.plaid_service import PlaidConfig, PlaidConfigurationError, PlaidService
+from src.services.production import validate_production_configuration
+from src.services.security import (
+    AuthenticationError,
+    protect_database_file,
+    safe_display_name,
+    user_database_path,
+)
 from src.ui.charts import (
-    make_category_bar_chart,
+    make_category_donut_chart,
     make_category_heatmap,
     make_comparison_category_chart,
     make_comparison_delta_chart,
     make_comparison_summary_chart,
     make_monthly_bar_chart,
+    make_profit_loss_line_chart,
 )
 from src.ui.components import (
     format_currency,
@@ -30,11 +43,108 @@ from src.ui.components import (
     transaction_frame,
     transactions_to_csv,
 )
+from src.ui.plaid_link import render_plaid_link
 
 
+load_dotenv()
 st.set_page_config(page_title="FinanceBuddy", page_icon="💸", layout="wide")
 inject_app_styles()
-repo = TransactionRepository()
+
+
+def _streamlit_secrets():
+    try:
+        return dict(st.secrets)
+    except Exception:
+        return {}
+
+
+app_secrets = _streamlit_secrets()
+production_errors = validate_production_configuration(app_secrets)
+if production_errors:
+    st.title("💸 FinanceBuddy")
+    st.error("FinanceBuddy cannot start because its production configuration is incomplete.")
+    for production_error in production_errors:
+        st.write(f"• {production_error}")
+    st.caption("No secret values are displayed. Correct the named settings and restart the service.")
+    st.stop()
+
+auth_config = app_secrets.get("auth")
+if not auth_config:
+    st.title("💸 FinanceBuddy")
+    st.error("Account security must be configured before FinanceBuddy can be used.")
+    st.caption(
+        "The administrator must configure an OIDC provider such as Auth0. Passwords, sign-up, "
+        "verification, recovery, and optional MFA are handled by that provider—not this app."
+    )
+    st.code(
+        "cp .streamlit/secrets.toml.example .streamlit/secrets.toml",
+        language="bash",
+    )
+    st.stop()
+
+if not st.user.is_logged_in:
+    st.title("💸 FinanceBuddy")
+    st.subheader("Your finances stay private to your account")
+    st.write(
+        "Log in to open your private dashboard, or create an account through the secure "
+        "identity-provider screen. FinanceBuddy never stores your password."
+    )
+    login_column, signup_column = st.columns(2)
+    if login_column.button("Log in", type="primary", width="stretch"):
+        st.login()
+    if signup_column.button("Create account", width="stretch"):
+        st.login()
+    st.caption("Account creation, email verification, password recovery, and MFA are managed securely by the identity provider.")
+    st.stop()
+
+user_claims = dict(st.user)
+expires_at = user_claims.get("exp")
+if expires_at and float(expires_at) <= time.time():
+    st.warning("Your login expired. Please sign in again.")
+    st.logout()
+
+if user_claims.get("email_verified") is False:
+    if st.query_params.get("email_verified") == "1":
+        st.login()
+        st.stop()
+    st.title("💸 FinanceBuddy")
+    with st.container(border=True):
+        st.subheader("One last step: verify your email")
+        st.write(
+            "We sent a verification link to the email address used for this account. "
+            "Open that link, then return here to refresh your secure login."
+        )
+        st.markdown(
+            "1. Check your inbox and spam folder.\n"
+            "2. Open the **Verify email** link from Auth0.\n"
+            "3. Return here and continue below."
+        )
+        if st.button(
+            "I verified my email — continue",
+            type="primary",
+            width="stretch",
+            help="Refresh your Auth0 identity so FinanceBuddy can confirm the verified-email claim.",
+        ):
+            st.login()
+        st.caption(
+            "FinanceBuddy securely refreshes your signed identity. If your Auth0 session is still "
+            "active, you will continue to the dashboard automatically."
+        )
+    if st.button("Use a different account"):
+        st.logout()
+    st.stop()
+
+try:
+    current_user_db = user_database_path(user_claims)
+except AuthenticationError as error:
+    st.error(f"Secure account setup failed: {error}")
+    if st.button("Log out"):
+        st.logout()
+    st.stop()
+
+repo = TransactionRepository(current_user_db)
+plaid_repo = PlaidRepository(current_user_db)
+protect_database_file(current_user_db)
 
 
 def apply_custom_rules(transactions):
@@ -58,11 +168,31 @@ def sync_import_account_name() -> None:
         st.session_state.import_account_name = defaults[st.session_state.import_account_type]
 
 
+def clear_account_filter() -> None:
+    st.session_state.dashboard_accounts = []
+
+
+def select_all_accounts(account_options: list[str]) -> None:
+    st.session_state.dashboard_accounts = account_options
+
+
+def reset_dashboard_filters() -> None:
+    for key in (
+        "dashboard_dates",
+        "dashboard_accounts",
+        "dashboard_categories",
+        "dashboard_transaction_types",
+        "dashboard_search",
+        "dashboard_minimum_amount",
+    ):
+        st.session_state.pop(key, None)
+
+
 def render_onboarding() -> None:
     with st.container(border=True):
         heading, close = st.columns([5, 1])
         heading.subheader("Welcome to FinanceBuddy 👋")
-        heading.caption("Your financial data stays in the local SQLite database on this computer.")
+        heading.caption("Your financial data is isolated in the database assigned to your signed-in account.")
         if close.button(
             "Hide guide",
             help="Dismiss this guide. You can reopen it anytime with “How FinanceBuddy works.”",
@@ -105,7 +235,21 @@ def render_overview(transactions):
     with left:
         st.plotly_chart(make_monthly_bar_chart(monthly), width="stretch")
     with right:
-        st.plotly_chart(make_category_bar_chart(categories), width="stretch")
+        st.plotly_chart(
+            make_category_donut_chart(
+                {item["category"]: item["amount"] for item in categories}
+            ),
+            width="stretch",
+        )
+
+    st.plotly_chart(
+        make_profit_loss_line_chart(AnalyticsService.cumulative_cash_flow(transactions)),
+        width="stretch",
+    )
+    st.caption(
+        "Gain/loss is cumulative transaction cash flow from zero at the beginning of the selected "
+        "period. It is not an investment return or live account balance."
+    )
 
     uncategorized = next(
         (item for item in categories if item["category"] == "Uncategorized"), None
@@ -501,14 +645,176 @@ def render_compare():
     st.plotly_chart(make_comparison_delta_chart(comparisons), width="stretch")
 
 
+def render_bank_connections() -> None:
+    st.subheader("Connected banks")
+    st.caption(
+        "Connect through Plaid to import bank activity automatically. FinanceBuddy never receives "
+        "your bank username or password, and stored Plaid access tokens are encrypted."
+    )
+    config = PlaidConfig.from_sources(_streamlit_secrets())
+    if not config.is_configured:
+        st.info(
+            "Plaid is ready to use after its credentials are configured. Add `PLAID_CLIENT_ID`, "
+            "`PLAID_SECRET`, and `PLAID_ENV` to a local `.env` file or your deployment secrets."
+        )
+        with st.expander("Configuration example"):
+            st.code(
+                "PLAID_CLIENT_ID=your_client_id\n"
+                "PLAID_SECRET=your_production_secret\n"
+                "PLAID_ENV=production\n"
+                "PLAID_COUNTRY_CODES=US",
+                language="bash",
+            )
+        return
+
+    try:
+        service = PlaidService(config, plaid_repo, repo)
+    except (PlaidConfigurationError, ImportError) as error:
+        st.error(f"Plaid setup is incomplete: {error}")
+        return
+
+    client_user_id = repo.get_setting("plaid_client_user_id")
+    if not client_user_id:
+        client_user_id = str(uuid.uuid4())
+        repo.set_setting("plaid_client_user_id", client_user_id)
+
+    items = plaid_repo.get_items()
+    if items:
+        for item in items:
+            with st.container(border=True):
+                heading, status = st.columns([3, 1])
+                heading.markdown(f"**{item.institution_name}**")
+                account_count = len(plaid_repo.get_accounts(item.item_id))
+                last_sync = item.last_synced_at.replace("T", " ").replace("+00:00", " UTC") if item.last_synced_at else "Not synced yet"
+                heading.caption(f"{account_count} account(s) · Last sync: {last_sync}")
+                if item.status == "error":
+                    status.error("Needs attention")
+                    st.warning(item.error_message or "Reconnect this institution to continue syncing.")
+                else:
+                    status.success("Connected")
+
+                sync_col, repair_col = st.columns(2)
+                if sync_col.button(
+                    "Sync transactions",
+                    key=f"sync_{item.item_id}",
+                    type="primary",
+                    width="stretch",
+                    help="Fetch transactions added, changed, or removed since the last successful sync.",
+                ):
+                    try:
+                        result = service.sync_item(item.item_id)
+                        st.session_state.plaid_notice = (
+                            f"Sync complete: {result['added']} added, {result['modified']} updated, "
+                            f"and {result['removed']} removed."
+                        )
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Plaid sync failed: {service._friendly_error(error)}")
+
+                if repair_col.button(
+                    "Update connection",
+                    key=f"repair_{item.item_id}",
+                    width="stretch",
+                    help="Reopen Plaid to repair expired credentials or institution access.",
+                ):
+                    try:
+                        st.session_state.plaid_update_item = item.item_id
+                        st.session_state.plaid_link_token = service.update_link_token(
+                            item.item_id, client_user_id
+                        )
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Could not start update mode: {service._friendly_error(error)}")
+
+                with st.expander("Disconnect institution"):
+                    remove_transactions = st.checkbox(
+                        "Also remove imported transactions from these connected accounts",
+                        key=f"remove_tx_{item.item_id}",
+                    )
+                    confirmed = st.checkbox(
+                        "I understand this revokes FinanceBuddy's Plaid access",
+                        key=f"disconnect_confirm_{item.item_id}",
+                    )
+                    if st.button(
+                        "Disconnect",
+                        key=f"disconnect_{item.item_id}",
+                        disabled=not confirmed,
+                        help="Revoke the Plaid Item and remove its saved connection metadata.",
+                    ):
+                        try:
+                            deleted = service.remove_item(item.item_id, remove_transactions)
+                            st.session_state.plaid_notice = (
+                                f"Disconnected {item.institution_name}. Removed {deleted} transaction(s)."
+                            )
+                            st.rerun()
+                        except Exception as error:
+                            st.error(f"Could not disconnect: {service._friendly_error(error)}")
+    else:
+        st.info("No bank is connected yet. You can keep using statement imports alongside Plaid.")
+
+    if st.session_state.get("plaid_notice"):
+        st.success(st.session_state.pop("plaid_notice"))
+
+    st.markdown("#### Add another institution")
+    if "plaid_link_token" not in st.session_state:
+        if st.button(
+            "Prepare secure connection",
+            type="primary",
+            help="Create a short-lived Plaid Link session before choosing your institution.",
+        ):
+            try:
+                st.session_state.plaid_update_item = None
+                st.session_state.plaid_link_token = service.create_link_token(client_user_id)
+                st.rerun()
+            except Exception as error:
+                st.error(f"Could not start Plaid Link: {service._friendly_error(error)}")
+    else:
+        updating = st.session_state.get("plaid_update_item")
+        result = render_plaid_link(
+            st.session_state.plaid_link_token,
+            button_label="Update bank connection" if updating else "Choose a bank",
+            key=f"plaid_link_{updating or 'new'}",
+        )
+        success = getattr(result, "success", None)
+        link_error = getattr(result, "error", None)
+        if success:
+            try:
+                if updating:
+                    st.session_state.plaid_notice = "Bank connection updated. You can sync again now."
+                else:
+                    item = service.exchange_public_token(
+                        success["public_token"], success.get("metadata")
+                    )
+                    sync_result = service.sync_item(item.item_id)
+                    st.session_state.plaid_notice = (
+                        f"Connected {item.institution_name}. Initial sync added "
+                        f"{sync_result['added']} transaction(s)."
+                    )
+                st.session_state.pop("plaid_link_token", None)
+                st.session_state.pop("plaid_update_item", None)
+                st.rerun()
+            except Exception as error:
+                st.session_state.pop("plaid_link_token", None)
+                st.error(f"Could not finish the Plaid connection: {service._friendly_error(error)}")
+        elif link_error:
+            st.error(link_error.get("message", "Plaid Link could not be completed."))
+            if st.button("Start a fresh connection"):
+                st.session_state.pop("plaid_link_token", None)
+                st.session_state.pop("plaid_update_item", None)
+                st.rerun()
+
+
 def render_import_and_data(all_transactions):
     render_feature_intro(
         "Import & data",
-        "Add statement activity, create or restore a portable backup, manage saved accounts, and review custom merchant-category rules.",
+        "Connect a bank with Plaid or add statement activity, create or restore a portable backup, manage saved accounts, and review custom merchant-category rules.",
     )
-    import_tab, backup_tab, account_tab, rule_tab = st.tabs(
-        ["Import statement", "Backup & restore", "Accounts", "Category rules"]
+    bank_tab, import_tab, backup_tab, account_tab, rule_tab = st.tabs(
+        ["Bank connections", "Import statement", "Backup & restore", "Accounts", "Category rules"]
     )
+    with bank_tab:
+        render_bank_connections()
+
     with import_tab:
         st.subheader("Import a statement")
         st.caption("Files stay local. Review parsed rows before saving anything.")
@@ -674,9 +980,14 @@ def render_import_and_data(all_transactions):
             st.info("Rules saved from category corrections will appear here.")
 
 
-title_column, guide_column = st.columns([5, 1])
+title_column, account_column, guide_column = st.columns([4, 1, 1])
 title_column.title("💸 FinanceBuddy")
-title_column.caption("A private, local-first view of your money")
+title_column.caption("A private, account-isolated view of your money")
+account_column.caption(safe_display_name(user_claims))
+if account_column.button(
+    "Log out", help="End this browser's FinanceBuddy login session.", width="stretch"
+):
+    st.logout()
 if guide_column.button(
     "How it works",
     help="Open the getting-started guide and a short explanation of the main workflow.",
@@ -698,24 +1009,61 @@ if all_transactions:
         st.caption("These controls update the Overview, Transactions, and budget calculations together.")
         min_date = min(item.date for item in all_transactions)
         max_date = max(item.date for item in all_transactions)
+        account_options = sorted({item.account_name for item in all_transactions})
+        category_options = sorted({item.category for item in all_transactions})
+        clear_column, all_column = st.columns(2)
+        clear_column.button(
+            "Clear accounts",
+            on_click=clear_account_filter,
+            width="stretch",
+            help="Temporarily hide every account from Overview and Transactions.",
+        )
+        all_column.button(
+            "Select all",
+            on_click=select_all_accounts,
+            args=(account_options,),
+            width="stretch",
+            help="Include every account in Overview and Transactions.",
+        )
+        st.button(
+            "Reset overview & transactions",
+            on_click=reset_dashboard_filters,
+            width="stretch",
+            help="Restore the full date range, all accounts, all categories, and clear search and amount filters.",
+        )
         selected_dates = st.date_input(
-            "Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date
+            "Date range",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            key="dashboard_dates",
         )
         if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
             start_date, end_date = selected_dates
         else:
             start_date, end_date = min_date, max_date
-        account_options = sorted({item.account_name for item in all_transactions})
-        category_options = sorted({item.category for item in all_transactions})
-        selected_accounts = st.multiselect("Accounts", account_options, default=account_options)
-        selected_categories = st.multiselect("Categories", category_options, default=category_options)
+        selected_accounts = st.multiselect(
+            "Accounts", account_options, default=account_options, key="dashboard_accounts"
+        )
+        selected_categories = st.multiselect(
+            "Categories", category_options, default=category_options, key="dashboard_categories"
+        )
         selected_types = st.multiselect(
             "Transaction type",
             ["Income / credit", "Expense / purchase"],
             default=["Income / credit", "Expense / purchase"],
+            key="dashboard_transaction_types",
         )
-        search = st.text_input("Merchant search", placeholder="e.g. Costco")
-        minimum_amount = st.number_input("Minimum absolute amount", min_value=0.0, value=0.0, step=10.0)
+        search = st.text_input(
+            "Merchant search", placeholder="e.g. Costco", key="dashboard_search"
+        )
+        minimum_amount = st.number_input(
+            "Minimum absolute amount",
+            min_value=0.0,
+            value=0.0,
+            step=10.0,
+            key="dashboard_minimum_amount",
+        )
     filtered_transactions = AnalyticsService.filter_transactions(
         all_transactions,
         start_date,

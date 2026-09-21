@@ -119,6 +119,54 @@ class TransactionRepository:
             )
             return cursor.rowcount
 
+    def upsert_many(self, transactions: Iterable[Transaction]) -> int:
+        """Insert synced rows and refresh mutable fields without losing user categories."""
+        payload = [
+            (
+                transaction.id,
+                transaction.date.isoformat(),
+                transaction.description,
+                transaction.amount,
+                transaction.category,
+                transaction.account_name,
+                transaction.account_type,
+            )
+            for transaction in transactions
+        ]
+        if not payload:
+            return 0
+
+        with self._get_connection() as connection:
+            connection.executemany(
+                """
+                INSERT INTO transactions
+                    (id, date, description, amount, category, account_name, account_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    date = excluded.date,
+                    description = excluded.description,
+                    amount = excluded.amount,
+                    category = CASE
+                        WHEN transactions.category = 'Uncategorized' THEN excluded.category
+                        ELSE transactions.category
+                    END,
+                    account_name = excluded.account_name,
+                    account_type = excluded.account_type
+                """,
+                payload,
+            )
+        return len(payload)
+
+    def delete_many(self, transaction_ids: Iterable[str]) -> int:
+        ids = list(transaction_ids)
+        if not ids:
+            return 0
+        with self._get_connection() as connection:
+            cursor = connection.executemany(
+                "DELETE FROM transactions WHERE id = ?", [(item,) for item in ids]
+            )
+            return cursor.rowcount
+
     def count_existing_ids(self, transactions: Iterable[Transaction]) -> int:
         existing = self.get_existing_ids()
         return sum(transaction.id in existing for transaction in transactions)

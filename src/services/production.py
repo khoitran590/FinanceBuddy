@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Mapping
+from urllib.parse import urlparse
+
+
+def _section(values: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    section = values.get(name, {}) if hasattr(values, "get") else {}
+    return section if hasattr(section, "get") else {}
+
+
+def _value(section: Mapping[str, Any], key: str, env_name: str) -> str:
+    return str(os.getenv(env_name) or section.get(key) or "").strip()
+
+
+def validate_production_configuration(secrets: Mapping[str, Any]) -> list[str]:
+    """Return safe, field-level errors without exposing any configured secret."""
+    if os.getenv("FINANCEBUDDY_ENV", "development").lower() != "production":
+        return []
+
+    auth = _section(secrets, "auth")
+    plaid = _section(secrets, "plaid")
+    errors: list[str] = []
+
+    required = (
+        ("auth.client_id", _value(auth, "client_id", "AUTH_CLIENT_ID")),
+        ("auth.client_secret", _value(auth, "client_secret", "AUTH_CLIENT_SECRET")),
+        ("auth.server_metadata_url", _value(auth, "server_metadata_url", "AUTH_SERVER_METADATA_URL")),
+        ("plaid.client_id", _value(plaid, "client_id", "PLAID_CLIENT_ID")),
+        ("plaid.secret", _value(plaid, "secret", "PLAID_SECRET")),
+        ("plaid.token_encryption_key", _value(plaid, "token_encryption_key", "PLAID_TOKEN_ENCRYPTION_KEY")),
+    )
+    for field, value in required:
+        if not value:
+            errors.append(f"Missing required production setting: {field}.")
+
+    cookie_secret = _value(auth, "cookie_secret", "AUTH_COOKIE_SECRET")
+    if len(cookie_secret) < 32:
+        errors.append("auth.cookie_secret must contain at least 32 characters.")
+
+    for field, value in (
+        ("auth.redirect_uri", _value(auth, "redirect_uri", "AUTH_REDIRECT_URI")),
+        ("auth.server_metadata_url", _value(auth, "server_metadata_url", "AUTH_SERVER_METADATA_URL")),
+    ):
+        parsed = urlparse(value)
+        if parsed.scheme != "https" or parsed.hostname in {"localhost", "127.0.0.1"}:
+            errors.append(f"{field} must be a public HTTPS URL in production.")
+
+    plaid_environment = _value(plaid, "environment", "PLAID_ENV").lower()
+    if plaid_environment != "production":
+        errors.append("plaid.environment must be production.")
+
+    for field, value in (
+        ("plaid.redirect_uri", _value(plaid, "redirect_uri", "PLAID_REDIRECT_URI")),
+        ("plaid.webhook_url", _value(plaid, "webhook_url", "PLAID_WEBHOOK_URL")),
+    ):
+        if value and urlparse(value).scheme != "https":
+            errors.append(f"{field} must use HTTPS when configured.")
+
+    data_dir = os.getenv("FINANCEBUDDY_DATA_DIR", "")
+    if not data_dir or not Path(data_dir).is_absolute():
+        errors.append("FINANCEBUDDY_DATA_DIR must be an absolute persistent-disk path.")
+    elif Path(data_dir).exists() and not os.access(data_dir, os.W_OK):
+        errors.append("FINANCEBUDDY_DATA_DIR must be writable by the application user.")
+    return errors

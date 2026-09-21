@@ -80,7 +80,9 @@ class AnalyticsService:
             kind = "Income / credit" if transaction.amount > 0 else "Expense / purchase"
             if not start_date <= transaction.date <= end_date:
                 continue
-            if accounts and transaction.account_name not in accounts:
+            # An empty account selection intentionally means "show no accounts" so
+            # users can clear the dashboard before choosing another account.
+            if transaction.account_name not in accounts:
                 continue
             if categories and transaction.category not in categories:
                 continue
@@ -92,6 +94,25 @@ class AnalyticsService:
                 continue
             results.append(transaction)
         return results
+
+    @staticmethod
+    def cumulative_cash_flow(transactions: List[Transaction]) -> List[Dict[str, Any]]:
+        """Return daily cumulative net flow relative to the selected period's start."""
+        daily: Dict[date, float] = defaultdict(float)
+        for transaction in transactions:
+            daily[transaction.date] += transaction.amount
+        cumulative = 0.0
+        points = []
+        for transaction_date, amount in sorted(daily.items()):
+            cumulative += amount
+            points.append(
+                {
+                    "date": transaction_date,
+                    "pnl": round(cumulative, 2),
+                    "daily_change": round(amount, 2),
+                }
+            )
+        return points
 
     @staticmethod
     def monthly_breakdown(transactions: List[Transaction]) -> List[Dict[str, Any]]:

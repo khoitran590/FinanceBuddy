@@ -3,6 +3,7 @@ from typing import Any, Dict, List
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 
 
 FINANCIAL_COLORS = {
@@ -91,14 +92,106 @@ def make_category_donut_chart(category_data: Dict[str, float]):
         return _style_figure(px.pie(title="No Expense Data Available"))
 
     rows = [{"category": category, "amount": amount} for category, amount in category_data.items()]
-    figure = px.pie(
-        pd.DataFrame(rows),
-        names="category",
-        values="amount",
-        hole=0.45,
-        title="Spending by category",
-        color_discrete_sequence=CATEGORY_COLORS,
+    total = sum(item["amount"] for item in rows)
+    figure = go.Figure(
+        go.Pie(
+            labels=[item["category"] for item in rows],
+            values=[item["amount"] for item in rows],
+            hole=0.58,
+            sort=True,
+            direction="clockwise",
+            marker={
+                "colors": CATEGORY_COLORS,
+                "line": {"color": "#0B0F14", "width": 3},
+            },
+            textinfo="percent",
+            textposition="inside",
+            hovertemplate="<b>%{label}</b><br>$%{value:,.2f}<br>%{percent}<extra></extra>",
+        )
     )
+    figure.update_layout(
+        title="Spending by category",
+        legend={"orientation": "h", "y": -0.12, "x": 0.5, "xanchor": "center"},
+        annotations=[
+            {
+                "text": f"<span style='font-size:12px'>Total spent</span><br><b>${total:,.0f}</b>",
+                "x": 0.5,
+                "y": 0.5,
+                "showarrow": False,
+                "font": {"size": 18, "color": "#F8FAFC"},
+            }
+        ],
+    )
+    return _style_figure(figure)
+
+
+def make_profit_loss_line_chart(cumulative_data: List[Dict[str, Any]]):
+    """Render cumulative net flow with emerald gains and red losses around zero."""
+    if not cumulative_data:
+        return _style_figure(go.Figure().update_layout(title="No gain/loss data available"))
+
+    frame = pd.DataFrame(cumulative_data).sort_values("date")
+    expanded = [frame.iloc[0].to_dict()]
+    for index in range(1, len(frame)):
+        previous = frame.iloc[index - 1].to_dict()
+        current = frame.iloc[index].to_dict()
+        if previous["pnl"] * current["pnl"] < 0:
+            fraction = abs(previous["pnl"]) / (abs(previous["pnl"]) + abs(current["pnl"]))
+            previous_date = pd.Timestamp(previous["date"])
+            current_date = pd.Timestamp(current["date"])
+            expanded.append(
+                {
+                    "date": previous_date + (current_date - previous_date) * fraction,
+                    "pnl": 0.0,
+                    "daily_change": current["daily_change"],
+                }
+            )
+        expanded.append(current)
+    frame = pd.DataFrame(expanded)
+    positive = frame["pnl"].where(frame["pnl"] >= 0)
+    negative = frame["pnl"].where(frame["pnl"] <= 0)
+    custom_data = frame[["daily_change"]].to_numpy()
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=frame["date"],
+            y=positive,
+            customdata=custom_data,
+            mode="lines+markers",
+            name="Gain",
+            connectgaps=False,
+            line={"color": "#34D399", "width": 3, "shape": "linear"},
+            marker={"size": 7, "color": "#34D399"},
+            hovertemplate=(
+                "<b>%{x|%b %-d, %Y}</b><br>Cumulative gain: $%{y:,.2f}"
+                "<br>Daily change: $%{customdata[0]:,.2f}<extra></extra>"
+            ),
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=frame["date"],
+            y=negative,
+            customdata=custom_data,
+            mode="lines+markers",
+            name="Loss",
+            connectgaps=False,
+            line={"color": "#FB7185", "width": 3, "shape": "linear"},
+            marker={"size": 7, "color": "#FB7185"},
+            hovertemplate=(
+                "<b>%{x|%b %-d, %Y}</b><br>Cumulative loss: $%{y:,.2f}"
+                "<br>Daily change: $%{customdata[0]:,.2f}<extra></extra>"
+            ),
+        )
+    )
+    figure.add_hline(y=0, line_width=2, line_dash="dot", line_color="#94A3B8")
+    figure.update_layout(
+        title="Gain and loss across the selected period",
+        hovermode="x unified",
+        legend={"orientation": "h", "y": 1.08, "x": 1, "xanchor": "right"},
+    )
+    figure.update_xaxes(title_text="Date")
+    figure.update_yaxes(title_text="Cumulative net flow ($)", tickprefix="$", separatethousands=True)
     return _style_figure(figure)
 
 

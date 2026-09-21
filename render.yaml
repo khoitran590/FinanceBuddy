@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: financebuddy
+    runtime: docker
+    plan: starter
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: FINANCEBUDDY_ENV
+        value: production
+      - key: FINANCEBUDDY_DATA_DIR
+        value: /app/data
+      - key: PLAID_ENV
+        value: production
+      - key: PLAID_COUNTRY_CODES
+        value: US
+      - key: AUTH_REDIRECT_URI
+        sync: false
+      - key: AUTH_COOKIE_SECRET
+        sync: false
+      - key: AUTH_CLIENT_ID
+        sync: false
+      - key: AUTH_CLIENT_SECRET
+        sync: false
+      - key: AUTH_SERVER_METADATA_URL
+        sync: false
+      - key: PLAID_CLIENT_ID
+        sync: false
+      - key: PLAID_SECRET
+        sync: false
+      - key: PLAID_TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: PLAID_REDIRECT_URI
+        sync: false
+      - key: PLAID_WEBHOOK_URL
+        sync: false
+    disk:
+      name: financebuddy-data
+      mountPath: /app/data
+      sizeGB: 1

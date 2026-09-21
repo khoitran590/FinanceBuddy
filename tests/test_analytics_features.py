@@ -65,3 +65,25 @@ def test_filters_recurring_anomalies_and_forecast():
     assert AnalyticsService.recurring_expenses(transactions)[0]["merchant"] == "Streaming"
     assert AnalyticsService.unusual_expenses(transactions)[0].description == "Large purchase"
     assert AnalyticsService.cash_flow_forecast(transactions)["months"] == 2
+
+
+def test_empty_account_filter_clears_dashboard_and_cash_flow_accumulates():
+    transactions = [
+        make_transaction("1", date(2026, 1, 1), 1000.0, "Payroll", "Salary/Income"),
+        make_transaction("2", date(2026, 1, 2), -250.0, "Rent", "Housing"),
+    ]
+
+    filtered = AnalyticsService.filter_transactions(
+        transactions,
+        date(2026, 1, 1),
+        date(2026, 1, 31),
+        [],
+        ["Salary/Income", "Housing"],
+        ["Income / credit", "Expense / purchase"],
+    )
+
+    assert filtered == []
+    assert AnalyticsService.cumulative_cash_flow(transactions) == [
+        {"date": date(2026, 1, 1), "pnl": 1000.0, "daily_change": 1000.0},
+        {"date": date(2026, 1, 2), "pnl": 750.0, "daily_change": -250.0},
+    ]

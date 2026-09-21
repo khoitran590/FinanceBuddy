@@ -4,5 +4,10 @@ __pycache__/
 .pytest_cache/
 .streamlit/*
 !.streamlit/config.toml
+!.streamlit/secrets.toml.example
+.env
+.env.*
+!.env.example
 data/*.db
+data/**/*.db
 .DS_Store
