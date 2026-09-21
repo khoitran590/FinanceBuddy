@@ -10,18 +10,21 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from src.domain.models import Budget, CategoryRule, SavingsGoal
-from src.repositories.plaid_repo import PlaidRepository
-from src.repositories.transaction_repo import TransactionRepository
+from src.repositories.supabase_repo import (
+    SupabasePlaidRepository,
+    SupabaseTransactionRepository,
+)
 from src.services.analytics import AnalyticsService
 from src.services.categorizer import CATEGORIES, categorize_with_custom_rules
 from src.services.parser import BankStatementParser
 from src.services.plaid_service import PlaidConfig, PlaidConfigurationError, PlaidService
 from src.services.production import validate_production_configuration
-from src.services.security import (
-    AuthenticationError,
-    protect_database_file,
-    safe_display_name,
-    user_database_path,
+from src.services.supabase import (
+    SupabaseAuth,
+    SupabaseConfig,
+    SupabaseDataClient,
+    SupabaseError,
+    normalized_session,
 )
 from src.ui.charts import (
     make_category_donut_chart,
@@ -68,13 +71,13 @@ if production_errors:
     st.caption("No secret values are displayed. Correct the named settings and restart the service.")
     st.stop()
 
-auth_config = app_secrets.get("auth")
-if not auth_config:
+supabase_config = SupabaseConfig.from_sources(app_secrets)
+if not supabase_config.is_configured:
     st.title("💸 FinanceBuddy")
-    st.error("Account security must be configured before FinanceBuddy can be used.")
+    st.error("Supabase must be configured before FinanceBuddy can be used.")
     st.caption(
-        "The administrator must configure an OIDC provider such as Auth0. Passwords, sign-up, "
-        "verification, recovery, and optional MFA are handled by that provider—not this app."
+        "Add the Supabase project URL and publishable key to Streamlit secrets. Supabase then "
+        "handles account creation, email verification, password recovery, and database security."
     )
     st.code(
         "cp .streamlit/secrets.toml.example .streamlit/secrets.toml",
@@ -82,69 +85,175 @@ if not auth_config:
     )
     st.stop()
 
-if not st.user.is_logged_in:
+auth = SupabaseAuth(supabase_config)
+
+
+def _save_supabase_session(payload: dict) -> None:
+    session_value = normalized_session(payload)
+    if not session_value["access_token"] or not session_value["refresh_token"]:
+        raise SupabaseError("Supabase did not return a complete login session.")
+    st.session_state.supabase_session = session_value
+
+
+def _clear_supabase_session() -> None:
+    st.session_state.pop("supabase_session", None)
+
+
+def _render_authentication() -> None:
     st.title("💸 FinanceBuddy")
     st.subheader("Your finances stay private to your account")
     st.write(
-        "Log in to open your private dashboard, or create an account through the secure "
-        "identity-provider screen. FinanceBuddy never stores your password."
+        "Log in or create an account with Supabase Auth. FinanceBuddy never stores your password, "
+        "and PostgreSQL row-level security keeps every financial record tied to your account."
     )
-    login_column, signup_column = st.columns(2)
-    if login_column.button("Log in", type="primary", width="stretch"):
-        st.login()
-    if signup_column.button("Create account", width="stretch"):
-        st.login()
-    st.caption("Account creation, email verification, password recovery, and MFA are managed securely by the identity provider.")
+    login_tab, signup_tab, recovery_tab = st.tabs(
+        ["Log in", "Create account", "Reset password"]
+    )
+    with login_tab:
+        with st.form("supabase_login"):
+            login_email = st.text_input("Email", autocomplete="email")
+            login_password = st.text_input(
+                "Password", type="password", autocomplete="current-password"
+            )
+            login_submitted = st.form_submit_button(
+                "Log in", type="primary", width="stretch"
+            )
+        if login_submitted:
+            try:
+                _save_supabase_session(
+                    auth.sign_in(login_email.strip().lower(), login_password)
+                )
+                st.rerun()
+            except SupabaseError as error:
+                st.error(str(error))
+
+    with signup_tab:
+        with st.form("supabase_signup"):
+            signup_email = st.text_input("Email", autocomplete="email", key="signup_email")
+            signup_password = st.text_input(
+                "Password",
+                type="password",
+                autocomplete="new-password",
+                key="signup_password",
+            )
+            signup_confirmation = st.text_input(
+                "Confirm password",
+                type="password",
+                autocomplete="new-password",
+                key="signup_confirmation",
+            )
+            signup_submitted = st.form_submit_button(
+                "Create secure account", width="stretch"
+            )
+        if signup_submitted:
+            if len(signup_password) < 12:
+                st.error("Use at least 12 characters for your password.")
+            elif signup_password != signup_confirmation:
+                st.error("The passwords do not match.")
+            else:
+                try:
+                    response = auth.sign_up(signup_email.strip().lower(), signup_password)
+                    if response.get("access_token"):
+                        _save_supabase_session(response)
+                        st.rerun()
+                    st.session_state.pending_verification_email = signup_email.strip().lower()
+                    st.success(
+                        "Account created. Enter the verification code from the FinanceBuddy email below."
+                    )
+                except SupabaseError as error:
+                    st.error(str(error))
+        if st.session_state.get("pending_verification_email"):
+            with st.form("verify_signup"):
+                verification_code = st.text_input("Email verification code")
+                verify_submitted = st.form_submit_button(
+                    "Verify and continue", type="primary", width="stretch"
+                )
+            if verify_submitted:
+                try:
+                    _save_supabase_session(
+                        auth.verify_signup_otp(
+                            st.session_state.pending_verification_email,
+                            verification_code.strip(),
+                        )
+                    )
+                    st.session_state.pop("pending_verification_email", None)
+                    st.rerun()
+                except SupabaseError as error:
+                    st.error(str(error))
+        with st.expander("Didn't receive the verification email?"):
+            resend_email = st.text_input("Account email", key="resend_email")
+            if st.button("Resend verification email", width="stretch"):
+                try:
+                    auth.resend_signup_email(resend_email.strip().lower())
+                    st.success("If that account exists, Supabase sent another verification email.")
+                except SupabaseError as error:
+                    st.error(str(error))
+
+    with recovery_tab:
+        st.caption("Request a recovery code, then enter the code and a new password below.")
+        with st.form("request_recovery"):
+            recovery_email = st.text_input("Account email", key="recovery_email_input")
+            request_code = st.form_submit_button("Send recovery email", width="stretch")
+        if request_code:
+            try:
+                auth.send_recovery_email(recovery_email.strip().lower())
+                st.session_state.recovery_email = recovery_email.strip().lower()
+                st.success("Check your inbox for the Supabase recovery code.")
+            except SupabaseError as error:
+                st.error(str(error))
+        if st.session_state.get("recovery_email"):
+            with st.form("finish_recovery"):
+                recovery_code = st.text_input("Recovery code")
+                new_password = st.text_input(
+                    "New password", type="password", autocomplete="new-password"
+                )
+                reset_submitted = st.form_submit_button(
+                    "Set new password", type="primary", width="stretch"
+                )
+            if reset_submitted:
+                if len(new_password) < 12:
+                    st.error("Use at least 12 characters for your password.")
+                else:
+                    try:
+                        session_payload = auth.verify_recovery_otp(
+                            st.session_state.recovery_email, recovery_code.strip()
+                        )
+                        auth.update_password(session_payload["access_token"], new_password)
+                        _save_supabase_session(session_payload)
+                        st.session_state.pop("recovery_email", None)
+                        st.rerun()
+                    except (KeyError, SupabaseError) as error:
+                        st.error(str(error))
+    st.caption(
+        "Authentication is provided by Supabase. Session tokens remain only in this Streamlit browser session."
+    )
+
+
+session = st.session_state.get("supabase_session")
+user = None
+if session:
+    try:
+        if int(session.get("expires_at", 0)) <= time.time() + 60:
+            _save_supabase_session(auth.refresh(session["refresh_token"]))
+            session = st.session_state.supabase_session
+        user = auth.get_user(session["access_token"])
+    except (KeyError, SupabaseError):
+        _clear_supabase_session()
+        session = None
+
+if not session or not user:
+    _render_authentication()
     st.stop()
 
-user_claims = dict(st.user)
-expires_at = user_claims.get("exp")
-if expires_at and float(expires_at) <= time.time():
-    st.warning("Your login expired. Please sign in again.")
-    st.logout()
-
-if user_claims.get("email_verified") is False:
-    if st.query_params.get("email_verified") == "1":
-        st.login()
-        st.stop()
-    st.title("💸 FinanceBuddy")
-    with st.container(border=True):
-        st.subheader("One last step: verify your email")
-        st.write(
-            "We sent a verification link to the email address used for this account. "
-            "Open that link, then return here to refresh your secure login."
-        )
-        st.markdown(
-            "1. Check your inbox and spam folder.\n"
-            "2. Open the **Verify email** link from Auth0.\n"
-            "3. Return here and continue below."
-        )
-        if st.button(
-            "I verified my email — continue",
-            type="primary",
-            width="stretch",
-            help="Refresh your Auth0 identity so FinanceBuddy can confirm the verified-email claim.",
-        ):
-            st.login()
-        st.caption(
-            "FinanceBuddy securely refreshes your signed identity. If your Auth0 session is still "
-            "active, you will continue to the dashboard automatically."
-        )
-    if st.button("Use a different account"):
-        st.logout()
+user_id = str(user.get("id") or "")
+if not user_id:
+    _clear_supabase_session()
+    st.error("Supabase returned an invalid user identity. Please log in again.")
     st.stop()
 
-try:
-    current_user_db = user_database_path(user_claims)
-except AuthenticationError as error:
-    st.error(f"Secure account setup failed: {error}")
-    if st.button("Log out"):
-        st.logout()
-    st.stop()
-
-repo = TransactionRepository(current_user_db)
-plaid_repo = PlaidRepository(current_user_db)
-protect_database_file(current_user_db)
+data_client = SupabaseDataClient(supabase_config, session["access_token"])
+repo = SupabaseTransactionRepository(data_client, user_id)
+plaid_repo = SupabasePlaidRepository(data_client, user_id)
 
 
 def apply_custom_rules(transactions):
@@ -983,11 +1092,24 @@ def render_import_and_data(all_transactions):
 title_column, account_column, guide_column = st.columns([4, 1, 1])
 title_column.title("💸 FinanceBuddy")
 title_column.caption("A private, account-isolated view of your money")
-account_column.caption(safe_display_name(user_claims))
+user_metadata = user.get("user_metadata") or {}
+account_column.caption(
+    str(
+        user_metadata.get("full_name")
+        or user_metadata.get("name")
+        or user.get("email")
+        or "Your account"
+    )
+)
 if account_column.button(
     "Log out", help="End this browser's FinanceBuddy login session.", width="stretch"
 ):
-    st.logout()
+    try:
+        auth.sign_out(session["access_token"])
+    except SupabaseError:
+        pass
+    _clear_supabase_session()
+    st.rerun()
 if guide_column.button(
     "How it works",
     help="Open the getting-started guide and a short explanation of the main workflow.",

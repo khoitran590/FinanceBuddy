@@ -1,6 +1,6 @@
 # FinanceBuddy
 
-FinanceBuddy is an authenticated personal finance dashboard built with Python, Streamlit, SQLite, Pandas, and Plotly.
+FinanceBuddy is an authenticated personal finance dashboard built with Python, Streamlit, Supabase PostgreSQL, Pandas, and Plotly.
 
 The project follows Clean Architecture so the domain models, parser, categorizer, analytics, and repository can be mapped to Swift, SwiftData, and SwiftUI later without moving business logic out of the UI.
 
@@ -14,36 +14,52 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 streamlit run app.py
 ```
 
-Each authenticated OIDC identity receives a separate SQLite database under `data/users/`. Database paths are derived from a hash of the provider issuer and immutable subject—not an email or browser-supplied value—and are not committed to Git.
+## Supabase setup and authentication
 
-## Login and account creation
+FinanceBuddy uses one Supabase project for authentication and durable PostgreSQL storage.
+No Supabase secret/service-role key is used by the app. Each database request carries the
+signed-in user's short-lived access token, so PostgreSQL row-level security is the final
+authority for every read and write.
 
-FinanceBuddy requires OIDC authentication before any dashboard, transaction, backup, or Plaid code is available. Auth0 is a suitable provider because its Universal Login screen supports login, account creation, email verification, password recovery, breached-password protection, and MFA without FinanceBuddy storing passwords.
+1. Create a Supabase project and open **SQL Editor**.
+2. Run `supabase/migrations/202609200001_financebuddy.sql` once.
+3. Under **Project Settings → API**, copy the project URL and publishable key. Do not use a
+   secret key or legacy `service_role` key.
+4. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set the project
+   URL, publishable key, and local `public_app_url`.
+5. Under **Authentication → URL Configuration**, set the Site URL to the deployed Render
+   URL and add both the deployed URL and `http://localhost:8501` to Redirect URLs.
+6. Keep **Confirm email** enabled. In both the confirmation and recovery email templates,
+   include the six-digit `{{ .Token }}` value so FinanceBuddy can verify the code and open
+   the dashboard immediately.
+7. Configure the existing SendGrid account under **Authentication → SMTP Settings**. Use
+   SendGrid host `smtp.sendgrid.net`, port `587`, username `apikey`, the SendGrid API key
+   as the password, and the verified From address.
 
-1. Create an Auth0 Regular Web Application and enable database or social connections for login and sign-up.
-2. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`.
-3. Set a long random `cookie_secret`, the Auth0 client ID and secret, and your tenant's metadata URL.
-4. Register `http://localhost:8501/oauth2callback` as a local callback URL. For deployment, replace it with the HTTPS deployment URL ending in `/oauth2callback` and register that exact URL with Auth0.
-5. Enable email verification and MFA in the Auth0 tenant before accepting real users.
-
-For the Auth0 **Verification Email** template, set **Redirect To** to
-`http://localhost:8501/?email_verified=1` locally, or the equivalent HTTPS deployment URL.
-FinanceBuddy detects that return marker, refreshes the signed OIDC identity, and opens the
-dashboard when Auth0 reports the email as verified.
-
-The **Log in** and **Create account** buttons both open the provider's secure Universal Login experience. FinanceBuddy validates the signed OIDC identity through Streamlit, rejects expired sessions and explicitly unverified email claims, provides logout on every authenticated page, and derives all storage access from the authenticated subject.
+Supabase Auth provides account creation, email verification, login, logout, token refresh,
+and password recovery. Session tokens live only in Streamlit session state; passwords and
+Supabase secret keys are never stored by FinanceBuddy.
 
 Security boundaries implemented by the app include:
 
 - Complete authentication gate before financial UI or data access
-- Per-user transaction, budget, goal, settings, backup, and Plaid storage
-- Non-PII, server-derived user database identifiers and Plaid `client_user_id` values
-- Owner-only database file permissions where supported by the operating system
+- Per-user transaction, budget, goal, settings, backup, and Plaid rows
+- PostgreSQL row-level security based on the immutable Supabase Auth user UUID
+- Explicit ownership filters in addition to database policies for defense in depth
 - Encrypted Plaid access tokens and server-side public-token exchange
 - CORS and cross-site request-forgery protection enabled in Streamlit
-- No application password database; password policy, recovery, verification, and MFA stay with the identity provider
+- No application password database; password hashing, recovery, verification, and optional MFA stay with Supabase Auth
 
-The earlier single-user database remains at `data/finance.db` and is not exposed to authenticated web users. Export or migrate that legacy profile deliberately before removing it; never make it a shared fallback database.
+The earlier local SQLite files are no longer used by the running app. Export them as a JSON
+backup and restore that backup after signing in to migrate legacy activity deliberately.
+
+```bash
+python -m scripts.export_sqlite data/finance.db financebuddy-backup.json
+```
+
+After logging in with the intended Supabase account, open **Import & data → Backup &
+restore** and upload that JSON file. This deliberately assigns the imported rows to that
+authenticated Supabase user; the migration never guesses account ownership.
 
 ## Dashboard features
 
@@ -92,40 +108,31 @@ python -m pytest
 
 ## Production deployment
 
-The included `Dockerfile` and `render.yaml` define a small-production deployment: the
-process runs as a non-root user, dependencies are pinned, health checks use Streamlit's
-health endpoint, secrets are assembled from environment variables at startup, and each
-user's SQLite database is stored on a persistent disk. Do not deploy this repository as
-a Vercel Next.js project.
+The included `Dockerfile` and `render.yaml` define a stateless free-tier Render deployment:
+the process runs as a non-root user, dependencies are pinned, health checks use Streamlit's
+health endpoint, secrets are assembled from environment variables at startup, and all
+durable state lives in Supabase.
 
-1. Create a Render Blueprint from this repository. The declared Starter service and its
-   persistent disk are paid resources; confirm the current Render pricing before creation.
-2. Set every secret environment variable prompted by the Blueprint. Generate
-   `AUTH_COOKIE_SECRET` and `PLAID_TOKEN_ENCRYPTION_KEY` independently, with at least
-   32 random bytes each. Never reuse or casually rotate the Plaid encryption key.
-3. Set `AUTH_REDIRECT_URI` to `https://YOUR_HOST/oauth2callback`. Add that exact value to
-   Auth0's Allowed Callback URLs, add `https://YOUR_HOST` to Allowed Logout URLs and
-   Allowed Web Origins, and change the verification-email **Redirect To** URL to
-   `https://YOUR_HOST/?email_verified=1`. Remove localhost URLs from the production Auth0 app.
+1. Create a Render Blueprint from this repository. It declares the free web-service plan
+   and does not request a disk or payment method.
+2. Set `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, and `PUBLIC_APP_URL`. `PUBLIC_APP_URL`
+   must be the final HTTPS `onrender.com` URL.
+3. Set `PLAID_CLIENT_ID`, `PLAID_SECRET`, and a stable random
+   `PLAID_TOKEN_ENCRYPTION_KEY`. Never reuse or casually rotate the encryption key.
 4. Keep `PLAID_ENV=production`; use the Production secret supplied for the Plaid Trial.
    Register `PLAID_REDIRECT_URI` if OAuth institutions are enabled. Set
    `PLAID_WEBHOOK_URL` to a separate HTTPS webhook receiver if you enable automatic
    Transactions updates; Link tokens will register it with Plaid.
-5. Enable Auth0 email verification, breached-password protection, and MFA before inviting
-   real users. Configure SendGrid domain authentication for production mail delivery.
+5. Enable Supabase email verification and configure SendGrid custom SMTP before inviting
+   real users. Enable the available CAPTCHA, rate limits, and MFA policies.
 6. Verify login, email verification, Plaid Link, sync, disconnect, export, and restore on
-   the deployed HTTPS URL. Configure backups or disk snapshots for `/app/data`.
+   the deployed HTTPS URL. Export periodic encrypted backups; Supabase Free does not include
+   automatic database backups and may pause after low activity.
 
-Required production variables are `AUTH_REDIRECT_URI`, `AUTH_COOKIE_SECRET`,
-`AUTH_CLIENT_ID`, `AUTH_CLIENT_SECRET`, `AUTH_SERVER_METADATA_URL`, `PLAID_CLIENT_ID`,
-`PLAID_SECRET`, and `PLAID_TOKEN_ENCRYPTION_KEY`. The app refuses to start in production
-when these are missing, Auth/Plaid URLs are unsafe, Plaid is not in Production, or the
-data directory is not an absolute persistent-disk path.
-
-This SQLite design intentionally supports one running service instance. Render persistent
-disks are attached to one instance, so do not enable horizontal scaling. Migrate the
-repositories to a managed PostgreSQL database before running multiple instances or before
-your expected user count exceeds a small private beta.
+Required production variables are `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`,
+`PUBLIC_APP_URL`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, and
+`PLAID_TOKEN_ENCRYPTION_KEY`. The app refuses to start when these are missing, Supabase or
+application URLs are unsafe, or Plaid is not in Production.
 
 ## CSV import behavior
 

@@ -11,11 +11,9 @@ def _quoted(value: str) -> str:
 
 def write_runtime_secrets() -> None:
     required = {
-        "AUTH_REDIRECT_URI": os.getenv("AUTH_REDIRECT_URI", ""),
-        "AUTH_COOKIE_SECRET": os.getenv("AUTH_COOKIE_SECRET", ""),
-        "AUTH_CLIENT_ID": os.getenv("AUTH_CLIENT_ID", ""),
-        "AUTH_CLIENT_SECRET": os.getenv("AUTH_CLIENT_SECRET", ""),
-        "AUTH_SERVER_METADATA_URL": os.getenv("AUTH_SERVER_METADATA_URL", ""),
+        "SUPABASE_URL": os.getenv("SUPABASE_URL", ""),
+        "SUPABASE_PUBLISHABLE_KEY": os.getenv("SUPABASE_PUBLISHABLE_KEY", ""),
+        "PUBLIC_APP_URL": os.getenv("PUBLIC_APP_URL", ""),
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
@@ -31,12 +29,10 @@ def write_runtime_secrets() -> None:
         "token_encryption_key": os.getenv("PLAID_TOKEN_ENCRYPTION_KEY", ""),
     }
     lines = [
-        "[auth]",
-        f"redirect_uri = {_quoted(required['AUTH_REDIRECT_URI'])}",
-        f"cookie_secret = {_quoted(required['AUTH_COOKIE_SECRET'])}",
-        f"client_id = {_quoted(required['AUTH_CLIENT_ID'])}",
-        f"client_secret = {_quoted(required['AUTH_CLIENT_SECRET'])}",
-        f"server_metadata_url = {_quoted(required['AUTH_SERVER_METADATA_URL'])}",
+        "[supabase]",
+        f"url = {_quoted(required['SUPABASE_URL'])}",
+        f"publishable_key = {_quoted(required['SUPABASE_PUBLISHABLE_KEY'])}",
+        f"public_app_url = {_quoted(required['PUBLIC_APP_URL'])}",
         "",
         "[plaid]",
     ]

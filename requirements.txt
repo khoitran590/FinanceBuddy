@@ -8,5 +8,4 @@ reportlab==5.0.1
 plaid-python==44.0.0
 python-dotenv==1.2.3
 cryptography==50.0.1
-Authlib==1.8.0
 httpx==0.28.1

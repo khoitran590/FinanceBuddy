@@ -14,6 +14,7 @@ def test_app_stops_at_authentication_boundary_without_exceptions():
         expected in message
         for expected in (
             "Account security must be configured",
+            "Supabase must be configured",
             "Your finances stay private to your account",
         )
         for message in messages

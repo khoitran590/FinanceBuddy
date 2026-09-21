@@ -4,7 +4,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     FINANCEBUDDY_ENV=production \
-    FINANCEBUDDY_DATA_DIR=/app/data \
     PORT=8501
 
 WORKDIR /app
@@ -18,7 +17,7 @@ COPY requirements.txt ./
 RUN python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
 COPY --chown=financebuddy:financebuddy . .
-RUN mkdir -p /app/data && chown -R financebuddy:financebuddy /app/data /app/.streamlit
+RUN chown -R financebuddy:financebuddy /app/.streamlit
 
 USER financebuddy
 EXPOSE 8501

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
@@ -20,14 +19,16 @@ def validate_production_configuration(secrets: Mapping[str, Any]) -> list[str]:
     if os.getenv("FINANCEBUDDY_ENV", "development").lower() != "production":
         return []
 
-    auth = _section(secrets, "auth")
+    supabase = _section(secrets, "supabase")
     plaid = _section(secrets, "plaid")
     errors: list[str] = []
 
     required = (
-        ("auth.client_id", _value(auth, "client_id", "AUTH_CLIENT_ID")),
-        ("auth.client_secret", _value(auth, "client_secret", "AUTH_CLIENT_SECRET")),
-        ("auth.server_metadata_url", _value(auth, "server_metadata_url", "AUTH_SERVER_METADATA_URL")),
+        ("supabase.url", _value(supabase, "url", "SUPABASE_URL")),
+        (
+            "supabase.publishable_key",
+            _value(supabase, "publishable_key", "SUPABASE_PUBLISHABLE_KEY"),
+        ),
         ("plaid.client_id", _value(plaid, "client_id", "PLAID_CLIENT_ID")),
         ("plaid.secret", _value(plaid, "secret", "PLAID_SECRET")),
         ("plaid.token_encryption_key", _value(plaid, "token_encryption_key", "PLAID_TOKEN_ENCRYPTION_KEY")),
@@ -36,13 +37,12 @@ def validate_production_configuration(secrets: Mapping[str, Any]) -> list[str]:
         if not value:
             errors.append(f"Missing required production setting: {field}.")
 
-    cookie_secret = _value(auth, "cookie_secret", "AUTH_COOKIE_SECRET")
-    if len(cookie_secret) < 32:
-        errors.append("auth.cookie_secret must contain at least 32 characters.")
-
     for field, value in (
-        ("auth.redirect_uri", _value(auth, "redirect_uri", "AUTH_REDIRECT_URI")),
-        ("auth.server_metadata_url", _value(auth, "server_metadata_url", "AUTH_SERVER_METADATA_URL")),
+        ("supabase.url", _value(supabase, "url", "SUPABASE_URL")),
+        (
+            "supabase.public_app_url",
+            _value(supabase, "public_app_url", "PUBLIC_APP_URL"),
+        ),
     ):
         parsed = urlparse(value)
         if parsed.scheme != "https" or parsed.hostname in {"localhost", "127.0.0.1"}:
@@ -59,9 +59,4 @@ def validate_production_configuration(secrets: Mapping[str, Any]) -> list[str]:
         if value and urlparse(value).scheme != "https":
             errors.append(f"{field} must use HTTPS when configured.")
 
-    data_dir = os.getenv("FINANCEBUDDY_DATA_DIR", "")
-    if not data_dir or not Path(data_dir).is_absolute():
-        errors.append("FINANCEBUDDY_DATA_DIR must be an absolute persistent-disk path.")
-    elif Path(data_dir).exists() and not os.access(data_dir, os.W_OK):
-        errors.append("FINANCEBUDDY_DATA_DIR must be writable by the application user.")
     return errors
