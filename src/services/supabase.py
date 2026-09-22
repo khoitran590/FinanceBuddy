@@ -165,10 +165,15 @@ class SupabaseDataClient:
         params: Optional[dict[str, str]] = None,
         payload: Any = None,
         prefer: Optional[str] = None,
+        range_start: Optional[int] = None,
+        range_end: Optional[int] = None,
     ) -> list[dict]:
         headers = dict(self.headers)
         if prefer:
             headers["Prefer"] = prefer
+        if range_start is not None and range_end is not None:
+            headers["Range-Unit"] = "items"
+            headers["Range"] = f"{range_start}-{range_end}"
         try:
             response = self.client.request(
                 method,
@@ -191,7 +196,19 @@ class SupabaseDataClient:
         return data if isinstance(data, list) else [data]
 
     def select(self, table: str, **params: str) -> list[dict]:
-        return self.request("GET", table, params={"select": "*", **params})
+        page_size = 1000
+        rows: list[dict] = []
+        while True:
+            page = self.request(
+                "GET",
+                table,
+                params={"select": "*", **params},
+                range_start=len(rows),
+                range_end=len(rows) + page_size - 1,
+            )
+            rows.extend(page)
+            if len(page) < page_size:
+                return rows
 
     def insert(self, table: str, payload: list[dict], *, ignore_duplicates: bool = False) -> list[dict]:
         prefer = "return=representation"

@@ -56,6 +56,21 @@ def test_data_client_sends_user_jwt_for_rls():
     assert client.select("transactions", user_id="eq.user-1") == []
 
 
+def test_data_client_pages_through_large_history():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers["range"])
+        size = 1000 if len(calls) == 1 else 1
+        return httpx.Response(200, json=[{"id": str(index)} for index in range(size)])
+
+    config = SupabaseConfig("https://project.supabase.co", "sb_publishable_test")
+    client = SupabaseDataClient(config, "user-jwt", transport=httpx.MockTransport(handler))
+
+    assert len(client.select("transactions", user_id="eq.user-1")) == 1001
+    assert calls == ["0-999", "1000-1999"]
+
+
 class RecordingDataClient:
     def __init__(self):
         self.inserted = []
