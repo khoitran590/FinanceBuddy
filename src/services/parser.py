@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from charset_normalizer import from_bytes
 
 from src.domain.models import ParseMetrics, Transaction
+from src.services.security import MAX_UPLOAD_BYTES
 from src.services.categorizer import auto_categorize, generate_tx_id
 
 
@@ -88,6 +89,10 @@ def _normalize_amount(amount: float, description: str, account_type: str) -> flo
 
 class BankStatementParser:
     """Parse common bank CSV variants with an 80% validity gate."""
+
+    @staticmethod
+    def _rejected(message: str):
+        return [], ParseMetrics(total_rows=0, valid_rows=0, skipped_rows=0, accuracy_rate=0.0, is_valid=False, errors=[message])
 
     @staticmethod
     def detect_encoding(raw_bytes: bytes) -> str:
@@ -294,17 +299,23 @@ class BankStatementParser:
         account_name: str,
         account_type: str = "Checking",
     ) -> Tuple[List[Transaction], ParseMetrics]:
+        if len(raw_bytes) > MAX_UPLOAD_BYTES:
+            return cls._rejected("Statement exceeds the 10 MB limit.")
         encoding = cls.detect_encoding(raw_bytes)
         try:
             text = raw_bytes.decode(encoding)
         except (LookupError, UnicodeDecodeError):
             text = raw_bytes.decode("latin-1", errors="replace")
 
-        raw_rows = [
-            row
-            for row in csv.reader(io.StringIO(text), dialect=cls.detect_dialect(text[:65536]))
-            if any(cell.strip() for cell in row)
-        ]
+        raw_rows = []
+        try:
+            for row in csv.reader(io.StringIO(text), dialect=cls.detect_dialect(text[:65536])):
+                if any(cell.strip() for cell in row):
+                    raw_rows.append(row)
+                if len(raw_rows) > 50_001:
+                    return cls._rejected("Statement exceeds the 50,000-row limit.")
+        except csv.Error:
+            return cls._rejected("The statement contains an invalid or oversized CSV field.")
         return cls._parse_rows(raw_rows, account_name, account_type=account_type)
 
     @classmethod
@@ -320,6 +331,8 @@ class BankStatementParser:
         partially imported. OCR can be added later without changing the
         repository or analytics layers.
         """
+        if len(raw_bytes) > MAX_UPLOAD_BYTES:
+            return cls._rejected("Statement exceeds the 10 MB limit.")
         try:
             import pdfplumber
         except ImportError:
@@ -336,6 +349,8 @@ class BankStatementParser:
         text_parts: List[str] = []
         try:
             with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+                if len(pdf.pages) > 100:
+                    return cls._rejected("PDF exceeds the 100-page limit. Split it into smaller statements.")
                 for page in pdf.pages:
                     try:
                         for table in page.extract_tables() or []:
@@ -360,7 +375,7 @@ class BankStatementParser:
                 skipped_rows=0,
                 accuracy_rate=0.0,
                 is_valid=False,
-                errors=[f"Could not read PDF: {error}"],
+                errors=["Could not read this PDF. Use a text-based PDF or export a CSV from your bank."],
             )
 
         table_result = (
@@ -416,5 +431,7 @@ class BankStatementParser:
     ) -> Tuple[List[Transaction], ParseMetrics]:
         """Dispatch an uploaded statement to the matching document parser."""
         if filename.lower().endswith(".pdf"):
-            return cls.parse_pdf(raw_bytes, account_name, account_type)
+            from src.services.pdf_worker import parse_pdf_bounded
+
+            return parse_pdf_bounded(raw_bytes, account_name, account_type)
         return cls.parse(raw_bytes, account_name, account_type)

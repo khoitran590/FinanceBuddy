@@ -21,8 +21,11 @@ No Supabase secret/service-role key is used by the app. Each database request ca
 signed-in user's short-lived access token, so PostgreSQL row-level security is the final
 authority for every read and write.
 
-1. Create a Supabase project and open **SQL Editor**.
-2. Run `supabase/migrations/202609200001_financebuddy.sql` once.
+1. Create a Supabase project and link it with `supabase link --project-ref <project-ref>`.
+2. Apply the checked-in migrations with `supabase db push --linked --skip-vault` before
+   deploying this version of the app. For an existing project where the first migration
+   was applied manually, verify its schema before marking it applied in migration history;
+   do not run that schema migration a second time.
 3. Under **Project Settings → API**, copy the project URL and publishable key. Do not use a
    secret key or legacy `service_role` key.
 4. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set the project
@@ -73,7 +76,7 @@ authenticated Supabase user; the migration never guesses account ownership.
 - Editable categories, reusable merchant rules, and split transactions
 - Monthly budgets, savings goals, recurring-charge detection, unusual-expense review, and a simple cash-flow estimate
 - Comparison of up to six statements with automatic date ordering
-- Multi-account append or account-scoped replacement with import preview, duplicate detection, confirmation, and undo
+- Multi-account append or account-scoped replacement with import preview, duplicate detection, and confirmation; a current-session undo is available for unchanged appended rows
 - Filtered CSV export plus full JSON backup and restore
 - Secure Plaid Link connections with encrypted access-token storage and incremental transaction sync
 - Interactive spending donut plus a zero-baseline gain/loss cash-flow chart
@@ -138,6 +141,10 @@ durable state lives in Supabase.
 6. Verify login, email verification, Plaid Link, sync, disconnect, export, and restore on
    the deployed HTTPS URL. Export periodic encrypted backups; Supabase Free does not include
    automatic database backups and may pause after low activity.
+7. Once this app version is deployed and Plaid connections have been tested, run the
+   reviewed cleanup in `supabase/staged/drop_public_plaid_token_after_app_rollout.sql`.
+   It removes the compatibility ciphertext column from the public Data API. Do not run it
+   while an older app version still reads that column.
 
 Required production variables are `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`,
 `PUBLIC_APP_URL`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, and
@@ -154,7 +161,7 @@ for a pilot but do not provide always-on availability or managed backup recovery
 
 The importer accepts CSV and text-based PDF statements. It detects common delimiters and encodings, extracts PDF tables or date-description-amount text rows, maps common bank header names, supports signed `Amount` or `Debit`/`Credit` columns, and refuses to commit an import when fewer than 80% of data rows are valid. Image-only/scanned PDFs are not supported yet because they require OCR.
 
-Choose `Checking` or `Credit Card` before importing. Credit-card purchases are normalized as outflows, while payments, refunds, and credits are normalized as inflows. The import preview reports its detected period, parsed and skipped rows, and exact duplicates. Appending is the default and ignores duplicates; replacement only clears the named account and can be undone during the current session.
+Choose `Checking` or `Credit Card` before importing. Credit-card purchases are normalized as outflows, while payments, refunds, and credits are normalized as inflows. The import preview reports its detected period, parsed and skipped rows, and exact duplicates. Appending is the default and ignores duplicates. The current-session undo removes only appended rows that have not changed since import. Replacement clears only the named account and is not undoable; download a backup first.
 
 The dashboard includes expanded categories, accessible cash-flow and category charts, a category share table, and an optional monthly category heatmap. Comparison statements are sorted automatically by their detected transaction dates.
 

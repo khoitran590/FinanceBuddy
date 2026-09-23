@@ -37,7 +37,10 @@ class SupabaseConfig:
 
     @property
     def is_configured(self) -> bool:
-        return self.url.startswith("https://") and bool(self.publishable_key)
+        from src.services.production import _is_privileged_supabase_key
+
+        return (self.url.startswith("https://") and bool(self.publishable_key)
+                and not _is_privileged_supabase_key(self.publishable_key))
 
 
 class SupabaseAuth:
@@ -70,10 +73,19 @@ class SupabaseAuth:
         if response.is_error:
             try:
                 payload = response.json()
-                message = payload.get("msg") or payload.get("message") or payload.get("error_description")
+                code = payload.get("code") or payload.get("error_code") if isinstance(payload, dict) else None
             except ValueError:
-                message = None
-            raise SupabaseError(str(message or "Supabase authentication request failed."))
+                code = None
+            messages = {
+                "invalid_credentials": "Email or password is incorrect.",
+                "email_not_confirmed": "Verify your email before logging in.",
+                "otp_expired": "This code or link has expired. Request a new one.",
+                "weak_password": "Choose a stronger password with at least 12 characters.",
+            }
+            message = messages.get(code, "Unable to complete sign-in or account update. Check your details and try again.")
+            if response.status_code == 429:
+                message = "Too many attempts. Wait a few minutes before trying again."
+            raise SupabaseError(message)
         return response.json() if response.content else {}
 
     def sign_in(self, email: str, password: str) -> dict:
@@ -197,11 +209,7 @@ class SupabaseDataClient:
         except httpx.RequestError as error:
             raise SupabaseError("Supabase data storage is temporarily unavailable.") from error
         if response.is_error:
-            try:
-                detail = response.json().get("message")
-            except ValueError:
-                detail = None
-            raise SupabaseError(str(detail or "Supabase database request failed."))
+            raise SupabaseError("Unable to complete the database request. Please try again.")
         if not response.content:
             return []
         data = response.json()
@@ -244,3 +252,10 @@ class SupabaseDataClient:
 
     def delete(self, table: str, **filters: str) -> list[dict]:
         return self.request("DELETE", table, params=filters, prefer="return=representation")
+
+    def rpc(self, name: str, payload: dict) -> Any:
+        """Call a database function once so all of its writes share a transaction."""
+        if not name.startswith("fb_") or not name.replace("_", "").isalnum():
+            raise ValueError("Invalid database operation.")
+        result = self.request("POST", f"rpc/{name}", payload=payload)
+        return result[0] if result else None

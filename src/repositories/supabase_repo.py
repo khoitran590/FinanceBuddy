@@ -4,9 +4,11 @@ import json
 from datetime import date
 from typing import Iterable, Optional
 
+from src.services.security import read_backup
+
 from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction
 from src.repositories.plaid_repo import PlaidItem
-from src.services.supabase import SupabaseDataClient
+from src.services.supabase import SupabaseDataClient, SupabaseError
 
 
 class SupabaseTransactionRepository:
@@ -88,10 +90,12 @@ class SupabaseTransactionRepository:
         return sum(item.id in existing for item in transactions)
 
     def replace_account(self, account_name: str, transactions: Iterable[Transaction]) -> int:
-        self.client.delete(
-            "transactions", user_id=self._owner, account_name=f"eq.{account_name}"
-        )
-        return self.insert_many(transactions)
+        rows = [self._transaction_payload(item) for item in transactions]
+        if any(row["account_name"] != account_name for row in rows):
+            raise ValueError("Statement account does not match the selected account.")
+        return int(self.client.rpc("fb_replace_transactions", {
+            "p_account": account_name, "p_rows": rows,
+        }))
 
     def update_category(self, transaction_id: str, category: str) -> None:
         self.client.update(
@@ -102,13 +106,9 @@ class SupabaseTransactionRepository:
         )
 
     def apply_category_rule(self, keyword: str, category: str) -> int:
-        rows = self.client.update(
-            "transactions",
-            {"category": category},
-            user_id=self._owner,
-            description=f"ilike.*{keyword.strip()}*",
-        )
-        return len(rows)
+        return int(self.client.rpc("fb_apply_category_rule", {
+            "p_keyword": keyword.strip(), "p_category": category,
+        }))
 
     def split_transaction(
         self,
@@ -118,32 +118,13 @@ class SupabaseTransactionRepository:
         second_category: str,
         second_amount: float,
     ) -> None:
-        original = next((item for item in self.get_all() if item.id == transaction_id), None)
-        if original is None:
-            raise ValueError("Transaction no longer exists.")
-        if abs((first_amount + second_amount) - abs(original.amount)) > 0.01:
-            raise ValueError("Split amounts must equal the original transaction amount.")
-        sign = -1 if original.amount < 0 else 1
-        splits = [
-            original.model_copy(
-                update={
-                    "id": f"{original.id}-split-1",
-                    "description": f"{original.description} (split 1)",
-                    "amount": sign * first_amount,
-                    "category": first_category,
-                }
-            ),
-            original.model_copy(
-                update={
-                    "id": f"{original.id}-split-2",
-                    "description": f"{original.description} (split 2)",
-                    "amount": sign * second_amount,
-                    "category": second_category,
-                }
-            ),
-        ]
-        self.insert_many(splits)
-        self.delete_many([transaction_id])
+        self.client.rpc("fb_split_transaction", {
+            "p_id": transaction_id,
+            "p_first_category": first_category,
+            "p_first_amount": first_amount,
+            "p_second_category": second_category,
+            "p_second_amount": second_amount,
+        })
 
     def get_budgets(self) -> list[Budget]:
         rows = self.client.select("budgets", user_id=self._owner, order="category.asc")
@@ -239,32 +220,43 @@ class SupabaseTransactionRepository:
         )
 
     def restore_backup(self, raw_json: bytes) -> dict:
-        data = json.loads(raw_json.decode("utf-8"))
-        if data.get("version") != 1:
-            raise ValueError("Unsupported FinanceBuddy backup version.")
+        data = read_backup(raw_json)
         transactions = [Transaction.model_validate(item) for item in data.get("transactions", [])]
         budgets = [Budget.model_validate(item) for item in data.get("budgets", [])]
         goals = [SavingsGoal.model_validate(item) for item in data.get("goals", [])]
         rules = [CategoryRule.model_validate(item) for item in data.get("category_rules", [])]
-        for table in ("transactions", "budgets", "savings_goals", "category_rules"):
-            self.client.delete(table, user_id=self._owner)
-        self.insert_many(transactions)
-        for budget in budgets:
-            self.upsert_budget(budget)
-        for goal in goals:
-            self.save_goal(goal.model_copy(update={"id": None}))
-        for rule in rules:
-            self.upsert_category_rule(rule)
-        return {
-            "transactions": len(transactions),
-            "budgets": len(budgets),
-            "goals": len(goals),
-            "category_rules": len(rules),
+        payload = {
+            "version": 1,
+            "transactions": [item.model_dump(mode="json") for item in transactions],
+            "budgets": [item.model_dump(mode="json") for item in budgets],
+            "goals": [item.model_dump(mode="json") for item in goals],
+            "category_rules": [item.model_dump(mode="json") for item in rules],
         }
+        return self.client.rpc("fb_restore_backup", {"p_backup": payload})
 
     def replace_all(self, transactions: Iterable[Transaction]) -> int:
-        self.client.delete("transactions", user_id=self._owner)
-        return self.insert_many(transactions)
+        return int(self.client.rpc("fb_replace_transactions", {
+            "p_account": None,
+            "p_rows": [self._transaction_payload(item) for item in transactions],
+        }))
+
+    def undo_append(self, transactions: Iterable[Transaction]) -> int:
+        return int(self.client.rpc("fb_undo_append", {
+            "p_rows": [self._transaction_payload(item) for item in transactions],
+        }))
+
+    def apply_plaid_sync(
+        self, item_id: str, expected_cursor: str | None, next_cursor: str,
+        upserts: Iterable[Transaction], removed_ids: Iterable[str], synced_at: str,
+    ) -> dict:
+        return self.client.rpc("fb_apply_plaid_sync", {
+            "p_item_id": item_id,
+            "p_expected_cursor": expected_cursor,
+            "p_next_cursor": next_cursor,
+            "p_synced_at": synced_at,
+            "p_upserts": [self._transaction_payload(item) for item in upserts],
+            "p_removed_ids": list(removed_ids),
+        })
 
 
 class SupabasePlaidRepository:
@@ -277,26 +269,16 @@ class SupabasePlaidRepository:
         return f"eq.{self.user_id}"
 
     def save_item(self, item_id: str, encrypted_access_token: str, institution_name: str) -> None:
-        self.client.upsert(
-            "plaid_items",
-            [{
-                "user_id": self.user_id,
-                "item_id": item_id,
-                "encrypted_access_token": encrypted_access_token,
-                "institution_name": institution_name,
-                "status": "connected",
-                "error_message": None,
-            }],
-            "user_id,item_id",
-        )
+        self.client.rpc("fb_save_plaid_item", {
+            "p_item_id": item_id,
+            "p_encrypted_access_token": encrypted_access_token,
+            "p_institution_name": institution_name,
+        })
 
     def save_accounts(self, item_id: str, accounts: list[dict]) -> None:
-        self.client.delete("plaid_accounts", user_id=self._owner, item_id=f"eq.{item_id}")
         payload = [
             {
-                "user_id": self.user_id,
                 "account_id": account["account_id"],
-                "item_id": item_id,
                 "name": account.get("name") or "Connected account",
                 "official_name": account.get("official_name"),
                 "type": str(account.get("type") or "depository"),
@@ -305,25 +287,27 @@ class SupabasePlaidRepository:
             }
             for account in accounts
         ]
-        if payload:
-            self.client.insert("plaid_accounts", payload)
+        self.client.rpc("fb_replace_plaid_accounts", {"p_item_id": item_id, "p_rows": payload})
 
     def get_items(self) -> list[PlaidItem]:
         rows = self.client.select(
             "plaid_items", user_id=self._owner, order="institution_name.asc,item_id.asc"
         )
-        return [
-            PlaidItem(
+        items = []
+        for row in rows:
+            token = self.client.rpc("fb_plaid_token", {"p_item_id": row["item_id"]})
+            if not token:
+                raise SupabaseError("A bank connection needs to be reconnected before it can sync.")
+            items.append(PlaidItem(
                 item_id=row["item_id"],
-                access_token=row["encrypted_access_token"],
+                access_token=token,
                 institution_name=row["institution_name"],
                 cursor=row.get("cursor"),
                 status=row["status"],
                 last_synced_at=row.get("last_synced_at"),
                 error_message=row.get("error_message"),
-            )
-            for row in rows
-        ]
+            ))
+        return items
 
     def get_item(self, item_id: str) -> Optional[PlaidItem]:
         return next((item for item in self.get_items() if item.item_id == item_id), None)

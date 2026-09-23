@@ -236,13 +236,19 @@ class PlaidService:
             account["account_id"]: account for account in self.plaid_repo.get_accounts(item_id)
         }
         upserts = [self._to_transaction(value, account_lookup) for value in added + modified]
-        self.transaction_repo.upsert_many(upserts)
-        removed_count = self.transaction_repo.delete_many(
-            f"plaid:{value['transaction_id']}" for value in removed
-        )
-        self.plaid_repo.update_sync(
-            item_id, cursor, datetime.now(timezone.utc).isoformat(timespec="seconds")
-        )
+        removed_ids = [f"plaid:{value['transaction_id']}" for value in removed]
+        synced_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if hasattr(self.transaction_repo, "apply_plaid_sync"):
+            result = self.transaction_repo.apply_plaid_sync(
+                item_id, starting_cursor, cursor, upserts, removed_ids, synced_at
+            )
+            removed_count = result["removed"]
+        else:
+            # The legacy SQLite repository already wraps each individual write
+            # but remains a local-only development path.
+            self.transaction_repo.upsert_many(upserts)
+            removed_count = self.transaction_repo.delete_many(removed_ids)
+            self.plaid_repo.update_sync(item_id, cursor, synced_at)
         return {"added": len(added), "modified": len(modified), "removed": removed_count}
 
     def remove_item(self, item_id: str, remove_transactions: bool = False) -> int:
@@ -274,18 +280,19 @@ class PlaidService:
     def _error_code(error: Exception) -> str:
         body = getattr(error, "body", "")
         try:
-            return json.loads(body).get("error_code", "")
+            payload = json.loads(body)
+            return payload.get("error_code", "") if isinstance(payload, dict) else ""
         except (TypeError, json.JSONDecodeError):
             return ""
 
     @classmethod
     def _friendly_error(cls, error: Exception) -> str:
-        body = getattr(error, "body", "")
-        try:
-            payload = json.loads(body)
-            return payload.get("display_message") or payload.get("error_message") or str(error)
-        except (TypeError, json.JSONDecodeError):
-            return str(error)
+        messages = {
+            "ITEM_LOGIN_REQUIRED": "Reconnect this bank to continue syncing.",
+            "INSTITUTION_DOWN": "Your bank is temporarily unavailable. Please try again later.",
+            "RATE_LIMIT_EXCEEDED": "Too many requests. Wait a moment before trying again.",
+        }
+        return messages.get(cls._error_code(error), "The bank request could not be completed. Please try again later.")
 
     @staticmethod
     def _account_name(account: dict) -> str:

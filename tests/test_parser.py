@@ -89,3 +89,14 @@ def test_pdf_parser_extracts_text_statement_rows():
     assert transactions[1].category == "Groceries"
     assert transactions[2].category == "Utilities"
     assert transactions[3].amount == 100.0
+
+
+def test_pdf_upload_is_parsed_in_bounded_worker():
+    output = BytesIO()
+    document = canvas.Canvas(output)
+    document.drawString(72, 760, "Checking Statement 2026")
+    document.drawString(72, 730, "01/01 Payroll 2500.00")
+    document.save()
+    rows, metrics = BankStatementParser.parse_file(output.getvalue(), "statement.pdf", "Checking")
+    assert metrics.is_valid
+    assert len(rows) == 1

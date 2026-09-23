@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import base64
+import binascii
+import json
 from ipaddress import ip_address
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -42,6 +45,20 @@ def _is_public_https_url(value: str, *, origin_only: bool = False) -> bool:
         return False
 
 
+def _is_privileged_supabase_key(value: str) -> bool:
+    """Fail closed for known key formats that would bypass user RLS."""
+    if value.startswith("sb_secret_"):
+        return True
+    parts = value.split(".")
+    if len(parts) != 3:
+        return False
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return False
+    return isinstance(payload, dict) and payload.get("role") in {"service_role", "supabase_admin"}
+
+
 def validate_production_configuration(secrets: Mapping[str, Any]) -> list[str]:
     """Return safe, field-level errors without exposing any configured secret."""
     if os.getenv("FINANCEBUDDY_ENV", "development").lower() != "production":
@@ -64,6 +81,9 @@ def validate_production_configuration(secrets: Mapping[str, Any]) -> list[str]:
     for field, value in required:
         if not value:
             errors.append(f"Missing required production setting: {field}.")
+
+    if _is_privileged_supabase_key(_value(supabase, "publishable_key", "SUPABASE_PUBLISHABLE_KEY")):
+        errors.append("supabase.publishable_key must be a publishable or anon key, never a privileged key.")
 
     for field, value in (
         ("supabase.url", _value(supabase, "url", "SUPABASE_URL")),

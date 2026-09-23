@@ -4,6 +4,8 @@ from datetime import date
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+from src.services.security import read_backup
+
 from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction
 
 
@@ -406,9 +408,7 @@ class TransactionRepository:
         return json.dumps(payload, indent=2)
 
     def restore_backup(self, raw_json: bytes) -> dict:
-        data = json.loads(raw_json.decode("utf-8"))
-        if data.get("version") != 1:
-            raise ValueError("Unsupported FinanceBuddy backup version.")
+        data = read_backup(raw_json)
         transactions = [Transaction.model_validate(item) for item in data.get("transactions", [])]
         budgets = [Budget.model_validate(item) for item in data.get("budgets", [])]
         goals = [SavingsGoal.model_validate(item) for item in data.get("goals", [])]

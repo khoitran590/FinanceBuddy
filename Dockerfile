@@ -14,7 +14,7 @@ RUN apt-get update \
     && useradd --create-home --uid 10001 financebuddy
 
 COPY requirements.txt ./
-RUN python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+RUN python -m pip install --upgrade "pip>=26.2" && python -m pip install -r requirements.txt
 
 COPY --chown=financebuddy:financebuddy . .
 RUN chown -R financebuddy:financebuddy /app/.streamlit

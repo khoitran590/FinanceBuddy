@@ -11,33 +11,37 @@ class Transaction(BaseModel):
     described in the project guide.
     """
 
-    model_config = ConfigDict(validate_assignment=True)
+    model_config = ConfigDict(validate_assignment=True, allow_inf_nan=False)
 
-    id: str
+    id: str = Field(min_length=1, max_length=256)
     date: date
-    description: str
+    description: str = Field(min_length=1, max_length=2048)
     amount: float
-    category: str = "Uncategorized"
-    account_name: str
-    account_type: str = "Checking"
+    category: str = Field(default="Uncategorized", min_length=1, max_length=128)
+    account_name: str = Field(min_length=1, max_length=256)
+    account_type: str = Field(default="Checking", min_length=1, max_length=64)
 
 
 class Budget(BaseModel):
-    category: str
-    monthly_limit: float
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    category: str = Field(min_length=1, max_length=128)
+    monthly_limit: float = Field(ge=0)
 
 
 class SavingsGoal(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
     id: Optional[int] = None
-    name: str
-    target_amount: float
-    current_amount: float = 0.0
+    name: str = Field(min_length=1, max_length=256)
+    target_amount: float = Field(gt=0)
+    current_amount: float = Field(default=0.0, ge=0)
     target_date: Optional[date] = None
 
 
 class CategoryRule(BaseModel):
-    keyword: str
-    category: str
+    keyword: str = Field(min_length=1, max_length=256)
+    category: str = Field(min_length=1, max_length=128)
 
 
 class ParseMetrics(BaseModel):

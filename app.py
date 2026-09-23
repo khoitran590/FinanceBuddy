@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import hashlib
 import time
 import uuid
 from datetime import date
@@ -19,6 +19,7 @@ from src.services.categorizer import CATEGORIES, categorize_with_custom_rules
 from src.services.parser import BankStatementParser
 from src.services.plaid_service import PlaidConfig, PlaidConfigurationError, PlaidService
 from src.services.production import validate_production_configuration
+from src.services.security import bind_session_owner, clear_private_session, read_backup
 from src.services.supabase import (
     SupabaseAuth,
     SupabaseConfig,
@@ -97,7 +98,7 @@ def _save_supabase_session(payload: dict) -> None:
 
 
 def _clear_supabase_session() -> None:
-    st.session_state.pop("supabase_session", None)
+    clear_private_session(st.session_state)
 
 
 def _consume_auth_link() -> None:
@@ -126,13 +127,15 @@ def _render_authentication() -> None:
     st.title("💸 FinanceBuddy")
     st.subheader("Your finances stay private to your account")
     st.write(
-        "Log in or create an account with Supabase Auth. FinanceBuddy never stores your password, "
-        "and PostgreSQL row-level security keeps every financial record tied to your account."
+        "Log in to see your spending, manage budgets, and plan your savings. "
+        "New here? Create an account and verify your email to get started."
     )
     if st.session_state.pop("auth_link_error", None):
         st.error("This email link could not be used. Request a fresh email and try again.")
     if st.session_state.pop("unverified_email_error", None):
         st.warning("Verify your email address before accessing financial data.")
+    if st.session_state.pop("session_expired_notice", None):
+        st.info("Your session expired after 30 minutes without activity. Please log in again.")
     recovery_link_session = st.session_state.get("recovery_link_session")
     if recovery_link_session:
         st.info("Email verified. Choose a new password to finish recovering your account.")
@@ -283,13 +286,17 @@ def _render_authentication() -> None:
                     except (KeyError, SupabaseError) as error:
                         st.error(str(error))
     st.caption(
-        "Authentication is provided by Supabase. Session tokens stay in this server-side Streamlit session."
+        "Sign-in is secured by Supabase. Log out when you finish on a shared device."
     )
 
 
 _consume_auth_link()
 session = st.session_state.get("supabase_session")
 user = None
+if session and time.time() - st.session_state.get("last_activity_at", time.time()) > 30 * 60:
+    _clear_supabase_session()
+    st.session_state.session_expired_notice = True
+    session = None
 if session:
     try:
         if int(session.get("expires_at", 0)) <= time.time() + 60:
@@ -316,6 +323,9 @@ if not user_id:
     st.error("Supabase returned an invalid user identity. Please log in again.")
     st.stop()
 
+bind_session_owner(st.session_state, user_id)
+st.session_state.last_activity_at = time.time()
+
 data_client = SupabaseDataClient(supabase_config, session["access_token"])
 repo = SupabaseTransactionRepository(data_client, user_id)
 plaid_repo = SupabasePlaidRepository(data_client, user_id)
@@ -329,10 +339,18 @@ def apply_custom_rules(transactions):
 
 
 def parse_statement(upload, account_name: str, account_type: str):
-    parsed, metrics = BankStatementParser.parse_file(
-        upload.getvalue(), upload.name, account_name, account_type
-    )
-    return apply_custom_rules(parsed), metrics
+    raw = upload.getvalue()
+    cache_key = (hashlib.sha256(raw).hexdigest(), upload.name.lower().endswith(".pdf"),
+                 account_name, account_type)
+    cache = st.session_state.setdefault("statement_parse_cache", {})
+    if cache_key not in cache:
+        if len(cache) >= 6:
+            cache.clear()
+        cache[cache_key] = BankStatementParser.parse_file(
+            raw, upload.name, account_name, account_type
+        )
+    parsed, metrics = cache[cache_key]
+    return apply_custom_rules([item.model_copy(deep=True) for item in parsed]), metrics
 
 
 def sync_import_account_name() -> None:
@@ -366,7 +384,7 @@ def render_onboarding() -> None:
     with st.container(border=True):
         heading, close = st.columns([5, 1])
         heading.subheader("Welcome to FinanceBuddy 👋")
-        heading.caption("Your financial data is isolated in the database assigned to your signed-in account.")
+        heading.caption("Your financial records are restricted to your signed-in account.")
         if close.button(
             "Hide guide",
             help="Dismiss this guide. You can reopen it anytime with “How FinanceBuddy works.”",
@@ -600,11 +618,14 @@ def render_transactions(transactions):
                     help="Replace the original transaction with two categorized entries whose amounts add up to the original.",
                 )
             if split_submitted:
-                repo.split_transaction(
-                    split_id, category_one, amount_one, category_two, amount_two
-                )
-                st.success("Transaction split successfully.")
-                st.rerun()
+                try:
+                    repo.split_transaction(
+                        split_id, category_one, amount_one, category_two, amount_two
+                    )
+                    st.success("Transaction split successfully.")
+                    st.rerun()
+                except SupabaseError:
+                    st.error("The split could not be saved. The original transaction is unchanged; refresh and try again.")
         else:
             st.caption("No expenses are available to split.")
 
@@ -627,6 +648,7 @@ def render_budgets_and_goals(transactions):
     budget_tab, goal_tab = st.tabs(["Budgets", "Savings goals"])
     with budget_tab:
         st.subheader("Monthly budgets")
+        st.caption("Includes all accounts and categories for the selected month, regardless of dashboard filters.")
         budgets = repo.get_budgets()
         months = sorted({item.date.strftime("%Y-%m") for item in transactions})
         selected_month = st.selectbox("Budget month", months, index=len(months) - 1) if months else None
@@ -863,7 +885,7 @@ def render_bank_connections() -> None:
                 heading.caption(f"{account_count} account(s) · Last sync: {last_sync}")
                 if item.status == "error":
                     status.error("Needs attention")
-                    st.warning(item.error_message or "Reconnect this institution to continue syncing.")
+                    st.warning("Reconnect this institution to continue syncing.")
                 else:
                     status.success("Connected")
 
@@ -991,7 +1013,7 @@ def render_import_and_data(all_transactions):
 
     with import_tab:
         st.subheader("Import a statement")
-        st.caption("Files stay local. Review parsed rows before saving anything.")
+        st.caption("Files are uploaded to the FinanceBuddy server for processing. Reviewed transactions are saved to your account only when you confirm. Maximum file size: 10 MB.")
         if "import_account_type" not in st.session_state:
             st.session_state.import_account_type = "Checking"
         if "import_account_name" not in st.session_state:
@@ -1045,33 +1067,47 @@ def render_import_and_data(all_transactions):
                     "I reviewed the account, statement type, period, and preview"
                 )
                 if mode == "Replace this account":
-                    st.warning(f"This will replace saved history for “{account_name}” only.")
+                    st.warning(f"This replaces saved history for “{account_name}”. Download a backup first if you may need those records later.")
                 if st.button(
                     "Save statement",
                     type="primary",
                     disabled=not confirmation or not account_name.strip(),
                     help="Append only new transactions, or replace history for the named account when that mode is selected.",
                 ):
-                    st.session_state.undo_transactions = repo.get_all()
-                    if mode == "Append new transactions":
-                        inserted = repo.insert_many(parsed)
-                    else:
-                        inserted = repo.replace_account(account_name.strip(), parsed)
-                    st.session_state.import_success = f"Saved {inserted} new transaction(s)."
-                    st.rerun()
+                    try:
+                        st.session_state.pop("undo_import_rows", None)
+                        if mode == "Append new transactions":
+                            before_ids = repo.get_existing_ids()
+                            inserted = repo.insert_many(parsed)
+                            new_ids = {item.id for item in parsed} - before_ids
+                            if new_ids:
+                                st.session_state.undo_import_rows = list({
+                                    item.id: item for item in parsed if item.id in new_ids
+                                }.values())
+                        else:
+                            inserted = repo.replace_account(account_name.strip(), parsed)
+                        st.session_state.import_success = f"Saved {inserted} new transaction(s)."
+                        st.rerun()
+                    except SupabaseError:
+                        st.error("The statement could not be saved. Your existing history is unchanged; please retry.")
         if "import_success" in st.session_state:
             st.success(st.session_state.pop("import_success"))
-        if st.session_state.get("undo_transactions") is not None:
+        if st.session_state.get("undo_import_rows"):
             if st.button(
                 "Undo last import",
-                help="Restore the transaction history captured immediately before the most recent import in this browser session.",
+                help="Remove only the new rows from the latest appended statement, if none have changed since import.",
             ):
-                repo.replace_all(st.session_state.pop("undo_transactions"))
-                st.success("The previous transaction history was restored.")
-                st.rerun()
+                try:
+                    removed = repo.undo_append(st.session_state.undo_import_rows)
+                    st.session_state.pop("undo_import_rows", None)
+                    st.success(f"Removed {removed} imported transaction(s).")
+                    st.rerun()
+                except SupabaseError:
+                    st.error("Some imported transactions changed. Nothing was removed; review your history before retrying.")
 
     with backup_tab:
-        st.subheader("Portable local backup")
+        st.subheader("Download or restore your data")
+        st.caption("Downloaded backups are unencrypted and contain financial records. Store them privately. Bank connections and settings are not included.")
         st.download_button(
             "Download full JSON backup",
             repo.export_backup(),
@@ -1082,22 +1118,22 @@ def render_import_and_data(all_transactions):
         restore = st.file_uploader("Restore a FinanceBuddy JSON backup", type=["json"])
         if restore:
             try:
-                preview = json.loads(restore.getvalue().decode("utf-8"))
+                preview = read_backup(restore.getvalue())
                 st.write(
                     f"Backup contains {len(preview.get('transactions', []))} transactions, "
                     f"{len(preview.get('budgets', []))} budgets, and {len(preview.get('goals', []))} goals."
                 )
-                confirm_restore = st.checkbox("I understand restore replaces all current FinanceBuddy data")
+                confirm_restore = st.checkbox("Replace my transactions, budgets, savings goals, and category rules")
                 if st.button(
                     "Restore backup",
                     disabled=not confirm_restore,
-                    help="Replace all current FinanceBuddy data with the contents of this validated backup.",
+                    help="Replace transactions, budgets, savings goals, and category rules. Bank connections and settings are kept.",
                 ):
                     result = repo.restore_backup(restore.getvalue())
                     st.success(f"Restored {result['transactions']} transactions.")
                     st.rerun()
-            except (ValueError, json.JSONDecodeError) as error:
-                st.error(f"Invalid backup: {error}")
+            except (ValueError, SupabaseError):
+                st.error("The backup could not be restored. Check its format and review your saved data before retrying.")
 
     with account_tab:
         st.subheader("Saved accounts")
@@ -1193,7 +1229,7 @@ all_transactions = repo.get_all()
 if all_transactions:
     with st.sidebar:
         st.header("Dashboard filters")
-        st.caption("These controls update the Overview, Transactions, and budget calculations together.")
+        st.caption("These controls update Overview and Transactions. Monthly budgets always include all saved spending for the selected month.")
         min_date = min(item.date for item in all_transactions)
         max_date = max(item.date for item in all_transactions)
         account_options = sorted({item.account_name for item in all_transactions})
@@ -1278,7 +1314,7 @@ with transactions_tab:
     render_transactions(filtered_transactions)
 
 with budgets_tab:
-    render_budgets_and_goals(filtered_transactions)
+    render_budgets_and_goals(all_transactions)
 
 with compare_tab:
     render_compare()

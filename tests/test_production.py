@@ -99,3 +99,18 @@ def test_production_rejects_unimplemented_plaid_oauth_redirect(monkeypatch):
     errors = validate_production_configuration(secrets)
 
     assert any("plaid.redirect_uri" in error for error in errors)
+
+
+def test_production_rejects_privileged_supabase_keys(monkeypatch):
+    import base64
+    import json
+    from src.services.supabase import SupabaseConfig
+
+    monkeypatch.setenv('FINANCEBUDDY_ENV', 'production')
+    for key in ('sb_secret_example', '.'.join([
+        'header', base64.urlsafe_b64encode(json.dumps({'role': 'service_role'}).encode()).decode().rstrip('='), 'signature'
+    ])):
+        secrets = _valid_secrets()
+        secrets['supabase']['publishable_key'] = key
+        assert any('privileged' in error for error in validate_production_configuration(secrets))
+        assert not SupabaseConfig('https://project.supabase.co', key).is_configured
