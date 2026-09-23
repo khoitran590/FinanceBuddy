@@ -20,6 +20,13 @@ class Transaction(BaseModel):
     category: str = Field(default="Uncategorized", min_length=1, max_length=128)
     account_name: str = Field(min_length=1, max_length=256)
     account_type: str = Field(default="Checking", min_length=1, max_length=64)
+    # Optional provider detail. Bank connections supply these; statement imports
+    # leave them empty, so analytics must treat every one of them as optional.
+    merchant_name: Optional[str] = Field(default=None, max_length=256)
+    subcategory: Optional[str] = Field(default=None, max_length=128)
+    payment_channel: Optional[str] = Field(default=None, max_length=32)
+    location: Optional[str] = Field(default=None, max_length=256)
+    pending: bool = False
 
 
 class Budget(BaseModel):

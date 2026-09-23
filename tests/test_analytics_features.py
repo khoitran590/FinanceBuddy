@@ -64,7 +64,10 @@ def test_filters_recurring_anomalies_and_forecast():
     assert [item.id for item in filtered] == ["6"]
     assert AnalyticsService.recurring_expenses(transactions)[0]["merchant"] == "Streaming"
     assert AnalyticsService.unusual_expenses(transactions)[0].description == "Large purchase"
-    assert AnalyticsService.cash_flow_forecast(transactions)["months"] == 2
+    # February's history ends on the 12th, so only complete January feeds the estimate.
+    forecast = AnalyticsService.cash_flow_forecast(transactions)
+    assert forecast["months"] == 1
+    assert forecast["recurring"] == 15.0
 
 
 def test_empty_account_filter_clears_dashboard_and_cash_flow_accumulates():

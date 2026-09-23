@@ -4,10 +4,16 @@ import hashlib
 CATEGORY_RULES = {
     "Salary/Income": ["payroll", "direct deposit", "employer", "salary", "wages"],
     "Housing": ["rent", "mortgage", "hoa", "landlord", "property management"],
-    "Debt Payments": [
+    # Card payments move money between the user's own accounts, so analytics
+    # treats this category like a transfer instead of new spending.
+    "Credit Card Payments": [
         "payment to chase card",
         "credit card payment",
         "applecard payment",
+        "payment thank you",
+        "card payment",
+    ],
+    "Debt Payments": [
         "loan payment",
         "auto carpay",
         "carpay",
@@ -97,6 +103,13 @@ CATEGORY_RULES = {
 }
 
 CATEGORIES = list(CATEGORY_RULES) + ["Uncategorized"]
+
+# Money moved between the user's own accounts. Counting these as income or
+# spending double-counts card purchases and inflates cash in and cash out.
+TRANSFER_CATEGORIES = frozenset({"Transfers", "Credit Card Payments"})
+
+# Obligations that stay roughly constant month to month.
+FIXED_CATEGORIES = frozenset({"Housing", "Utilities", "Insurance", "Debt Payments", "Education"})
 
 
 def auto_categorize(description: str) -> str:

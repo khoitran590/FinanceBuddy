@@ -7,7 +7,9 @@ from typing import Iterable, Optional
 from src.services.security import read_backup
 
 from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction
-from src.repositories.plaid_repo import PlaidItem
+from src.repositories.plaid_repo import PlaidItem, account_balances
+
+OPTIONAL_TRANSACTION_FIELDS = ("merchant_name", "subcategory", "payment_channel", "location", "pending")
 from src.services.supabase import SupabaseDataClient, SupabaseError
 
 
@@ -21,7 +23,7 @@ class SupabaseTransactionRepository:
         return f"eq.{self.user_id}"
 
     def _transaction_payload(self, item: Transaction) -> dict:
-        return {
+        payload = {
             "user_id": self.user_id,
             "id": item.id,
             "date": item.date.isoformat(),
@@ -31,6 +33,22 @@ class SupabaseTransactionRepository:
             "account_name": item.account_name,
             "account_type": item.account_type,
         }
+        # Provider detail is sent only when present, so statement imports keep
+        # working against a database that predates these optional columns.
+        for field in OPTIONAL_TRANSACTION_FIELDS:
+            value = getattr(item, field)
+            if value:
+                payload[field] = value
+        return payload
+
+    def _transaction_rows(self, items: Iterable[Transaction]) -> list[dict]:
+        """Payloads with one shared key set, as PostgREST bulk writes require."""
+        rows = [self._transaction_payload(item) for item in items]
+        present = {field for row in rows for field in OPTIONAL_TRANSACTION_FIELDS if field in row}
+        for row in rows:
+            for field in present:
+                row.setdefault(field, False if field == "pending" else None)
+        return rows
 
     @staticmethod
     def _transaction(row: dict) -> Transaction:
@@ -42,6 +60,11 @@ class SupabaseTransactionRepository:
             category=row["category"],
             account_name=row["account_name"],
             account_type=row["account_type"],
+            merchant_name=row.get("merchant_name"),
+            subcategory=row.get("subcategory"),
+            payment_channel=row.get("payment_channel"),
+            location=row.get("location"),
+            pending=bool(row.get("pending") or False),
         )
 
     def get_all(self) -> list[Transaction]:
@@ -54,7 +77,7 @@ class SupabaseTransactionRepository:
         return {item.id for item in self.get_all()}
 
     def insert_many(self, transactions: Iterable[Transaction]) -> int:
-        payload = [self._transaction_payload(item) for item in transactions]
+        payload = self._transaction_rows(transactions)
         if not payload:
             return 0
         rows = self.client.insert("transactions", payload, ignore_duplicates=True)
@@ -65,13 +88,11 @@ class SupabaseTransactionRepository:
         if not items:
             return 0
         existing_categories = {item.id: item.category for item in self.get_all()}
-        payload = []
-        for item in items:
-            row = self._transaction_payload(item)
+        payload = self._transaction_rows(items)
+        for item, row in zip(items, payload):
             existing = existing_categories.get(item.id)
             if existing and existing != "Uncategorized":
                 row["category"] = existing
-            payload.append(row)
         self.client.upsert("transactions", payload, "user_id,id")
         return len(payload)
 
@@ -284,6 +305,7 @@ class SupabasePlaidRepository:
                 "type": str(account.get("type") or "depository"),
                 "subtype": str(account.get("subtype") or ""),
                 "mask": account.get("mask"),
+                **account_balances(account),
             }
             for account in accounts
         ]
@@ -317,6 +339,11 @@ class SupabasePlaidRepository:
         if item_id:
             params["item_id"] = f"eq.{item_id}"
         return self.client.select("plaid_accounts", **params)
+
+    def get_balance_history(self) -> list[dict]:
+        return self.client.select(
+            "account_balances", user_id=self._owner, order="as_of.asc,account_id.asc"
+        )
 
     def update_sync(self, item_id: str, cursor: str, synced_at: str) -> None:
         self.client.update(

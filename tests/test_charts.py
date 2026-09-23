@@ -23,3 +23,46 @@ def test_profit_loss_chart_connects_sign_changes_at_zero():
     assert 0.0 in list(figure.data[0].y)
     assert 0.0 in list(figure.data[1].y)
     assert figure.layout.shapes[0].y0 == 0
+
+
+def test_new_charts_render_with_data_and_when_empty():
+    from src.ui.charts import (
+        make_budget_history_chart,
+        make_category_bar_chart,
+        make_daily_spending_chart,
+        make_fixed_flexible_chart,
+        make_income_chart,
+        make_merchant_bar_chart,
+        make_net_worth_chart,
+        make_savings_rate_chart,
+        make_week_of_month_chart,
+        make_weekday_chart,
+    )
+
+    samples = [
+        (make_savings_rate_chart, [{"month": "2026-08", "inflow": 100.0, "outflow": 50.0, "net": 50.0, "savings_rate": 50.0}]),
+        (make_merchant_bar_chart, [{"merchant": "Cafe", "amount": 10.0, "visits": 2, "average": 5.0, "share": 100.0, "category": "Dining"}]),
+        (make_weekday_chart, [{"day": "Monday", "total": 10.0, "transactions": 1, "days": 1, "average_per_day": 10.0}]),
+        (make_week_of_month_chart, [{"bucket": "Days 1–7", "total": 10.0, "share": 100.0, "average_per_day": 1.4}]),
+        (make_daily_spending_chart, [{"date": date(2026, 9, 1), "spend": 5.0, "rolling_7": 5.0}]),
+        (make_fixed_flexible_chart, [{"month": "2026-09", "fixed": 10.0, "flexible": 5.0}]),
+        (make_budget_history_chart, [{"category": "Dining", "month": "2026-09", "spent": 50.0, "limit": 100.0, "ratio": 50.0}]),
+        (make_net_worth_chart, [{"date": date(2026, 9, 1), "assets": 10.0, "liabilities": 2.0, "net_worth": 8.0}]),
+        (make_income_chart, [{"month": "2026-09", "income": 100.0}]),
+        (make_category_bar_chart, [{"category": "Dining", "amount": 10.0, "transactions": 1, "share": 100.0, "average": 10.0}]),
+    ]
+    for builder, data in samples:
+        assert builder(data).data
+        assert builder([]).layout.title.text
+
+
+def test_sankey_balances_income_spending_and_savings():
+    from src.ui.charts import make_cash_flow_sankey
+
+    saved = make_cash_flow_sankey({"Salary/Income": 1000.0}, {"Housing": 600.0, "Dining": 100.0})
+    labels = list(saved.data[0].node.label)
+    assert "Saved" in labels
+    assert saved.data[0].link.value[labels.index("Saved") - 1] == 300.0
+
+    deficit = make_cash_flow_sankey({"Salary/Income": 100.0}, {"Housing": 600.0})
+    assert "Drawn from savings" in list(deficit.data[0].node.label)

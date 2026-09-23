@@ -95,3 +95,37 @@ def test_plaid_sync_is_one_rpc_with_expected_cursor():
     client.rpc.assert_called_once()
     assert client.rpc.call_args.args[0] == 'fb_apply_plaid_sync'
     assert client.rpc.call_args.args[1]['p_expected_cursor'] == 'previous'
+
+
+def test_optional_transaction_detail_is_sent_only_when_present():
+    repo = SupabaseTransactionRepository(Mock(), 'alice')
+    plain = sample_transaction('plain')
+    detailed = sample_transaction('detailed').model_copy(update={'merchant_name': 'Cafe', 'pending': True})
+
+    assert 'merchant_name' not in repo._transaction_payload(plain)
+    rows = repo._transaction_rows([plain, detailed])
+    assert rows[0]['merchant_name'] is None and rows[0]['pending'] is False
+    assert rows[1]['merchant_name'] == 'Cafe' and rows[1]['pending'] is True
+    assert set(rows[0]) == set(rows[1])
+    restored = SupabaseTransactionRepository._transaction({**rows[1], 'date': '2026-09-01'})
+    assert restored.merchant_name == 'Cafe' and restored.pending is True
+
+
+def test_plaid_accounts_rpc_carries_balances():
+    client = Mock()
+    SupabasePlaidRepository(client, 'alice').save_accounts('bank-1', [{
+        'account_id': 'acct-1', 'name': 'Card', 'type': 'credit',
+        'balances': {'current': 12.5, 'available': None, 'limit': 100, 'iso_currency_code': 'USD'},
+    }])
+    row = client.rpc.call_args.args[1]['p_rows'][0]
+    assert (row['current_balance'], row['available_balance'], row['credit_limit']) == (12.5, None, 100.0)
+
+
+def test_insights_migration_protects_balance_history_with_rls():
+    from pathlib import Path
+    sql = (Path(__file__).parents[1] / 'supabase/migrations/202609240001_spending_insights.sql').read_text()
+    assert 'alter table public.account_balances enable row level security' in sql
+    assert 'revoke all on public.account_balances from anon' in sql
+    assert '(select auth.uid()) = user_id' in sql
+    assert sql.count('security invoker') == 4
+    assert 'coalesce(r.pending,false)' in sql

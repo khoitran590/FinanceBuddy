@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,22 @@ class PlaidItem:
     status: str
     last_synced_at: Optional[str]
     error_message: Optional[str]
+
+
+def account_balances(account: dict) -> dict:
+    """Flatten Plaid's nested balances into the stored account columns."""
+    balances = account.get("balances") or {}
+
+    def number(key: str) -> Optional[float]:
+        value = balances.get(key)
+        return float(value) if value is not None else None
+
+    return {
+        "current_balance": number("current"),
+        "available_balance": number("available"),
+        "credit_limit": number("limit"),
+        "iso_currency_code": balances.get("iso_currency_code"),
+    }
 
 
 class PlaidRepository:
@@ -59,8 +76,32 @@ class PlaidRepository:
                     mask TEXT,
                     FOREIGN KEY(item_id) REFERENCES plaid_items(item_id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS account_balances (
+                    account_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    as_of TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    current_balance REAL NOT NULL,
+                    available_balance REAL,
+                    credit_limit REAL,
+                    PRIMARY KEY(account_id, as_of),
+                    FOREIGN KEY(item_id) REFERENCES plaid_items(item_id) ON DELETE CASCADE
+                );
                 """
             )
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(plaid_accounts)").fetchall()
+            }
+            for column, kind in (
+                ("current_balance", "REAL"),
+                ("available_balance", "REAL"),
+                ("credit_limit", "REAL"),
+                ("iso_currency_code", "TEXT"),
+                ("balances_updated_at", "TEXT"),
+            ):
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE plaid_accounts ADD COLUMN {column} {kind}")
 
     def save_item(
         self, item_id: str, encrypted_access_token: str, institution_name: str
@@ -81,13 +122,17 @@ class PlaidRepository:
             )
 
     def save_accounts(self, item_id: str, accounts: list[dict]) -> None:
+        now = datetime.now(timezone.utc)
+        rows = [(account, account_balances(account)) for account in accounts]
         with self._get_connection() as connection:
             connection.execute("DELETE FROM plaid_accounts WHERE item_id = ?", (item_id,))
             connection.executemany(
                 """
                 INSERT INTO plaid_accounts
-                    (account_id, item_id, name, official_name, type, subtype, mask)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (account_id, item_id, name, official_name, type, subtype, mask,
+                     current_balance, available_balance, credit_limit, iso_currency_code,
+                     balances_updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -98,8 +143,38 @@ class PlaidRepository:
                         str(account.get("type") or "depository"),
                         str(account.get("subtype") or ""),
                         account.get("mask"),
+                        balances["current_balance"],
+                        balances["available_balance"],
+                        balances["credit_limit"],
+                        balances["iso_currency_code"],
+                        now.isoformat(timespec="seconds") if balances["current_balance"] is not None else None,
                     )
-                    for account in accounts
+                    for account, balances in rows
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO account_balances
+                    (account_id, item_id, as_of, type, current_balance, available_balance, credit_limit)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, as_of) DO UPDATE SET
+                    type = excluded.type,
+                    current_balance = excluded.current_balance,
+                    available_balance = excluded.available_balance,
+                    credit_limit = excluded.credit_limit
+                """,
+                [
+                    (
+                        account["account_id"],
+                        item_id,
+                        now.date().isoformat(),
+                        str(account.get("type") or "depository"),
+                        balances["current_balance"],
+                        balances["available_balance"],
+                        balances["credit_limit"],
+                    )
+                    for account, balances in rows
+                    if balances["current_balance"] is not None
                 ],
             )
 
@@ -133,6 +208,15 @@ class PlaidRepository:
         query += " ORDER BY name"
         with self._get_connection() as connection:
             return [dict(row) for row in connection.execute(query, params).fetchall()]
+
+    def get_balance_history(self) -> list[dict]:
+        with self._get_connection() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM account_balances ORDER BY as_of, account_id"
+                ).fetchall()
+            ]
 
     def update_sync(self, item_id: str, cursor: str, synced_at: str) -> None:
         with self._get_connection() as connection:

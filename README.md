@@ -75,11 +75,17 @@ Compare, and Settings. Each view keeps its place after saving. New accounts can 
 from Overview with one action to connect a bank or upload a statement. Accounts holds
 bank connections, imports, and saved accounts; Settings holds backup/restore and rules.
 
-- Account-aware metrics for checking and credit-card statements
+- Account-aware metrics for checking and credit-card statements, each compared with the matching previous period
+- Transfers and credit-card payments are left out of income and spending (with a sidebar toggle) so card purchases are not counted twice; older card payments saved as Debt Payments can be moved with one click
+- Plain-language insight cards, such as price increases, fast-growing categories, and yearly subscription cost
+- Overview tabs: **Summary** (click a category or month bar to drill into its transactions), **Trends** (savings rate by month, fixed vs flexible spending, daily spending with a 7-day average, a where-the-money-went flow chart), **Habits** (day-of-week and time-of-month spending, top merchants, online vs in-store, locations), **Recurring & income** (schedule-aware recurring charges with next dates, yearly cost, and price changes; pay frequency, next payday, and income stability), and **Balances** for connected banks (net worth and its trend, cash available, safe-to-spend before payday, credit utilization per card)
+- Quick date ranges (this month, last month, last 30 days, last 3 months, year to date, last 12 months) alongside the custom date picker
 - Global date, account, category, transaction-type, merchant, and amount filters with clear/select-all/reset controls
 - Responsive desktop tables and mobile transaction cards
 - Editable categories, reusable merchant rules, and split transactions
-- Monthly budgets, savings goals, recurring-charge detection, unusual-expense review, and a simple cash-flow estimate
+- Monthly budgets with pace tracking (projected month-end spend and a daily allowance) and a six-month budget history
+- Savings goals that show the monthly amount needed and a projected finish date based on recent net savings
+- Unusual-expense review and a next-month estimate built from expected recurring charges plus typical variable spending
 - Comparison of up to six statements with automatic date ordering
 - Multi-account append or account-scoped replacement with import preview, duplicate detection, and confirmation; a current-session undo is available for unchanged appended rows
 - Filtered CSV export plus full JSON backup and restore
@@ -110,6 +116,11 @@ The current embedded Plaid Link UI does not resume an OAuth redirect after retur
 FinanceBuddy. Leave `PLAID_REDIRECT_URI` unset; OAuth-only institutions are not supported
 by this release. Production access and institution availability are controlled in Plaid.
 
+Each sync also stores Plaid's cached account balances and a daily balance snapshot, which power
+the Balances tab. Synced transactions keep Plaid's merchant name, detailed category, payment
+channel, location, and pending status for the Habits tab and drill-downs; statement imports
+simply leave those details empty.
+
 The first Transactions Sync response can contain no activity while Plaid prepares transaction history. Use **Sync transactions** again after Plaid finishes processing; subsequent syncs use a saved cursor and apply added, modified, and removed records without overwriting a category you corrected manually.
 
 > Deployment note: this repository is a Streamlit/Python app, not a Next.js app. A Vercel preset that expects `next` in `package.json` will fail. Deploy it to a Streamlit-capable host, or wrap/migrate the UI to a framework Vercel supports as a persistent web app.
@@ -126,6 +137,10 @@ The included `Dockerfile` and `render.yaml` define a stateless free-tier Render 
 the process runs as a non-root user, dependencies are pinned, health checks use Streamlit's
 health endpoint, secrets are assembled from environment variables at startup, and all
 durable state lives in Supabase.
+
+Apply every migration in `supabase/migrations` before deploying a new app version. The
+`202609240001_spending_insights.sql` migration adds the optional transaction detail columns,
+account balances, and the `account_balances` history table that the Balances tab reads.
 
 1. Create a Render Blueprint from this repository. It declares the free web-service plan
    and does not request a disk or payment method.

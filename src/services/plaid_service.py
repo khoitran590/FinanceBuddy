@@ -249,7 +249,26 @@ class PlaidService:
             self.transaction_repo.upsert_many(upserts)
             removed_count = self.transaction_repo.delete_many(removed_ids)
             self.plaid_repo.update_sync(item_id, cursor, synced_at)
-        return {"added": len(added), "modified": len(modified), "removed": removed_count}
+        return {
+            "added": len(added),
+            "modified": len(modified),
+            "removed": removed_count,
+            "balances_updated": self.refresh_balances(item_id, access_token),
+        }
+
+    def refresh_balances(self, item_id: str, access_token: str) -> bool:
+        """Store the latest cached balances Plaid returns with account metadata."""
+        from plaid.model.accounts_get_request import AccountsGetRequest
+
+        try:
+            response = self._serialized(
+                self.client.accounts_get(AccountsGetRequest(access_token=access_token))
+            )
+            self.plaid_repo.save_accounts(item_id, response.get("accounts", []))
+        except Exception:
+            # Transactions are already committed; stale balances should not fail the sync.
+            return False
+        return True
 
     def remove_item(self, item_id: str, remove_transactions: bool = False) -> int:
         from plaid.model.item_remove_request import ItemRemoveRequest
@@ -311,6 +330,10 @@ class PlaidService:
         plaid_type = str(account.get("type", ""))
         account_type = "Credit Card" if plaid_type == "credit" else "Checking"
         category = cls._map_category(value) or auto_categorize(description)
+        location = value.get("location") or {}
+        place = ", ".join(
+            str(part) for part in (location.get("city"), location.get("region")) if part
+        )
         return Transaction(
             id=f"plaid:{value['transaction_id']}",
             date=transaction_date,
@@ -319,7 +342,25 @@ class PlaidService:
             category=category,
             account_name=cls._account_name(account),
             account_type=account_type,
+            merchant_name=(value.get("merchant_name") or None),
+            subcategory=cls._subcategory(value),
+            payment_channel=(str(value.get("payment_channel") or "")[:32] or None),
+            location=place[:256] or None,
+            pending=bool(value.get("pending", False)),
         )
+
+    @staticmethod
+    def _subcategory(value: dict) -> Optional[str]:
+        """Turn Plaid's detailed category code into a short readable label."""
+        pfc = value.get("personal_finance_category") or {}
+        primary = str(pfc.get("primary") or "").upper()
+        detailed = str(pfc.get("detailed") or "").upper()
+        if not detailed:
+            return None
+        if primary and detailed.startswith(primary + "_"):
+            detailed = detailed[len(primary) + 1:]
+        label = detailed.replace("_", " ").strip().capitalize()
+        return label[:128] or None
 
     @staticmethod
     def _map_category(value: dict) -> Optional[str]:
@@ -343,6 +384,8 @@ class PlaidService:
             "TRANSFER_OUT": "Transfers",
         }
         detailed = str(pfc.get("detailed") or "").upper()
+        if "CREDIT_CARD_PAYMENT" in detailed:
+            return "Credit Card Payments"
         if "GROCER" in detailed:
             return "Groceries"
         return mapping.get(primary)

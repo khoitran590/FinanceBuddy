@@ -41,6 +41,22 @@ def inject_app_styles() -> None:
             outline-offset: 2px;
         }
         .fb-progress-label { display:flex; justify-content:space-between; gap:1rem; }
+        .fb-insights {
+            display:grid;
+            grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+            gap:.75rem;
+            margin: .25rem 0 1.25rem;
+        }
+        .fb-insight {
+            border: 1px solid rgba(167,139,250,.35);
+            border-radius: 12px;
+            padding: .8rem 1rem;
+            background: rgba(76,29,149,.18);
+            color: #E5E7EB;
+            line-height: 1.4;
+        }
+        .fb-insight::before { content: "💡 "; }
+        .fb-budget-meta { color:#94A3B8; font-size:.85rem; margin: -.4rem 0 .9rem; }
         .fb-feature-intro {
             border-left: 3px solid #60A5FA;
             padding: .7rem 1rem;
@@ -82,14 +98,36 @@ def format_metric(metric: Dict[str, Any]) -> str:
     return f"{int(metric['value']):,}"
 
 
-def render_metrics(metrics: List[Dict[str, Any]]) -> None:
+def format_delta(metric: Dict[str, Any]) -> str | None:
+    delta = metric.get("delta")
+    if delta is None:
+        return None
+    if metric["format"] == "currency":
+        return ("+" if delta >= 0 else "-") + format_currency(abs(delta))
+    if metric["format"] == "percent":
+        return f"{delta:+,.1f} pts"
+    return f"{int(delta):+,}"
+
+
+def render_metrics(metrics: List[Dict[str, Any]], delta_caption: str | None = None) -> None:
     columns = st.columns(len(metrics))
     for column, metric in zip(columns, metrics):
         column.metric(
             metric["label"],
             format_metric(metric),
+            delta=format_delta(metric),
+            delta_color=metric.get("delta_color", "normal"),
             help=metric.get("help"),
         )
+    if delta_caption and any(metric.get("delta") is not None for metric in metrics):
+        st.caption(delta_caption)
+
+
+def render_insights(insights: List[str]) -> None:
+    if not insights:
+        return
+    cards = "".join(f'<div class="fb-insight">{html.escape(text)}</div>' for text in insights)
+    st.markdown(f'<div class="fb-insights">{cards}</div>', unsafe_allow_html=True)
 
 
 def period_label(transactions: List[Transaction]) -> str:
@@ -121,15 +159,26 @@ def transaction_frame(transactions: Iterable[Transaction]) -> pd.DataFrame:
     )
 
 
+def _status_column(transactions: List[Transaction]) -> List[str] | None:
+    if not any(transaction.pending for transaction in transactions):
+        return None
+    return ["Pending" if transaction.pending else "Posted" for transaction in transactions]
+
+
 def render_transaction_table(transactions: List[Transaction], height: int = 520) -> None:
     frame = transaction_frame(transactions)
+    column_order = ["Date", "Amount", "Category", "Description", "Account", "Type"]
+    status = _status_column(transactions)
+    if status:
+        frame["Status"] = status
+        column_order.insert(1, "Status")
     with st.container(key="desktop_transactions"):
         st.dataframe(
             frame,
             width="stretch",
             height=height,
             hide_index=True,
-            column_order=["Date", "Amount", "Category", "Description", "Account", "Type"],
+            column_order=column_order,
             column_config={
                 "Date": st.column_config.DateColumn(format="MMM D, YYYY", width="small"),
                 "Amount": st.column_config.NumberColumn(format="$%.2f", width="small"),
@@ -159,8 +208,9 @@ def render_transaction_table(transactions: List[Transaction], height: int = 520)
             (
                 '<div class="fb-card"><div class="fb-card-top">'
                 '<span>{description}</span><span class="{amount_class}">{amount}</span>'
-                '</div><div class="fb-card-meta">{date} · {category} · {account}</div></div>'
+                '</div><div class="fb-card-meta">{date}{pending} · {category} · {account}</div></div>'
             ).format(
+                pending=" · Pending" if transaction.pending else "",
                 description=html.escape(transaction.description),
                 amount_class=amount_class,
                 amount=format_currency(transaction.amount),
