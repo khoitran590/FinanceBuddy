@@ -97,32 +97,50 @@ def make_category_donut_chart(category_data: Dict[str, float]):
         go.Pie(
             labels=[item["category"] for item in rows],
             values=[item["amount"] for item in rows],
-            hole=0.58,
+            hole=0.5,
             sort=True,
             direction="clockwise",
             marker={
                 "colors": CATEGORY_COLORS,
-                "line": {"color": "#0B0F14", "width": 3},
+                "line": {"color": "#0B0F14", "width": 2},
             },
             textinfo="percent",
             textposition="inside",
+            insidetextorientation="horizontal",
+            textfont={"size": 15, "color": "#0B0F14"},
             hovertemplate="<b>%{label}</b><br>$%{value:,.2f}<br>%{percent}<extra></extra>",
+            domain={"x": [0, 1], "y": [0.12, 1]},
         )
     )
     figure.update_layout(
         title="Spending by category",
-        legend={"orientation": "h", "y": -0.12, "x": 0.5, "xanchor": "center"},
         annotations=[
             {
-                "text": f"<span style='font-size:12px'>Total spent</span><br><b>${total:,.0f}</b>",
+                "text": f"<span style='font-size:14px'>Total spent</span><br><b>${total:,.0f}</b>",
                 "x": 0.5,
-                "y": 0.5,
+                "y": 0.56,
                 "showarrow": False,
-                "font": {"size": 18, "color": "#F8FAFC"},
+                "font": {"size": 24, "color": "#F8FAFC"},
             }
         ],
     )
-    return _style_figure(figure)
+    # Applied after the shared theme, which would otherwise reset the legend and margins.
+    figure = _style_figure(figure)
+    figure.update_layout(
+        height=560,
+        margin={"l": 8, "r": 8, "t": 56, "b": 8},
+        legend={
+            "orientation": "h",
+            "y": 0.06,
+            "yanchor": "top",
+            "x": 0.5,
+            "xanchor": "center",
+            "font": {"size": 14},
+        },
+        # Hide percentages on slices too thin to fit them legibly; hover still shows them.
+        uniformtext={"minsize": 12, "mode": "hide"},
+    )
+    return figure
 
 
 def make_profit_loss_line_chart(cumulative_data: List[Dict[str, Any]]):

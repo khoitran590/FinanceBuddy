@@ -6,7 +6,9 @@ from src.ui.charts import make_category_donut_chart, make_profit_loss_line_chart
 def test_donut_chart_has_center_total_and_interactive_slice_details():
     figure = make_category_donut_chart({"Housing": 1200.0, "Dining": 300.0})
 
-    assert figure.data[0].hole == 0.58
+    assert figure.data[0].hole == 0.5
+    assert figure.layout.height == 560
+    assert figure.layout.legend.font.size == 14
     assert "$1,500" in figure.layout.annotations[0].text
     assert "%{percent}" in figure.data[0].hovertemplate
 
