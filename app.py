@@ -124,149 +124,29 @@ def _consume_auth_link() -> None:
 
 
 def _render_authentication() -> None:
-    st.title("💸 FinanceBuddy")
-    st.subheader("Your finances stay private to your account")
-    st.write(
-        "Log in to see your spending, manage budgets, and plan your savings. "
-        "New here? Create an account and verify your email to get started."
-    )
-    if st.session_state.pop("auth_link_error", None):
-        st.error("This email link could not be used. Request a fresh email and try again.")
-    if st.session_state.pop("unverified_email_error", None):
-        st.warning("Verify your email address before accessing financial data.")
-    if st.session_state.pop("session_expired_notice", None):
-        st.info("Your session expired after 30 minutes without activity. Please log in again.")
-    recovery_link_session = st.session_state.get("recovery_link_session")
-    if recovery_link_session:
-        st.info("Email verified. Choose a new password to finish recovering your account.")
-        with st.form("finish_link_recovery"):
-            new_password = st.text_input(
-                "New password", type="password", autocomplete="new-password"
-            )
-            confirm_password = st.text_input(
-                "Confirm new password", type="password", autocomplete="new-password"
-            )
-            reset_submitted = st.form_submit_button(
-                "Set new password", type="primary", width="stretch"
-            )
-        if reset_submitted:
-            if len(new_password) < 12:
-                st.error("Use at least 12 characters for your password.")
-            elif new_password != confirm_password:
-                st.error("The passwords do not match.")
-            else:
-                try:
-                    auth.update_password(recovery_link_session["access_token"], new_password)
-                    _save_supabase_session(recovery_link_session)
-                    st.session_state.pop("recovery_link_session", None)
-                    st.rerun()
-                except (KeyError, SupabaseError) as error:
-                    st.error(str(error))
-        return
-    login_tab, signup_tab, recovery_tab = st.tabs(
-        ["Log in", "Create account", "Reset password"]
-    )
-    with login_tab:
-        with st.form("supabase_login"):
-            login_email = st.text_input("Email", autocomplete="email")
-            login_password = st.text_input(
-                "Password", type="password", autocomplete="current-password"
-            )
-            login_submitted = st.form_submit_button(
-                "Log in", type="primary", width="stretch"
-            )
-        if login_submitted:
-            try:
-                _save_supabase_session(
-                    auth.sign_in(login_email.strip().lower(), login_password)
-                )
-                st.rerun()
-            except SupabaseError as error:
-                st.error(str(error))
-
-    with signup_tab:
-        with st.form("supabase_signup"):
-            signup_email = st.text_input("Email", autocomplete="email", key="signup_email")
-            signup_password = st.text_input(
-                "Password",
-                type="password",
-                autocomplete="new-password",
-                key="signup_password",
-            )
-            signup_confirmation = st.text_input(
-                "Confirm password",
-                type="password",
-                autocomplete="new-password",
-                key="signup_confirmation",
-            )
-            signup_submitted = st.form_submit_button(
-                "Create secure account", width="stretch"
-            )
-        if signup_submitted:
-            if len(signup_password) < 12:
-                st.error("Use at least 12 characters for your password.")
-            elif signup_password != signup_confirmation:
-                st.error("The passwords do not match.")
-            else:
-                try:
-                    response = auth.sign_up(signup_email.strip().lower(), signup_password)
-                    if response.get("access_token"):
-                        _save_supabase_session(response)
-                        st.rerun()
-                    st.session_state.pending_verification_email = signup_email.strip().lower()
-                    st.success(
-                        "If this is a new account, check your email for a verification code. "
-                        "If you already verified this address, use Log in instead."
-                    )
-                except SupabaseError as error:
-                    st.error(str(error))
-        if st.session_state.get("pending_verification_email"):
-            with st.form("verify_signup"):
-                verification_code = st.text_input("Email verification code")
-                verify_submitted = st.form_submit_button(
-                    "Verify and continue", type="primary", width="stretch"
-                )
-            if verify_submitted:
-                try:
-                    _save_supabase_session(
-                        auth.verify_signup_otp(
-                            st.session_state.pending_verification_email,
-                            verification_code.strip(),
-                        )
-                    )
-                    st.session_state.pop("pending_verification_email", None)
-                    st.rerun()
-                except SupabaseError as error:
-                    st.error(str(error))
-        with st.expander("Didn't receive the verification email?"):
-            resend_email = st.text_input("Account email", key="resend_email")
-            if st.button("Resend verification email", width="stretch"):
-                try:
-                    auth.resend_signup_email(resend_email.strip().lower())
-                    st.success(
-                        "If this account still needs verification, check for a new email. "
-                        "Already verified? Use Log in instead."
-                    )
-                except SupabaseError as error:
-                    st.error(str(error))
-
-    with recovery_tab:
-        st.caption("Request a recovery code, then enter the code and a new password below.")
-        with st.form("request_recovery"):
-            recovery_email = st.text_input("Account email", key="recovery_email_input")
-            request_code = st.form_submit_button("Send recovery email", width="stretch")
-        if request_code:
-            try:
-                auth.send_recovery_email(recovery_email.strip().lower())
-                st.session_state.recovery_email = recovery_email.strip().lower()
-                st.success("Check your inbox for the Supabase recovery code.")
-            except SupabaseError as error:
-                st.error(str(error))
-        if st.session_state.get("recovery_email"):
-            with st.form("finish_recovery"):
-                recovery_code = st.text_input("Recovery code")
+    with st.container(key="auth_shell"):
+        st.title("💸 FinanceBuddy")
+        st.subheader("Your finances stay private to your account")
+        st.write(
+            "Log in to see your spending, manage budgets, and plan your savings. "
+            "New here? Create an account and verify your email to get started."
+        )
+        if st.session_state.pop("auth_link_error", None):
+            st.error("This email link could not be used. Request a fresh email and try again.")
+        if st.session_state.pop("unverified_email_error", None):
+            st.warning("Verify your email address before accessing financial data.")
+        if st.session_state.pop("session_expired_notice", None):
+            st.info("Your session expired after 30 minutes without activity. Please log in again.")
+        recovery_link_session = st.session_state.get("recovery_link_session")
+        if recovery_link_session:
+            st.info("Email verified. Choose a new password to finish recovering your account.")
+            st.caption("Use at least 12 characters and enter the same password twice.")
+            with st.form("finish_link_recovery"):
                 new_password = st.text_input(
                     "New password", type="password", autocomplete="new-password"
+                )
+                confirm_password = st.text_input(
+                    "Confirm new password", type="password", autocomplete="new-password"
                 )
                 reset_submitted = st.form_submit_button(
                     "Set new password", type="primary", width="stretch"
@@ -274,20 +154,155 @@ def _render_authentication() -> None:
             if reset_submitted:
                 if len(new_password) < 12:
                     st.error("Use at least 12 characters for your password.")
+                elif new_password != confirm_password:
+                    st.error("The passwords do not match.")
                 else:
                     try:
-                        session_payload = auth.verify_recovery_otp(
-                            st.session_state.recovery_email, recovery_code.strip()
-                        )
-                        auth.update_password(session_payload["access_token"], new_password)
-                        _save_supabase_session(session_payload)
-                        st.session_state.pop("recovery_email", None)
+                        auth.update_password(recovery_link_session["access_token"], new_password)
+                        _save_supabase_session(recovery_link_session)
+                        st.session_state.pop("recovery_link_session", None)
                         st.rerun()
                     except (KeyError, SupabaseError) as error:
                         st.error(str(error))
-    st.caption(
-        "Sign-in is secured by Supabase. Log out when you finish on a shared device."
-    )
+            return
+        auth_stage = st.radio(
+            "Account access",
+            ["Log in", "Create account", "Reset password"],
+            horizontal=True,
+            key="auth_stage",
+        )
+        if auth_stage == "Log in":
+            with st.form("supabase_login"):
+                login_email = st.text_input("Email", autocomplete="email")
+                login_password = st.text_input(
+                    "Password", type="password", autocomplete="current-password"
+                )
+                login_submitted = st.form_submit_button(
+                    "Log in", type="primary", width="stretch"
+                )
+            if login_submitted:
+                try:
+                    _save_supabase_session(
+                        auth.sign_in(login_email.strip().lower(), login_password)
+                    )
+                    st.rerun()
+                except SupabaseError as error:
+                    st.error(str(error))
+
+        elif auth_stage == "Create account":
+            st.caption("Use at least 12 characters. You will verify your email before opening financial data.")
+            with st.form("supabase_signup"):
+                signup_email = st.text_input("Email", autocomplete="email", key="signup_email")
+                signup_password = st.text_input(
+                    "Password",
+                    type="password",
+                    autocomplete="new-password",
+                    key="signup_password",
+                )
+                signup_confirmation = st.text_input(
+                    "Confirm password",
+                    type="password",
+                    autocomplete="new-password",
+                    key="signup_confirmation",
+                )
+                signup_submitted = st.form_submit_button(
+                    "Create secure account", width="stretch"
+                )
+            if signup_submitted:
+                if len(signup_password) < 12:
+                    st.error("Use at least 12 characters for your password.")
+                elif signup_password != signup_confirmation:
+                    st.error("The passwords do not match.")
+                else:
+                    try:
+                        response = auth.sign_up(signup_email.strip().lower(), signup_password)
+                        if response.get("access_token"):
+                            _save_supabase_session(response)
+                            st.rerun()
+                        st.session_state.pending_verification_email = signup_email.strip().lower()
+                        st.success(
+                            "If this is a new account, check your email for a verification code. "
+                            "If you already verified this address, use Log in instead."
+                        )
+                    except SupabaseError as error:
+                        st.error(str(error))
+            if st.session_state.get("pending_verification_email"):
+                with st.form("verify_signup"):
+                    verification_code = st.text_input("Email verification code")
+                    verify_submitted = st.form_submit_button(
+                        "Verify and continue", type="primary", width="stretch"
+                    )
+                if verify_submitted:
+                    try:
+                        _save_supabase_session(
+                            auth.verify_signup_otp(
+                                st.session_state.pending_verification_email,
+                                verification_code.strip(),
+                            )
+                        )
+                        st.session_state.pop("pending_verification_email", None)
+                        st.rerun()
+                    except SupabaseError as error:
+                        st.error(str(error))
+            with st.expander("Didn't receive the verification email?"):
+                resend_email = st.text_input(
+                    "Account email",
+                    value=st.session_state.get("pending_verification_email", ""),
+                    key="resend_email",
+                )
+                if st.button("Resend verification email", width="stretch"):
+                    try:
+                        auth.resend_signup_email(resend_email.strip().lower())
+                        st.success(
+                            "If this account still needs verification, check for a new email. "
+                            "Already verified? Use Log in instead."
+                        )
+                    except SupabaseError as error:
+                        st.error(str(error))
+
+        else:
+            st.caption("Request a recovery code, then enter it with a new password of at least 12 characters.")
+            with st.form("request_recovery"):
+                recovery_email = st.text_input("Account email", key="recovery_email_input")
+                request_code = st.form_submit_button("Send recovery email", width="stretch")
+            if request_code:
+                try:
+                    auth.send_recovery_email(recovery_email.strip().lower())
+                    st.session_state.recovery_email = recovery_email.strip().lower()
+                    st.success("Check your inbox for the Supabase recovery code.")
+                except SupabaseError as error:
+                    st.error(str(error))
+            if st.session_state.get("recovery_email"):
+                with st.form("finish_recovery"):
+                    recovery_code = st.text_input("Recovery code")
+                    new_password = st.text_input(
+                        "New password", type="password", autocomplete="new-password"
+                    )
+                    confirm_password = st.text_input(
+                        "Confirm new password", type="password", autocomplete="new-password"
+                    )
+                    reset_submitted = st.form_submit_button(
+                        "Set new password", type="primary", width="stretch"
+                    )
+                if reset_submitted:
+                    if len(new_password) < 12:
+                        st.error("Use at least 12 characters for your password.")
+                    elif new_password != confirm_password:
+                        st.error("The passwords do not match.")
+                    else:
+                        try:
+                            session_payload = auth.verify_recovery_otp(
+                                st.session_state.recovery_email, recovery_code.strip()
+                            )
+                            auth.update_password(session_payload["access_token"], new_password)
+                            _save_supabase_session(session_payload)
+                            st.session_state.pop("recovery_email", None)
+                            st.rerun()
+                        except (KeyError, SupabaseError) as error:
+                            st.error(str(error))
+        st.caption(
+            "Sign-in is secured by Supabase. Log out when you finish on a shared device."
+        )
 
 
 _consume_auth_link()
@@ -380,6 +395,34 @@ def reset_dashboard_filters() -> None:
         st.session_state.pop(key, None)
 
 
+def navigate_to(page: str, section: str | None = None) -> None:
+    st.session_state.nav_page = page
+    if section and page == "Accounts":
+        st.session_state.accounts_view = section
+    if section and page == "Settings":
+        st.session_state.settings_view = section
+
+
+def render_start_actions() -> None:
+    st.subheader("Get started with your financial history")
+    st.write("Choose how to add your first transactions. You can use both methods later.")
+    bank, statement = st.columns(2)
+    bank.button(
+        "Connect a bank",
+        type="primary",
+        width="stretch",
+        on_click=navigate_to,
+        args=("Accounts", "Bank connections"),
+    )
+    statement.button(
+        "Upload a statement",
+        width="stretch",
+        on_click=navigate_to,
+        args=("Accounts", "Import statement"),
+    )
+    st.caption("A bank connection syncs through Plaid. A CSV or text-based PDF is previewed before saving.")
+
+
 def render_onboarding() -> None:
     with st.container(border=True):
         heading, close = st.columns([5, 1])
@@ -395,14 +438,14 @@ def render_onboarding() -> None:
             st.rerun()
 
         first, second, third, fourth = st.columns(4)
-        first.markdown("**1 · Import**")
-        first.caption("Open **Import & data**, choose the account type, then preview a CSV or PDF before saving it.")
+        first.markdown("**1 · Add activity**")
+        first.caption("Use Accounts to connect a bank or preview a statement before saving.")
         second.markdown("**2 · Review**")
         second.caption("Use **Transactions** to correct categories, teach merchant rules, or split a purchase.")
         third.markdown("**3 · Understand**")
-        third.caption("Use **Overview** and the sidebar filters to explore cash flow, trends, and unusual expenses.")
+        third.caption("Use Overview and its filters to explore cash flow, trends, and unusual expenses.")
         fourth.markdown("**4 · Plan**")
-        fourth.caption("Create limits and targets in **Budgets & goals**, or compare statement periods.")
+        fourth.caption("Create limits and targets in Plan, or compare statement periods.")
         st.info(
             "Best first step: import one statement with **Append new transactions**. "
             "Exact duplicates are ignored, and nothing is saved until you confirm the preview."
@@ -415,7 +458,7 @@ def render_overview(transactions):
         "See account-appropriate totals, monthly cash flow, category spending, recurring charges, unusual expenses, and a simple next-month estimate. Sidebar filters update everything on this page.",
     )
     if not transactions:
-        st.info("No transactions match the current filters. Adjust the filters in the sidebar.")
+        st.info("No transactions match the current filters. Reset them to see your full history.")
         return
 
     st.markdown(f'<p class="fb-period">{period_label(transactions)}</p>', unsafe_allow_html=True)
@@ -450,7 +493,7 @@ def render_overview(transactions):
         st.warning(
             f"{uncategorized['transactions']} transaction(s), totaling "
             f"{format_currency(uncategorized['amount'])}, still need a category. "
-            "Review them in the Transactions tab."
+            "Review them on the Transactions page."
         )
 
     st.subheader("Category summary")
@@ -640,119 +683,123 @@ def render_transactions(transactions):
             )
 
 
-def render_budgets_and_goals(transactions):
-    render_feature_intro(
-        "Budgets & goals",
-        "Budgets compare monthly category spending with a limit. Savings goals track progress toward a target amount and optional date.",
-    )
-    budget_tab, goal_tab = st.tabs(["Budgets", "Savings goals"])
-    with budget_tab:
-        st.subheader("Monthly budgets")
-        st.caption("Includes all accounts and categories for the selected month, regardless of dashboard filters.")
-        budgets = repo.get_budgets()
-        months = sorted({item.date.strftime("%Y-%m") for item in transactions})
-        selected_month = st.selectbox("Budget month", months, index=len(months) - 1) if months else None
-        month_transactions = [
-            item for item in transactions if selected_month and item.date.strftime("%Y-%m") == selected_month
-        ]
-        spending = AnalyticsService.category_expenses(month_transactions)
-        if budgets:
-            for budget in budgets:
-                actual = spending.get(budget.category, 0.0)
-                render_progress(budget.category, actual, budget.monthly_limit)
-                if actual > budget.monthly_limit:
-                    st.error(f"Over budget by {format_currency(actual - budget.monthly_limit)}")
-        else:
-            st.info("Create a category budget to start tracking monthly limits.")
+def render_budgets(transactions) -> None:
+    st.subheader("Monthly budgets")
+    st.caption("Includes all accounts and categories for the selected month, regardless of dashboard filters.")
+    budgets = repo.get_budgets()
+    months = sorted({item.date.strftime("%Y-%m") for item in transactions})
+    selected_month = st.selectbox("Budget month", months, index=len(months) - 1) if months else None
+    month_transactions = [
+        item for item in transactions if selected_month and item.date.strftime("%Y-%m") == selected_month
+    ]
+    spending = AnalyticsService.category_expenses(month_transactions)
+    if budgets:
+        for budget in budgets:
+            actual = spending.get(budget.category, 0.0)
+            render_progress(budget.category, actual, budget.monthly_limit)
+            if actual > budget.monthly_limit:
+                st.error(f"Over budget by {format_currency(actual - budget.monthly_limit)}")
+    else:
+        st.info("Create a category budget to start tracking monthly limits.")
 
-        with st.form("budget_form"):
-            budget_category = st.selectbox("Category", CATEGORIES, key="budget_category")
-            budget_limit = st.number_input("Monthly limit", min_value=1.0, value=500.0, step=25.0)
-            budget_submit = st.form_submit_button(
-                "Save budget",
-                type="primary",
-                help="Create a new monthly category limit or update the existing limit for that category.",
-            )
-        if budget_submit:
-            repo.upsert_budget(Budget(category=budget_category, monthly_limit=budget_limit))
-            st.success("Budget saved.")
-            st.rerun()
+    with st.form("budget_form"):
+        budget_category = st.selectbox("Category", CATEGORIES, key="budget_category")
+        budget_limit = st.number_input("Monthly limit", min_value=1.0, value=500.0, step=25.0)
+        budget_submit = st.form_submit_button(
+            "Save budget",
+            type="primary",
+            help="Create a new monthly category limit or update the existing limit for that category.",
+        )
+    if budget_submit:
+        repo.upsert_budget(Budget(category=budget_category, monthly_limit=budget_limit))
+        st.success("Budget saved.")
+        st.rerun()
 
-        if budgets:
-            with st.expander("Remove a budget"):
-                remove_budget = st.selectbox("Budget", [item.category for item in budgets])
-                confirm_budget = st.checkbox("I understand this removes the selected budget")
-                if st.button(
-                    "Remove budget",
-                    disabled=not confirm_budget,
-                    help="Delete this spending limit. Transactions and categories are not affected.",
-                ):
-                    repo.delete_budget(remove_budget)
-                    st.rerun()
-
-    with goal_tab:
-        st.subheader("Savings goals")
-        goals = repo.get_goals()
-        for goal in goals:
-            label = goal.name
-            if goal.target_date:
-                label += f" · target {goal.target_date.strftime('%b %-d, %Y')}"
-            render_progress(label, goal.current_amount, goal.target_amount)
-        if not goals:
-            st.info("Create a goal for an emergency fund, trip, or major purchase.")
-
-        with st.form("goal_form"):
-            goal_name = st.text_input("Goal name")
-            goal_target = st.number_input("Target amount", min_value=1.0, value=1000.0, step=100.0)
-            goal_current = st.number_input("Already saved", min_value=0.0, value=0.0, step=50.0)
-            has_date = st.checkbox("Set a target date")
-            goal_date = st.date_input("Target date", value=date.today(), disabled=not has_date)
-            goal_submit = st.form_submit_button(
-                "Create goal",
-                type="primary",
-                help="Save a target amount, current progress, and optional target date.",
-            )
-        if goal_submit:
-            if not goal_name.strip():
-                st.error("Enter a name for the goal.")
-            else:
-                repo.save_goal(
-                    SavingsGoal(
-                        name=goal_name.strip(),
-                        target_amount=goal_target,
-                        current_amount=goal_current,
-                        target_date=goal_date if has_date else None,
-                    )
-                )
-                st.success("Goal created.")
+    if budgets:
+        with st.expander("Remove a budget"):
+            remove_budget = st.selectbox("Budget", [item.category for item in budgets])
+            confirm_budget = st.checkbox("I understand this removes the selected budget")
+            if st.button(
+                "Remove budget",
+                disabled=not confirm_budget,
+                help="Delete this spending limit. Transactions and categories are not affected.",
+            ):
+                repo.delete_budget(remove_budget)
                 st.rerun()
 
-        if goals:
-            with st.expander("Update or remove a goal"):
-                goal_id = st.selectbox(
-                    "Goal", [item.id for item in goals], format_func=lambda item_id: next(item.name for item in goals if item.id == item_id)
+
+def render_goals() -> None:
+    st.subheader("Savings goals")
+    goals = repo.get_goals()
+    for goal in goals:
+        label = goal.name
+        if goal.target_date:
+            label += f" · target {goal.target_date.strftime('%b %-d, %Y')}"
+        render_progress(label, goal.current_amount, goal.target_amount)
+    if not goals:
+        st.info("Create a goal for an emergency fund, trip, or major purchase.")
+
+    with st.form("goal_form"):
+        goal_name = st.text_input("Goal name")
+        goal_target = st.number_input("Target amount", min_value=1.0, value=1000.0, step=100.0)
+        goal_current = st.number_input("Already saved", min_value=0.0, value=0.0, step=50.0)
+        has_date = st.checkbox("Set a target date")
+        goal_date = st.date_input("Target date", value=date.today(), disabled=not has_date)
+        goal_submit = st.form_submit_button(
+            "Create goal",
+            type="primary",
+            help="Save a target amount, current progress, and optional target date.",
+        )
+    if goal_submit:
+        if not goal_name.strip():
+            st.error("Enter a name for the goal.")
+        else:
+            repo.save_goal(
+                SavingsGoal(
+                    name=goal_name.strip(),
+                    target_amount=goal_target,
+                    current_amount=goal_current,
+                    target_date=goal_date if has_date else None,
                 )
-                goal = next(item for item in goals if item.id == goal_id)
-                new_current = st.number_input(
-                    "Current saved amount",
-                    min_value=0.0,
-                    value=float(goal.current_amount),
-                    step=50.0,
-                )
-                if st.button(
-                    "Update progress",
-                    help="Save the latest amount accumulated toward this goal.",
-                ):
-                    repo.save_goal(goal.model_copy(update={"current_amount": new_current}))
-                    st.rerun()
-                confirm_goal = st.checkbox("I understand this removes the selected goal")
-                if st.button(
-                    "Remove goal",
-                    disabled=not confirm_goal,
-                    help="Permanently remove this goal. Transaction history is not affected.",
-                ):
-                    repo.delete_goal(goal_id)
-                    st.rerun()
+            )
+            st.success("Goal created.")
+            st.rerun()
+
+    if goals:
+        with st.expander("Update or remove a goal"):
+            goal_id = st.selectbox(
+                "Goal", [item.id for item in goals], format_func=lambda item_id: next(item.name for item in goals if item.id == item_id)
+            )
+            goal = next(item for item in goals if item.id == goal_id)
+            new_current = st.number_input(
+                "Current saved amount",
+                min_value=0.0,
+                value=float(goal.current_amount),
+                step=50.0,
+            )
+            if st.button(
+                "Update progress",
+                help="Save the latest amount accumulated toward this goal.",
+            ):
+                repo.save_goal(goal.model_copy(update={"current_amount": new_current}))
+                st.rerun()
+            confirm_goal = st.checkbox("I understand this removes the selected goal")
+            if st.button(
+                "Remove goal",
+                disabled=not confirm_goal,
+                help="Permanently remove this goal. Transaction history is not affected.",
+            ):
+                repo.delete_goal(goal_id)
+                st.rerun()
+
+
+def render_plan(transactions) -> None:
+    render_feature_intro("Plan", "Set monthly spending limits and track savings goals.")
+    view = st.radio("Plan view", ["Budgets", "Savings goals"], horizontal=True, key="plan_view")
+    if view == "Budgets":
+        render_budgets(transactions)
+    else:
+        render_goals()
 
 
 def render_compare():
@@ -1000,194 +1047,244 @@ def render_bank_connections() -> None:
                 st.rerun()
 
 
-def render_import_and_data(all_transactions):
-    render_feature_intro(
-        "Import & data",
-        "Connect a bank with Plaid or add statement activity, create or restore a portable backup, manage saved accounts, and review custom merchant-category rules.",
+def render_import_statement() -> None:
+    st.subheader("Import a statement")
+    st.caption("Files are uploaded to the FinanceBuddy server for processing. Reviewed transactions are saved to your account only when you confirm. Maximum file size: 10 MB.")
+    receipt = st.session_state.get("import_receipt")
+    if receipt:
+        st.success(f"Saved {receipt['count']} transaction(s) to {receipt['account']}.")
+        st.button("Review categories", on_click=navigate_to, args=("Transactions",))
+    if "import_account_type" not in st.session_state:
+        st.session_state.import_account_type = "Checking"
+    if "import_account_name" not in st.session_state:
+        st.session_state.import_account_name = "Primary Checking"
+    st.markdown("#### 1. Choose an account")
+    account_type = st.selectbox(
+        "Statement type",
+        ["Checking", "Credit Card"],
+        key="import_account_type",
+        on_change=sync_import_account_name,
+        help="Checking and credit-card statements use different sign conventions and dashboard metrics.",
     )
-    bank_tab, import_tab, backup_tab, account_tab, rule_tab = st.tabs(
-        ["Bank connections", "Import statement", "Backup & restore", "Accounts", "Category rules"]
+    account_name = st.text_input("Account name", key="import_account_name")
+    st.markdown("#### 2. Add a statement")
+    upload = st.file_uploader(
+        "CSV, TXT, or text-based PDF",
+        type=["csv", "txt", "pdf"],
+        key="statement_import",
+        help="CSV and TXT files are read as tables. PDFs must contain selectable text; scanned images require OCR and are not supported yet.",
     )
-    with bank_tab:
-        render_bank_connections()
-
-    with import_tab:
-        st.subheader("Import a statement")
-        st.caption("Files are uploaded to the FinanceBuddy server for processing. Reviewed transactions are saved to your account only when you confirm. Maximum file size: 10 MB.")
-        if "import_account_type" not in st.session_state:
-            st.session_state.import_account_type = "Checking"
-        if "import_account_name" not in st.session_state:
-            st.session_state.import_account_name = "Primary Checking"
-        account_type = st.selectbox(
-            "Statement type",
-            ["Checking", "Credit Card"],
-            key="import_account_type",
-            on_change=sync_import_account_name,
-            help="Checking and credit-card statements use different sign conventions and dashboard metrics.",
-        )
-        account_name = st.text_input("Account name", key="import_account_name")
-        upload = st.file_uploader(
-            "CSV, TXT, or text-based PDF",
-            type=["csv", "txt", "pdf"],
-            key="statement_import",
-            help="CSV and TXT files are read as tables. PDFs must contain selectable text; scanned images require OCR and are not supported yet.",
-        )
-        if upload:
-            parsed, metrics = parse_statement(upload, account_name.strip(), account_type)
-            if not metrics.is_valid:
-                st.error("This statement could not be imported safely.")
-                for error in metrics.errors:
-                    st.write(f"• {error}")
-            else:
-                duplicates = repo.count_existing_ids(parsed)
-                start = min(item.date for item in parsed)
-                end = max(item.date for item in parsed)
-                st.success(
-                    f"Parsed {metrics.valid_rows} of {metrics.total_rows} rows "
-                    f"({metrics.accuracy_rate * 100:.1f}% row recognition)."
-                )
-                st.caption(
-                    f"Detected period: {start.strftime('%b %-d, %Y')}–{end.strftime('%b %-d, %Y')} · "
-                    f"{duplicates} already saved · {metrics.skipped_rows} skipped"
-                )
-                st.dataframe(
-                    transaction_frame(parsed[:20]),
-                    width="stretch",
-                    hide_index=True,
-                    column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")},
-                )
-                if len(parsed) > 20:
-                    st.caption(f"Previewing 20 of {len(parsed)} parsed rows.")
-                mode = st.radio(
-                    "Save behavior",
-                    ["Append new transactions", "Replace this account"],
-                    help="Append ignores exact duplicates. Replace only clears history for the named account.",
-                )
-                confirmation = st.checkbox(
-                    "I reviewed the account, statement type, period, and preview"
-                )
-                if mode == "Replace this account":
-                    st.warning(f"This replaces saved history for “{account_name}”. Download a backup first if you may need those records later.")
-                if st.button(
-                    "Save statement",
-                    type="primary",
-                    disabled=not confirmation or not account_name.strip(),
-                    help="Append only new transactions, or replace history for the named account when that mode is selected.",
-                ):
-                    try:
-                        st.session_state.pop("undo_import_rows", None)
-                        if mode == "Append new transactions":
-                            before_ids = repo.get_existing_ids()
-                            inserted = repo.insert_many(parsed)
-                            new_ids = {item.id for item in parsed} - before_ids
-                            if new_ids:
-                                st.session_state.undo_import_rows = list({
-                                    item.id: item for item in parsed if item.id in new_ids
-                                }.values())
-                        else:
-                            inserted = repo.replace_account(account_name.strip(), parsed)
-                        st.session_state.import_success = f"Saved {inserted} new transaction(s)."
-                        st.rerun()
-                    except SupabaseError:
-                        st.error("The statement could not be saved. Your existing history is unchanged; please retry.")
-        if "import_success" in st.session_state:
-            st.success(st.session_state.pop("import_success"))
-        if st.session_state.get("undo_import_rows"):
-            if st.button(
-                "Undo last import",
-                help="Remove only the new rows from the latest appended statement, if none have changed since import.",
-            ):
-                try:
-                    removed = repo.undo_append(st.session_state.undo_import_rows)
-                    st.session_state.pop("undo_import_rows", None)
-                    st.success(f"Removed {removed} imported transaction(s).")
-                    st.rerun()
-                except SupabaseError:
-                    st.error("Some imported transactions changed. Nothing was removed; review your history before retrying.")
-
-    with backup_tab:
-        st.subheader("Download or restore your data")
-        st.caption("Downloaded backups are unencrypted and contain financial records. Store them privately. Bank connections and settings are not included.")
-        st.download_button(
-            "Download full JSON backup",
-            repo.export_backup(),
-            file_name="financebuddy-backup.json",
-            mime="application/json",
-            help="Download transactions, budgets, goals, and category rules in one portable FinanceBuddy backup.",
-        )
-        restore = st.file_uploader("Restore a FinanceBuddy JSON backup", type=["json"])
-        if restore:
-            try:
-                preview = read_backup(restore.getvalue())
-                st.write(
-                    f"Backup contains {len(preview.get('transactions', []))} transactions, "
-                    f"{len(preview.get('budgets', []))} budgets, and {len(preview.get('goals', []))} goals."
-                )
-                confirm_restore = st.checkbox("Replace my transactions, budgets, savings goals, and category rules")
-                if st.button(
-                    "Restore backup",
-                    disabled=not confirm_restore,
-                    help="Replace transactions, budgets, savings goals, and category rules. Bank connections and settings are kept.",
-                ):
-                    result = repo.restore_backup(restore.getvalue())
-                    st.success(f"Restored {result['transactions']} transactions.")
-                    st.rerun()
-            except (ValueError, SupabaseError):
-                st.error("The backup could not be restored. Check its format and review your saved data before retrying.")
-
-    with account_tab:
-        st.subheader("Saved accounts")
-        accounts = sorted({item.account_name for item in all_transactions})
-        if accounts:
-            account_rows = []
-            for account in accounts:
-                items = [item for item in all_transactions if item.account_name == account]
-                account_rows.append(
-                    {
-                        "Account": account,
-                        "Type": ", ".join(sorted({item.account_type for item in items})),
-                        "Transactions": len(items),
-                        "First date": min(item.date for item in items),
-                        "Latest date": max(item.date for item in items),
-                    }
-                )
-            st.dataframe(pd.DataFrame(account_rows), width="stretch", hide_index=True)
-            remove_account = st.selectbox("Account to remove", accounts)
-            typed_name = st.text_input(
-                f"Type {remove_account} to confirm permanent removal",
-                key="delete_account_confirmation",
-            )
-            if st.button(
-                "Remove account",
-                disabled=typed_name != remove_account,
-                help="Permanently delete every saved transaction for this account. Other accounts are not affected.",
-            ):
-                deleted = repo.delete_account(remove_account)
-                st.success(f"Removed {deleted} transaction(s) from {remove_account}.")
-                st.rerun()
+    if upload:
+        parsed, metrics = parse_statement(upload, account_name.strip(), account_type)
+        if not metrics.is_valid:
+            st.error("This statement could not be imported safely.")
+            for error in metrics.errors:
+                st.write(f"• {error}")
+            st.info("Check the account type and file format, then choose a corrected file. Nothing was saved.")
         else:
-            st.info("No saved accounts yet.")
-
-    with rule_tab:
-        st.subheader("Custom merchant rules")
-        rules = repo.get_category_rules()
-        if rules:
+            st.markdown("#### 3. Review the preview")
+            duplicates = repo.count_existing_ids(parsed)
+            start = min(item.date for item in parsed)
+            end = max(item.date for item in parsed)
+            st.success(
+                f"Parsed {metrics.valid_rows} of {metrics.total_rows} rows "
+                f"({metrics.accuracy_rate * 100:.1f}% row recognition)."
+            )
+            st.caption(
+                f"Detected period: {start.strftime('%b %-d, %Y')}–{end.strftime('%b %-d, %Y')} · "
+                f"{duplicates} already saved · {metrics.skipped_rows} skipped"
+            )
             st.dataframe(
-                pd.DataFrame([rule.model_dump() for rule in rules]).rename(
-                    columns={"keyword": "Keyword", "category": "Category"}
-                ),
+                transaction_frame(parsed[:20]),
                 width="stretch",
                 hide_index=True,
+                column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")},
             )
-            remove_rule = st.selectbox("Rule to remove", [rule.keyword for rule in rules])
+            if len(parsed) > 20:
+                st.caption(f"Previewing 20 of {len(parsed)} parsed rows.")
+            if metrics.skipped_rows:
+                with st.expander(f"Why {metrics.skipped_rows} row(s) were skipped"):
+                    for error in metrics.errors:
+                        st.write(f"• {error}")
+                    if metrics.skipped_rows > len(metrics.errors):
+                        st.caption("Only the first few row issues are shown. Export a cleaner CSV if important rows are missing.")
+            st.caption("Duplicates are matched by the statement's transaction identifiers. Append keeps existing matches and saves only new rows.")
+            st.markdown("#### 4. Choose how to save")
+            mode = st.radio(
+                "Save behavior",
+                ["Append new transactions", "Replace this account"],
+                help="Append ignores exact duplicates. Replace only clears history for the named account.",
+            )
+            confirmation = st.checkbox(
+                "I reviewed the account, statement type, period, and preview"
+            )
+            if mode == "Replace this account":
+                existing_count = sum(item.account_name == account_name.strip() for item in repo.get_all())
+                st.warning(f"This replaces {existing_count} saved transaction(s) for “{account_name}” with {len(parsed)} parsed row(s). Replacement cannot be undone.")
+                st.download_button(
+                    "Download backup before replacing",
+                    repo.export_backup(),
+                    file_name="financebuddy-before-replacement.json",
+                    mime="application/json",
+                )
             if st.button(
-                "Remove rule",
-                help="Stop automatically applying this keyword on future imports. Existing categories remain unchanged.",
+                "Save statement",
+                type="primary",
+                disabled=not confirmation or not account_name.strip(),
+                help="Append only new transactions, or replace history for the named account when that mode is selected.",
             ):
-                repo.delete_category_rule(remove_rule)
+                try:
+                    st.session_state.pop("undo_import_rows", None)
+                    if mode == "Append new transactions":
+                        before_ids = repo.get_existing_ids()
+                        inserted = repo.insert_many(parsed)
+                        new_ids = {item.id for item in parsed} - before_ids
+                        if new_ids:
+                            st.session_state.undo_import_rows = list({
+                                item.id: item for item in parsed if item.id in new_ids
+                            }.values())
+                    else:
+                        inserted = repo.replace_account(account_name.strip(), parsed)
+                    st.session_state.import_receipt = {
+                        "count": inserted, "account": account_name.strip(), "mode": mode,
+                    }
+                    st.rerun()
+                except SupabaseError:
+                    st.error("The statement could not be saved. Your existing history is unchanged; please retry.")
+    if st.session_state.get("undo_import_rows"):
+        if st.button(
+            "Undo last import",
+            help="Remove only the new rows from the latest appended statement, if none have changed since import.",
+        ):
+            try:
+                removed = repo.undo_append(st.session_state.undo_import_rows)
+                st.session_state.pop("undo_import_rows", None)
+                st.success(f"Removed {removed} imported transaction(s).")
                 st.rerun()
-        else:
-            st.info("Rules saved from category corrections will appear here.")
+            except SupabaseError:
+                st.error("Some imported transactions changed. Nothing was removed; review your history before retrying.")
+
+
+def render_backup_restore(all_transactions) -> None:
+    st.subheader("Download or restore your data")
+    st.caption("Downloaded backups are unencrypted and contain financial records. Store them privately. Bank connections and settings are not included.")
+    if st.session_state.get("restore_receipt"):
+        st.success(st.session_state.restore_receipt)
+    st.download_button(
+        "Download full JSON backup",
+        repo.export_backup(),
+        file_name="financebuddy-backup.json",
+        mime="application/json",
+        help="Download transactions, budgets, goals, and category rules in one portable FinanceBuddy backup.",
+    )
+    restore = st.file_uploader("Restore a FinanceBuddy JSON backup", type=["json"])
+    if restore:
+        try:
+            preview = read_backup(restore.getvalue())
+            st.warning("Restoring replaces the four collections below for your account. Bank connections and settings stay in place.")
+            st.dataframe(
+                pd.DataFrame([
+                    {"Collection": "Transactions", "Saved now": len(all_transactions), "In backup": len(preview["transactions"])},
+                    {"Collection": "Budgets", "Saved now": len(repo.get_budgets()), "In backup": len(preview["budgets"])},
+                    {"Collection": "Savings goals", "Saved now": len(repo.get_goals()), "In backup": len(preview["goals"])},
+                    {"Collection": "Category rules", "Saved now": len(repo.get_category_rules()), "In backup": len(preview["category_rules"])},
+                ]),
+                hide_index=True,
+                width="stretch",
+            )
+            confirm_restore = st.checkbox("I reviewed the counts and want to replace these four collections")
+            if st.button(
+                "Restore backup",
+                disabled=not confirm_restore,
+                help="Replace transactions, budgets, savings goals, and category rules. Bank connections and settings are kept.",
+            ):
+                result = repo.restore_backup(restore.getvalue())
+                st.session_state.restore_receipt = (
+                    f"Restore complete: {result['transactions']} transactions, "
+                    f"{result['budgets']} budgets, {result['goals']} goals, and "
+                    f"{result['category_rules']} category rules."
+                )
+                st.rerun()
+        except (ValueError, SupabaseError):
+            st.error("The backup could not be restored. Check its format and review your saved data before retrying.")
+
+
+def render_saved_accounts(all_transactions) -> None:
+    st.subheader("Saved accounts")
+    accounts = sorted({item.account_name for item in all_transactions})
+    if accounts:
+        account_rows = []
+        for account in accounts:
+            items = [item for item in all_transactions if item.account_name == account]
+            account_rows.append(
+                {
+                    "Account": account,
+                    "Type": ", ".join(sorted({item.account_type for item in items})),
+                    "Transactions": len(items),
+                    "First date": min(item.date for item in items),
+                    "Latest date": max(item.date for item in items),
+                }
+            )
+        st.dataframe(pd.DataFrame(account_rows), width="stretch", hide_index=True)
+        remove_account = st.selectbox("Account to remove", accounts)
+        typed_name = st.text_input(
+            f"Type {remove_account} to confirm permanent removal",
+            key="delete_account_confirmation",
+        )
+        if st.button(
+            "Remove account",
+            disabled=typed_name != remove_account,
+            help="Permanently delete every saved transaction for this account. Other accounts are not affected.",
+        ):
+            deleted = repo.delete_account(remove_account)
+            st.success(f"Removed {deleted} transaction(s) from {remove_account}.")
+            st.rerun()
+    else:
+        st.info("No saved accounts yet.")
+
+
+def render_category_rules() -> None:
+    st.subheader("Custom merchant rules")
+    rules = repo.get_category_rules()
+    if rules:
+        st.dataframe(
+            pd.DataFrame([rule.model_dump() for rule in rules]).rename(
+                columns={"keyword": "Keyword", "category": "Category"}
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        remove_rule = st.selectbox("Rule to remove", [rule.keyword for rule in rules])
+        if st.button(
+            "Remove rule",
+            help="Stop automatically applying this keyword on future imports. Existing categories remain unchanged.",
+        ):
+            repo.delete_category_rule(remove_rule)
+            st.rerun()
+    else:
+        st.info("Rules saved from category corrections will appear here.")
+
+
+def render_accounts(all_transactions) -> None:
+    render_feature_intro("Accounts", "Connect a bank, import a statement, or review saved accounts.")
+    view = st.radio("Accounts view", ["Bank connections", "Import statement", "Saved accounts"],
+                    horizontal=True, key="accounts_view")
+    if view == "Bank connections":
+        render_bank_connections()
+    elif view == "Import statement":
+        render_import_statement()
+    else:
+        render_saved_accounts(all_transactions)
+
+
+def render_settings(all_transactions) -> None:
+    render_feature_intro("Settings", "Manage backups, restore data, and review category rules.")
+    view = st.radio("Settings view", ["Backup & restore", "Category rules"],
+                    horizontal=True, key="settings_view")
+    if view == "Backup & restore":
+        render_backup_restore(all_transactions)
+    else:
+        render_category_rules()
 
 
 title_column, account_column, guide_column = st.columns([4, 1, 1])
@@ -1225,8 +1322,15 @@ show_onboarding = (
 if show_onboarding:
     render_onboarding()
 
+page = st.selectbox(
+    "Go to",
+    ["Overview", "Transactions", "Plan", "Accounts", "Compare", "Settings"],
+    key="nav_page",
+    help="Choose the part of FinanceBuddy you want to use. Your place is kept while saving.",
+)
+
 all_transactions = repo.get_all()
-if all_transactions:
+if all_transactions and page in ("Overview", "Transactions"):
     with st.sidebar:
         st.header("Dashboard filters")
         st.caption("These controls update Overview and Transactions. Monthly budgets always include all saved spending for the selected month.")
@@ -1298,26 +1402,43 @@ if all_transactions:
         minimum_amount,
     )
 else:
-    filtered_transactions = []
+    filtered_transactions = all_transactions
 
-overview_tab, transactions_tab, budgets_tab, compare_tab, import_tab = st.tabs(
-    ["Overview", "Transactions", "Budgets & goals", "Compare", "Import & data"]
-)
+if page in ("Overview", "Transactions") and all_transactions:
+    active_count = len(filtered_transactions)
+    st.caption(f"Showing {active_count:,} of {len(all_transactions):,} saved transactions")
+    active_filters = []
+    if (start_date, end_date) != (min_date, max_date):
+        active_filters.append("date range")
+    if set(selected_accounts) != set(account_options):
+        active_filters.append("accounts")
+    if set(selected_categories) != set(category_options):
+        active_filters.append("categories")
+    if len(selected_types) != 2:
+        active_filters.append("transaction type")
+    if search.strip():
+        active_filters.append(f"merchant: {search.strip()}")
+    if minimum_amount:
+        active_filters.append(f"minimum: {format_currency(minimum_amount)}")
+    if active_filters:
+        st.info("Active filters: " + " · ".join(active_filters))
+        st.button("Reset filters and show all", on_click=reset_dashboard_filters)
 
-with overview_tab:
+if page == "Overview":
     if not all_transactions:
-        st.info("No transaction data yet. Open Import & data to preview and save a statement.")
+        render_start_actions()
     else:
         render_overview(filtered_transactions)
-
-with transactions_tab:
-    render_transactions(filtered_transactions)
-
-with budgets_tab:
-    render_budgets_and_goals(all_transactions)
-
-with compare_tab:
+elif page == "Transactions":
+    if not all_transactions:
+        render_start_actions()
+    else:
+        render_transactions(filtered_transactions)
+elif page == "Plan":
+    render_plan(all_transactions)
+elif page == "Compare":
     render_compare()
-
-with import_tab:
-    render_import_and_data(all_transactions)
+elif page == "Accounts":
+    render_accounts(all_transactions)
+else:
+    render_settings(all_transactions)

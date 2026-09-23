@@ -64,11 +64,16 @@ backup and restore that backup after signing in to migrate legacy activity delib
 python -m scripts.export_sqlite data/finance.db financebuddy-backup.json
 ```
 
-After logging in with the intended Supabase account, open **Import & data → Backup &
+After logging in with the intended Supabase account, open **Settings → Backup &
 restore** and upload that JSON file. This deliberately assigns the imported rows to that
 authenticated Supabase user; the migration never guesses account ownership.
 
 ## Dashboard features
+
+Use the **Go to** selector to move among Overview, Transactions, Plan, Accounts,
+Compare, and Settings. Each view keeps its place after saving. New accounts can start
+from Overview with one action to connect a bank or upload a statement. Accounts holds
+bank connections, imports, and saved accounts; Settings holds backup/restore and rules.
 
 - Account-aware metrics for checking and credit-card statements
 - Global date, account, category, transaction-type, merchant, and amount filters with clear/select-all/reset controls
@@ -88,7 +93,7 @@ FinanceBuddy supports Plaid alongside statement imports. Plaid credentials and p
 1. Create a Plaid application and copy `.env.example` to `.env`.
 2. Add `PLAID_CLIENT_ID`, your **Production** secret, and `PLAID_ENV=production`. Plaid Trial uses the Production environment and real institution data; its ten-Item allowance is enforced by Plaid.
 3. Set a private `PLAID_TOKEN_ENCRYPTION_KEY`. Keep this value stable when rotating Plaid secrets, because it encrypts stored access tokens.
-4. Run the app and open **Import & data → Bank connections**.
+4. Run the app and open **Accounts → Bank connections**.
 
 For a hosted deployment, configure the same values in the host's encrypted secret settings instead of committing `.env`. Streamlit secrets are also supported with this shape:
 

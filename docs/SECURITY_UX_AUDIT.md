@@ -3,7 +3,8 @@
 > Historical audit from September 22, 2026. The security and data-integrity items
 > implemented since this review, plus remaining rollout and operational work, are
 > recorded in [SECURITY_IMPLEMENTATION.md](SECURITY_IMPLEMENTATION.md). The UI/UX
-> findings below remain a separate design backlog.
+> findings below describe the original state; the current implementation status is
+> recorded after the table.
 
 Reviewed September 22, 2026. Changes are local; no production deployment or database migration was performed.
 
@@ -65,3 +66,20 @@ Supabase's [production checklist](https://supabase.com/docs/guides/deployment/go
 | Low | Login fills the desktop viewport and the app exposes development-oriented toolbar controls. | Use a constrained auth form width and production-appropriate toolbar settings; preserve the usable mobile form layout observed in this review. |
 
 Suggested order: transactional safety and deployed RLS tests first; onboarding/navigation and import recovery second; accessibility/mobile history third. A new frontend framework should only be considered if measured Streamlit navigation, performance, or accessibility limitations block these goals.
+
+## UX implementation update
+
+The current app uses persistent Overview, Transactions, Plan, Accounts, Compare, and
+Settings navigation. Only the selected page and its selected subsection render. Empty
+Overview and Transactions pages offer direct bank and statement actions. Import now
+guides account selection, file upload, preview, and save; it explains skipped rows and
+duplicate matching, shows replacement impact and a backup download, and retains a save
+receipt with a category-review action. Restore shows before/after collection counts.
+Active filters and visible/total transaction counts appear in the main view with a reset
+button. Mobile cards are paged so the full filtered history remains reachable. The auth
+form is width constrained and recovery codes require password confirmation. The primary
+button text and keyboard focus are more visible.
+
+Automated UI smoke tests cover first-run routing, page persistence, budget independence,
+and mobile paging. A deployed keyboard, screen-reader, and mobile-device review remains
+necessary to confirm these improvements with real browser behavior and Plaid Link.

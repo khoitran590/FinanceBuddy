@@ -58,7 +58,7 @@ Supabase security advisor reported only leaked-password protection disabled.
    or integer minor units across storage, models, import, and analytics. Direct API
    clients also bypass the app's aggregate import quotas; add database-side per-user
    limits if that abuse case matters for public sign-up.
-5. The UX/navigation overhaul in [SECURITY_UX_AUDIT.md](SECURITY_UX_AUDIT.md) remains
-   open. It should be planned from user flows and tested in the deployed app; this
-   security release changes only error handling, session expiry, import safety, and
-   truthful copy around undo and backups.
+5. The navigation and import overhaul described in
+   [SECURITY_UX_AUDIT.md](SECURITY_UX_AUDIT.md) is implemented locally. It still needs
+   a deployed mobile and keyboard review with real authentication, Plaid Link, and
+   uploaded statements before its usability can be confirmed in production.

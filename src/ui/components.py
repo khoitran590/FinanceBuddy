@@ -15,6 +15,7 @@ def inject_app_styles() -> None:
         """
         <style>
         .block-container { padding-top: 2rem; padding-bottom: 4rem; }
+        .st-key-auth_shell { max-width: 34rem; margin-inline: auto; }
         [data-testid="stMetric"] {
             background: linear-gradient(145deg, rgba(30,41,59,.72), rgba(15,23,42,.72));
             border: 1px solid rgba(148,163,184,.18);
@@ -34,7 +35,11 @@ def inject_app_styles() -> None:
         .fb-card-meta { color:#94A3B8; font-size:.85rem; margin-top:.3rem; }
         .fb-positive { color:#38BDF8; }
         .fb-negative { color:#FB923C; }
-        .fb-mobile-transactions { display:none; }
+        .fb-mobile-transactions, .st-key-mobile_history_controls { display:none; }
+        :is(button, input, select, textarea, [role="radio"], [role="combobox"]):focus-visible {
+            outline: 3px solid #93C5FD !important;
+            outline-offset: 2px;
+        }
         .fb-progress-label { display:flex; justify-content:space-between; gap:1rem; }
         .fb-feature-intro {
             border-left: 3px solid #60A5FA;
@@ -47,7 +52,7 @@ def inject_app_styles() -> None:
         @media (max-width: 640px) {
             .block-container { padding-left: 1rem; padding-right: 1rem; padding-top: 1.2rem; }
             .st-key-desktop_transactions { display:none; }
-            .fb-mobile-transactions { display:block; }
+            .fb-mobile-transactions, .st-key-mobile_history_controls { display:block; }
             h1 { font-size: 2rem !important; }
         }
         </style>
@@ -135,8 +140,20 @@ def render_transaction_table(transactions: List[Transaction], height: int = 520)
             },
         )
 
+    page_size = 50
+    page_count = max(1, (len(transactions) + page_size - 1) // page_size)
+    if st.session_state.get("mobile_history_page", 1) > page_count:
+        st.session_state.mobile_history_page = page_count
+    with st.container(key="mobile_history_controls"):
+        page = st.selectbox(
+            "Mobile history page",
+            options=list(range(1, page_count + 1)),
+            format_func=lambda number: f"Page {number} of {page_count}",
+            key="mobile_history_page",
+        )
+        st.caption(f"Transactions {(page - 1) * page_size + 1}–{min(page * page_size, len(transactions))} of {len(transactions):,}")
     cards = []
-    for transaction in transactions[:50]:
+    for transaction in transactions[(page - 1) * page_size:page * page_size]:
         amount_class = "fb-positive" if transaction.amount > 0 else "fb-negative"
         cards.append(
             (
@@ -151,10 +168,6 @@ def render_transaction_table(transactions: List[Transaction], height: int = 520)
                 category=html.escape(transaction.category),
                 account=html.escape(transaction.account_name),
             )
-        )
-    if len(transactions) > 50:
-        cards.append(
-            f'<p class="fb-card-meta">Showing the newest 50 of {len(transactions):,} transactions on mobile.</p>'
         )
     st.markdown(
         '<div class="fb-mobile-transactions">' + "".join(cards) + "</div>",
