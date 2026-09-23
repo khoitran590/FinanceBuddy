@@ -5,6 +5,7 @@ from datetime import date
 from pathlib import Path
 
 import httpx
+import pytest
 
 from src.domain.models import Transaction
 from src.repositories.supabase_repo import SupabaseTransactionRepository
@@ -12,6 +13,8 @@ from src.services.supabase import (
     SupabaseAuth,
     SupabaseConfig,
     SupabaseDataClient,
+    SupabaseError,
+    has_verified_email,
     normalized_session,
 )
 
@@ -41,6 +44,37 @@ def test_supabase_password_login_uses_publishable_key_and_normalizes_session():
     assert session["access_token"] == "access"
     assert session["refresh_token"] == "refresh"
     assert session["expires_at"] > 0
+
+
+@pytest.mark.parametrize("token_type", ["email", "recovery"])
+def test_email_link_exchanges_token_hash_for_session(token_type):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/auth/v1/verify")
+        assert json.loads(request.content) == {
+            "token_hash": "hash-from-email",
+            "type": token_type,
+        }
+        return httpx.Response(
+            200,
+            json={"access_token": "access", "refresh_token": "refresh"},
+        )
+
+    config = SupabaseConfig("https://project.supabase.co", "sb_publishable_test")
+    auth = SupabaseAuth(config, transport=httpx.MockTransport(handler))
+    assert auth.verify_email_link("hash-from-email", token_type)["access_token"] == "access"
+
+
+def test_email_link_rejects_unexpected_type_without_request():
+    config = SupabaseConfig("https://project.supabase.co", "sb_publishable_test")
+    auth = SupabaseAuth(config)
+    with pytest.raises(SupabaseError, match="invalid"):
+        auth.verify_email_link("hash-from-email", "invite")
+
+
+def test_email_verification_is_required_for_financial_access():
+    assert has_verified_email({"email": "person@example.com", "email_confirmed_at": "2026-09-20T00:00:00Z"})
+    assert not has_verified_email({"email": "person@example.com", "email_confirmed_at": None})
+    assert not has_verified_email({"email": "person@example.com", "confirmed_at": "2026-09-20T00:00:00Z"})
 
 
 def test_data_client_sends_user_jwt_for_rls():

@@ -102,6 +102,13 @@ class SupabaseAuth:
             "POST", "verify", json={"email": email, "token": token, "type": "email"}
         )
 
+    def verify_email_link(self, token_hash: str, token_type: str) -> dict:
+        if token_type not in {"email", "recovery"} or not token_hash:
+            raise SupabaseError("This email link is invalid. Request a new one.")
+        return self._request(
+            "POST", "verify", json={"token_hash": token_hash, "type": token_type}
+        )
+
     def send_recovery_email(self, email: str) -> None:
         self._request(
             "POST",
@@ -138,6 +145,11 @@ def normalized_session(payload: Mapping[str, Any]) -> dict[str, Any]:
         "refresh_token": str(payload.get("refresh_token") or ""),
         "expires_at": int(payload.get("expires_at") or (time.time() + expires_in)),
     }
+
+
+def has_verified_email(user: Mapping[str, Any]) -> bool:
+    """Require a confirmed email even if the provider's sign-in policy changes."""
+    return bool(user.get("email") and user.get("email_confirmed_at"))
 
 
 class SupabaseDataClient:

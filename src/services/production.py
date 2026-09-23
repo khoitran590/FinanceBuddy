@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+from ipaddress import ip_address
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 
 def _section(values: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -12,6 +13,33 @@ def _section(values: Mapping[str, Any], name: str) -> Mapping[str, Any]:
 
 def _value(section: Mapping[str, Any], key: str, env_name: str) -> str:
     return str(os.getenv(env_name) or section.get(key) or "").strip()
+
+
+def _is_public_https_url(value: str, *, origin_only: bool = False) -> bool:
+    """Reject local, malformed, and credential-bearing production URLs."""
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        if (
+            parsed.scheme != "https"
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+            or (origin_only and parsed.path not in ("", "/"))
+            or (origin_only and parsed.query)
+            or parsed.fragment
+            or host == "localhost"
+            or host.endswith((".localhost", ".local"))
+        ):
+            return False
+        # urlsplit does not validate a malformed port until .port is accessed.
+        parsed.port
+        try:
+            return ip_address(host).is_global
+        except ValueError:
+            return "." in host
+    except ValueError:
+        return False
 
 
 def validate_production_configuration(secrets: Mapping[str, Any]) -> list[str]:
@@ -44,19 +72,22 @@ def validate_production_configuration(secrets: Mapping[str, Any]) -> list[str]:
             _value(supabase, "public_app_url", "PUBLIC_APP_URL"),
         ),
     ):
-        parsed = urlparse(value)
-        if parsed.scheme != "https" or parsed.hostname in {"localhost", "127.0.0.1"}:
-            errors.append(f"{field} must be a public HTTPS URL in production.")
+        if not _is_public_https_url(value, origin_only=True):
+            errors.append(f"{field} must be a public HTTPS origin with no path, query, or fragment in production.")
 
     plaid_environment = _value(plaid, "environment", "PLAID_ENV").lower()
     if plaid_environment != "production":
         errors.append("plaid.environment must be production.")
 
+    if _value(plaid, "redirect_uri", "PLAID_REDIRECT_URI"):
+        errors.append(
+            "plaid.redirect_uri must be unset: the embedded Link UI does not resume OAuth redirects yet."
+        )
+
     for field, value in (
-        ("plaid.redirect_uri", _value(plaid, "redirect_uri", "PLAID_REDIRECT_URI")),
         ("plaid.webhook_url", _value(plaid, "webhook_url", "PLAID_WEBHOOK_URL")),
     ):
-        if value and urlparse(value).scheme != "https":
-            errors.append(f"{field} must use HTTPS when configured.")
+        if value and not _is_public_https_url(value):
+            errors.append(f"{field} must be a public HTTPS URL when configured.")
 
     return errors

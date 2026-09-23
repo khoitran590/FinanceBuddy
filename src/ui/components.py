@@ -163,7 +163,14 @@ def render_transaction_table(transactions: List[Transaction], height: int = 520)
 
 
 def transactions_to_csv(transactions: Iterable[Transaction]) -> bytes:
-    return transaction_frame(transactions).to_csv(index=False).encode("utf-8")
+    frame = transaction_frame(transactions)
+    for column in ("Category", "Description", "Account", "Type"):
+        frame[column] = frame[column].map(
+            lambda value: "'" + value
+            if isinstance(value, str) and value.lstrip(" \t\r\n").startswith(("=", "+", "-", "@"))
+            else value
+        )
+    return frame.to_csv(index=False).encode("utf-8")
 
 
 def render_progress(label: str, current: float, target: float) -> None:

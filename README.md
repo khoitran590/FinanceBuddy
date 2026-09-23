@@ -27,17 +27,21 @@ authority for every read and write.
    secret key or legacy `service_role` key.
 4. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set the project
    URL, publishable key, and local `public_app_url`.
-5. Under **Authentication → URL Configuration**, set the Site URL to the deployed Render
-   URL and add both the deployed URL and `http://localhost:8501` to Redirect URLs.
-6. Keep **Confirm email** enabled. In both the confirmation and recovery email templates,
-   include the six-digit `{{ .Token }}` value so FinanceBuddy can verify the code and open
-   the dashboard immediately.
+5. Under **Authentication → URL Configuration**, set the Site URL to the final deployed
+   HTTPS Render URL and allowlist that exact URL. Do not allowlist localhost in the
+   production Supabase project; use a separate development project for local email-link
+   testing. Keep `PUBLIC_APP_URL` identical to the allowlisted production URL.
+6. Keep **Confirm email** enabled. Under **Authentication → Emails → Templates**, use
+   `supabase/templates/confirm-sign-up.html` for **Confirm sign up** and
+   `supabase/templates/reset-password.html` for **Reset password**. These templates offer
+   a one-click link and a code fallback; FinanceBuddy exchanges the one-time link token
+   with Supabase, removes it from the address bar, and then opens the dashboard or reset form.
 7. Configure the existing SendGrid account under **Authentication → SMTP Settings**. Use
    SendGrid host `smtp.sendgrid.net`, port `587`, username `apikey`, the SendGrid API key
    as the password, and the verified From address.
 
 Supabase Auth provides account creation, email verification, login, logout, token refresh,
-and password recovery. Session tokens live only in Streamlit session state; passwords and
+and password recovery. Session tokens live only in server-side Streamlit session state; passwords and
 Supabase secret keys are never stored by FinanceBuddy.
 
 Security boundaries implemented by the app include:
@@ -94,7 +98,9 @@ country_codes = ["US"]
 token_encryption_key = "..."
 ```
 
-If you enable OAuth institutions, also set `PLAID_REDIRECT_URI` (or `plaid.redirect_uri`) to an exact redirect URI registered in the Plaid Dashboard. Production access and OAuth institution approval are controlled in Plaid.
+The current embedded Plaid Link UI does not resume an OAuth redirect after returning to
+FinanceBuddy. Leave `PLAID_REDIRECT_URI` unset; OAuth-only institutions are not supported
+by this release. Production access and institution availability are controlled in Plaid.
 
 The first Transactions Sync response can contain no activity while Plaid prepares transaction history. Use **Sync transactions** again after Plaid finishes processing; subsequent syncs use a saved cursor and apply added, modified, and removed records without overwriting a category you corrected manually.
 
@@ -116,15 +122,19 @@ durable state lives in Supabase.
 1. Create a Render Blueprint from this repository. It declares the free web-service plan
    and does not request a disk or payment method.
 2. Set `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, and `PUBLIC_APP_URL`. `PUBLIC_APP_URL`
-   must be the final HTTPS `onrender.com` URL.
-3. Set `PLAID_CLIENT_ID`, `PLAID_SECRET`, and a stable random
-   `PLAID_TOKEN_ENCRYPTION_KEY`. Never reuse or casually rotate the encryption key.
+   must be the final HTTPS `onrender.com` URL. If Render has not assigned it yet,
+   create the service first, then set the exact assigned URL and redeploy. The app will
+   intentionally refuse to start until that value is valid.
+3. Set `PLAID_CLIENT_ID` and `PLAID_SECRET`. Render generates a private
+   `PLAID_TOKEN_ENCRYPTION_KEY` on the initial Blueprint deployment. Keep that value
+   stable: rotating it makes existing encrypted bank tokens unreadable.
 4. Keep `PLAID_ENV=production`; use the Production secret supplied for the Plaid Trial.
-   Register `PLAID_REDIRECT_URI` if OAuth institutions are enabled. Set
-   `PLAID_WEBHOOK_URL` to a separate HTTPS webhook receiver if you enable automatic
+   Leave `PLAID_REDIRECT_URI` unset until the OAuth return flow is implemented. Set
+   `PLAID_WEBHOOK_URL` only if you run a separate HTTPS webhook receiver for automatic
    Transactions updates; Link tokens will register it with Plaid.
-5. Enable Supabase email verification and configure SendGrid custom SMTP before inviting
-   real users. Enable the available CAPTCHA, rate limits, and MFA policies.
+5. Keep Supabase **Confirm email** enabled, configure SendGrid custom SMTP, and install
+   the two email templates above before inviting real users. Review the available CAPTCHA,
+   rate limits, and MFA policies for your threat model.
 6. Verify login, email verification, Plaid Link, sync, disconnect, export, and restore on
    the deployed HTTPS URL. Export periodic encrypted backups; Supabase Free does not include
    automatic database backups and may pause after low activity.
@@ -133,6 +143,12 @@ Required production variables are `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`,
 `PUBLIC_APP_URL`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, and
 `PLAID_TOKEN_ENCRYPTION_KEY`. The app refuses to start when these are missing, Supabase or
 application URLs are unsafe, or Plaid is not in Production.
+
+Before public launch, verify sign-up, confirmation link and code, password recovery,
+cross-account isolation, Plaid Link, transaction sync, and disconnect on the deployed
+HTTPS URL. The free Render service sleeps when idle and has an ephemeral filesystem;
+Supabase Free does not provide downloadable database backups. These free tiers are useful
+for a pilot but do not provide always-on availability or managed backup recovery.
 
 ## CSV import behavior
 

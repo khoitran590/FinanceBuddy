@@ -24,6 +24,7 @@ from src.services.supabase import (
     SupabaseConfig,
     SupabaseDataClient,
     SupabaseError,
+    has_verified_email,
     normalized_session,
 )
 from src.ui.charts import (
@@ -99,6 +100,28 @@ def _clear_supabase_session() -> None:
     st.session_state.pop("supabase_session", None)
 
 
+def _consume_auth_link() -> None:
+    token_hash = st.query_params.get("token_hash")
+    token_type = st.query_params.get("type")
+    if not token_hash and not token_type:
+        return
+    # Remove one-time credentials from the address bar before rendering financial data.
+    st.query_params.clear()
+    try:
+        payload = auth.verify_email_link(str(token_hash or ""), str(token_type or ""))
+        if token_type == "email":
+            _save_supabase_session(payload)
+            st.session_state.pop("pending_verification_email", None)
+        else:
+            recovery_session = normalized_session(payload)
+            if not recovery_session["access_token"] or not recovery_session["refresh_token"]:
+                raise SupabaseError("Supabase did not return a complete recovery session.")
+            _clear_supabase_session()
+            st.session_state.recovery_link_session = recovery_session
+    except SupabaseError:
+        st.session_state.auth_link_error = True
+
+
 def _render_authentication() -> None:
     st.title("💸 FinanceBuddy")
     st.subheader("Your finances stay private to your account")
@@ -106,6 +129,37 @@ def _render_authentication() -> None:
         "Log in or create an account with Supabase Auth. FinanceBuddy never stores your password, "
         "and PostgreSQL row-level security keeps every financial record tied to your account."
     )
+    if st.session_state.pop("auth_link_error", None):
+        st.error("This email link could not be used. Request a fresh email and try again.")
+    if st.session_state.pop("unverified_email_error", None):
+        st.warning("Verify your email address before accessing financial data.")
+    recovery_link_session = st.session_state.get("recovery_link_session")
+    if recovery_link_session:
+        st.info("Email verified. Choose a new password to finish recovering your account.")
+        with st.form("finish_link_recovery"):
+            new_password = st.text_input(
+                "New password", type="password", autocomplete="new-password"
+            )
+            confirm_password = st.text_input(
+                "Confirm new password", type="password", autocomplete="new-password"
+            )
+            reset_submitted = st.form_submit_button(
+                "Set new password", type="primary", width="stretch"
+            )
+        if reset_submitted:
+            if len(new_password) < 12:
+                st.error("Use at least 12 characters for your password.")
+            elif new_password != confirm_password:
+                st.error("The passwords do not match.")
+            else:
+                try:
+                    auth.update_password(recovery_link_session["access_token"], new_password)
+                    _save_supabase_session(recovery_link_session)
+                    st.session_state.pop("recovery_link_session", None)
+                    st.rerun()
+                except (KeyError, SupabaseError) as error:
+                    st.error(str(error))
+        return
     login_tab, signup_tab, recovery_tab = st.tabs(
         ["Log in", "Create account", "Reset password"]
     )
@@ -158,7 +212,8 @@ def _render_authentication() -> None:
                         st.rerun()
                     st.session_state.pending_verification_email = signup_email.strip().lower()
                     st.success(
-                        "Account created. Enter the verification code from the FinanceBuddy email below."
+                        "If this is a new account, check your email for a verification code. "
+                        "If you already verified this address, use Log in instead."
                     )
                 except SupabaseError as error:
                     st.error(str(error))
@@ -185,7 +240,10 @@ def _render_authentication() -> None:
             if st.button("Resend verification email", width="stretch"):
                 try:
                     auth.resend_signup_email(resend_email.strip().lower())
-                    st.success("If that account exists, Supabase sent another verification email.")
+                    st.success(
+                        "If this account still needs verification, check for a new email. "
+                        "Already verified? Use Log in instead."
+                    )
                 except SupabaseError as error:
                     st.error(str(error))
 
@@ -225,10 +283,11 @@ def _render_authentication() -> None:
                     except (KeyError, SupabaseError) as error:
                         st.error(str(error))
     st.caption(
-        "Authentication is provided by Supabase. Session tokens remain only in this Streamlit browser session."
+        "Authentication is provided by Supabase. Session tokens stay in this server-side Streamlit session."
     )
 
 
+_consume_auth_link()
 session = st.session_state.get("supabase_session")
 user = None
 if session:
@@ -242,6 +301,12 @@ if session:
         session = None
 
 if not session or not user:
+    _render_authentication()
+    st.stop()
+
+if not has_verified_email(user):
+    _clear_supabase_session()
+    st.session_state.unverified_email_error = True
     _render_authentication()
     st.stop()
 

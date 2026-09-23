@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from src.services.production import validate_production_configuration
 
 
@@ -52,3 +54,48 @@ def test_production_requires_explicit_encryption_and_supabase_key(monkeypatch):
 
     assert any("plaid.token_encryption_key" in error for error in errors)
     assert any("supabase.publishable_key" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://",
+        "https://localhost:8501",
+        "https://127.0.0.1",
+        "https://192.168.1.2",
+        "https://internal.local",
+        "https://user:password@finance.example",
+        "https://finance.example/callback",
+        "https://finance.example?next=/dashboard",
+        "https://finance.example#dashboard",
+        "https://finance.example:invalid",
+    ],
+)
+def test_production_requires_public_root_app_url(monkeypatch, bad_url):
+    monkeypatch.setenv("FINANCEBUDDY_ENV", "production")
+    secrets = _valid_secrets()
+    secrets["supabase"]["public_app_url"] = bad_url
+
+    errors = validate_production_configuration(secrets)
+
+    assert any("supabase.public_app_url" in error for error in errors)
+
+
+def test_production_rejects_supabase_url_with_path_or_credentials(monkeypatch):
+    monkeypatch.setenv("FINANCEBUDDY_ENV", "production")
+    secrets = _valid_secrets()
+    secrets["supabase"]["url"] = "https://secret@project.supabase.co/auth/v1"
+
+    errors = validate_production_configuration(secrets)
+
+    assert any("supabase.url" in error for error in errors)
+
+
+def test_production_rejects_unimplemented_plaid_oauth_redirect(monkeypatch):
+    monkeypatch.setenv("FINANCEBUDDY_ENV", "production")
+    secrets = _valid_secrets()
+    secrets["plaid"]["redirect_uri"] = "https://localhost:8501/plaid/callback"
+
+    errors = validate_production_configuration(secrets)
+
+    assert any("plaid.redirect_uri" in error for error in errors)

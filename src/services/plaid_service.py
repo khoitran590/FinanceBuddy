@@ -86,7 +86,7 @@ class PlaidConfig:
 
 
 class TokenCipher:
-    """Encrypt Plaid access tokens before they are written to SQLite."""
+    """Encrypt Plaid access tokens before they are stored in Supabase."""
 
     def __init__(self, config: PlaidConfig) -> None:
         material = config.token_encryption_key or f"{config.client_id}:{config.secret}"
