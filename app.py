@@ -453,10 +453,26 @@ def apply_custom_dates() -> None:
         st.session_state.dashboard_dates = tuple(picked)
 
 
+def keep_choice(key: str, options: list[str], format_func=None) -> None:
+    """Keep a choice whose label includes a live count, such as "Pending (3)".
+
+    The browser remembers the label, so when the count changes Streamlit hands back
+    the old label text instead of the option. Map it back, or fall back to the first option.
+    """
+    labels_key = f"_labels_{key}"
+    value = st.session_state.get(key)
+    if value not in options:
+        value = st.session_state.get(labels_key, {}).get(value)
+        st.session_state[key] = value if value in options else options[0]
+    if format_func:
+        # Keep older labels too: the browser can send one from a few runs back.
+        labels = st.session_state.setdefault(labels_key, {})
+        labels.update({format_func(option): option for option in options})
+
+
 def view_switcher(label: str, options: list[str], key: str, **kwargs):
     """A segmented control that always has one option selected."""
-    if st.session_state.get(key) not in options:
-        st.session_state[key] = options[0]
+    keep_choice(key, options, kwargs.get("format_func"))
     return st.segmented_control(
         label, options, key=key, required=True, label_visibility="collapsed", **kwargs
     )
@@ -619,6 +635,8 @@ def render_spending_drilldown(transactions, category_event, month_event) -> None
     categories = [item["category"] for item in AnalyticsService.category_summary(transactions)]
     clicked_categories = [str(value) for value in _selected_points(category_event, "y")]
     clicked_months = [str(value)[:7] for value in _selected_points(month_event, "x")]
+    if st.session_state.get("drilldown_category") not in ["All categories"] + categories:
+        st.session_state.pop("drilldown_category", None)
     chosen = st.selectbox(
         "Category to explore",
         ["All categories"] + categories,
@@ -1370,6 +1388,9 @@ def render_transactions(transactions):
     with st.expander("Split a transaction between two categories"):
         expense_options = [item for item in transactions if item.amount < 0]
         if expense_options:
+            # A split replaces the original, so drop a choice that no longer exists.
+            if st.session_state.get("split_transaction") not in {item.id for item in expense_options}:
+                st.session_state.pop("split_transaction", None)
             split_id = st.selectbox(
                 "Expense to split",
                 [item.id for item in expense_options],
@@ -2328,16 +2349,16 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     with st.container(key="nav_menu"):
-        if st.session_state.get("nav_page") not in PAGES:
-            st.session_state.nav_page = PAGES[0]
+        def menu_label(name: str) -> str:
+            return f"{name} ({needs_review} to review)" if name == "Transactions" and needs_review else name
+
+        keep_choice("nav_page", PAGES, menu_label)
         page = st.radio(
             "Menu",
             PAGES,
             key="nav_page",
             label_visibility="collapsed",
-            format_func=lambda name: (
-                f"{name} ({needs_review} to review)" if name == "Transactions" and needs_review else name
-            ),
+            format_func=menu_label,
         )
     st.markdown('<p class="fb-menu-label">Add data</p>', unsafe_allow_html=True)
     menu_actions = st.container(key="menu_actions")

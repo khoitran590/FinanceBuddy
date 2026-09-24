@@ -275,16 +275,22 @@ def render_transaction_table(
 
     page_size = 50
     page_count = max(1, (len(transactions) + page_size - 1) // page_size)
-    if st.session_state.get("mobile_history_page", 1) > page_count:
-        st.session_state.mobile_history_page = page_count
+    # The browser remembers the page by its label, so a label that changes with the
+    # row count can come back as text. Keep labels stable and repair stale values.
+    stored_page = st.session_state.get("mobile_history_page", 1)
+    if not isinstance(stored_page, int) or not 1 <= stored_page <= page_count:
+        st.session_state.mobile_history_page = page_count if isinstance(stored_page, int) and stored_page > page_count else 1
     with st.container(key="mobile_history_controls"):
         page = st.selectbox(
             "Mobile history page",
             options=list(range(1, page_count + 1)),
-            format_func=lambda number: f"Page {number} of {page_count}",
+            format_func=lambda number: f"Page {number}",
             key="mobile_history_page",
         )
-        st.caption(f"Transactions {(page - 1) * page_size + 1}–{min(page * page_size, len(transactions))} of {len(transactions):,}")
+        st.caption(
+            f"Page {page} of {page_count} · transactions {(page - 1) * page_size + 1}–"
+            f"{min(page * page_size, len(transactions))} of {len(transactions):,}"
+        )
     cards = []
     for transaction in transactions[(page - 1) * page_size:page * page_size]:
         amount_class = "fb-positive" if transaction.amount > 0 else "fb-negative"

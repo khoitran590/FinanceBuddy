@@ -273,3 +273,29 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     app.segmented_control(key='plan_view').set_value('Savings goals').run()
     assert not app.exception
     assert any('projected to finish around' in item.value for item in app.markdown)
+
+
+def test_mobile_history_page_recovers_from_stale_label(monkeypatch):
+    from src.ui import components
+
+    captured = {}
+
+    class FakeState(dict):
+        __getattr__ = dict.get
+
+        def __setattr__(self, key, value):
+            self[key] = value
+
+    state = FakeState(mobile_history_page="Page 1 of 2")
+    monkeypatch.setattr(components.st, "session_state", state)
+
+    def fake_selectbox(label, options, format_func, key):
+        captured["value"] = state[key]
+        captured["labels"] = [format_func(option) for option in options]
+        return state[key]
+
+    monkeypatch.setattr(components.st, "selectbox", fake_selectbox)
+    monkeypatch.setattr(components.st, "dataframe", lambda *args, **kwargs: None)
+    components.render_transaction_table([])
+    assert captured["value"] == 1
+    assert captured["labels"] == ["Page 1"]
