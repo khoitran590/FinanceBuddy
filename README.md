@@ -70,19 +70,26 @@ authenticated Supabase user; the migration never guesses account ownership.
 
 ## Dashboard features
 
-Use the **Go to** selector to move among Overview, Transactions, Plan, Accounts,
-Compare, and Settings. Each view keeps its place after saving. New accounts can start
-from Overview with one action to connect a bank or upload a statement. Accounts holds
-bank connections, imports, and saved accounts; Settings holds backup/restore and rules.
+The sidebar menu moves among Overview, Transactions, Plan, Accounts, Compare, and Settings,
+and shows how many transactions still need a category. On phones it folds behind the menu
+button. Each view keeps its place after saving. New accounts can start from Overview or the
+sidebar with one action to connect a bank or upload a statement.
+
+Light and dark themes are both built in. The app follows the device setting, and anyone can
+switch under **⋮ → Settings → Theme**. Charts and custom styling change with it. Blue marks
+money in and good news; orange marks money out and things that need attention, so meaning
+never depends on red versus green. Public Sans and Newsreader are self-hosted from
+`static/fonts` (SIL Open Font License), so no third-party font service is contacted.
 
 - Account-aware metrics for checking and credit-card statements, each compared with the matching previous period
-- Transfers and credit-card payments are left out of income and spending (with a sidebar toggle) so card purchases are not counted twice; older card payments saved as Debt Payments can be moved with one click
+- Transfers and credit-card payments are left out of income and spending (with a toggle under **More filters**) so card purchases are not counted twice; older card payments saved as Debt Payments can be moved with one click
 - Plain-language insight cards, such as price increases, fast-growing categories, and yearly subscription cost
 - Overview tabs: **Summary** (click a category or month bar to drill into its transactions), **Trends** (savings rate by month, fixed vs flexible spending, daily spending with a 7-day average, a where-the-money-went flow chart), **Habits** (day-of-week and time-of-month spending, top merchants, online vs in-store, locations), **Recurring & income** (schedule-aware recurring charges with next dates, yearly cost, and price changes; pay frequency, next payday, and income stability), and **Balances** for connected banks (net worth and its trend, cash available, safe-to-spend before payday, credit utilization per card)
-- Quick date ranges (this month, last month, last 30 days, last 3 months, year to date, last 12 months) alongside the custom date picker
-- Global date, account, category, transaction-type, merchant, and amount filters with clear/select-all/reset controls
+- A compact filter bar above Overview and Transactions: one-tap date ranges (this month, last month, 30 days, 3 months, year to date, 12 months, all, or custom), account and category pickers with select-all/clear, merchant search, and **More filters** for money in/out, minimum amount, and transfers, plus chips that show what is active and one Reset
+- Switchable chart styles: money in vs out as columns, lines, or net; spending by category as a donut, bars, or tile map; fixed vs flexible stacked or side by side; category trend as a heat map or lines; top merchants as bars or a table. Choices are saved with the account
+- **Add a chart** on Summary to pin extra charts (running total, savings rate, daily spending, cash flow, weekday, time of month, top merchants, income, and more)
 - Responsive desktop tables and mobile transaction cards
-- Editable categories, reusable merchant rules, and split transactions
+- Transactions quick views (All, Needs a category, Pending, Possible duplicates); click a row to edit its category, create a reusable merchant rule, or split it
 - Monthly budgets with pace tracking (projected month-end spend and a daily allowance) and a six-month budget history
 - Savings goals that show the monthly amount needed and a projected finish date based on recent net savings
 - Unusual-expense review and a next-month estimate built from expected recurring charges plus typical variable spending

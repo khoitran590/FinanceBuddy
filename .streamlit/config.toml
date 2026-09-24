@@ -1,18 +1,71 @@
 [theme]
-base = "dark"
-primaryColor = "#BE123C"
-backgroundColor = "#0B0F14"
-secondaryBackgroundColor = "#1E293B"
-textColor = "#F8FAFC"
-font = "sans-serif"
+font = "'Public Sans', system-ui, -apple-system, 'Segoe UI', sans-serif"
+headingFont = "Newsreader, Georgia, 'Times New Roman', serif"
+headingFontWeights = [500, 500]
+metricValueFontWeight = 500
+baseRadius = "0.625rem"
+buttonRadius = "0.625rem"
+showWidgetBorder = true
+chartCategoricalColors = ["#2F6FCB", "#E08A3C", "#2E9C95", "#9B7BD8", "#C9A227", "#6B9BE0", "#B7652B", "#8A8F98"]
+
+# Fonts are served from static/fonts so no third-party font host sees the visitor.
+[[theme.fontFaces]]
+family = "Public Sans"
+url = "app/static/fonts/public-sans-latin-wght-normal.woff2"
+weight = "100 900"
+style = "normal"
+
+[[theme.fontFaces]]
+family = "Newsreader"
+url = "app/static/fonts/newsreader-latin-wght-normal.woff2"
+weight = "200 800"
+style = "normal"
+
+# Both palettes are defined, so the app follows the device setting and
+# viewers can switch under ⋮ → Settings. Blue marks money in / good news and
+# orange marks money out / attention, which stays readable for red-green
+# color blindness.
+[theme.light]
+primaryColor = "#1F4E8C"
+backgroundColor = "#F7F5F0"
+secondaryBackgroundColor = "#EDE9E1"
+textColor = "#1C1B18"
+borderColor = "#DDD7CB"
+dataframeBorderColor = "#E3DED4"
+dataframeHeaderBackgroundColor = "#F2EFE8"
+linkColor = "#1F5FA8"
+greenColor = "#1F5FA8"
+redColor = "#B8500C"
+
+[theme.light.sidebar]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2EFE8"
+
+[theme.dark]
+primaryColor = "#3A78CF"
+backgroundColor = "#121311"
+secondaryBackgroundColor = "#232420"
+textColor = "#F1EFE9"
+borderColor = "#3A3B35"
+dataframeBorderColor = "#2F302C"
+dataframeHeaderBackgroundColor = "#1B1C1A"
+linkColor = "#8DBBF5"
+greenColor = "#7DB2F2"
+redColor = "#F29A5E"
+
+[theme.dark.sidebar]
+backgroundColor = "#1A1B19"
+secondaryBackgroundColor = "#252622"
 
 [server]
 headless = true
 enableCORS = true
 enableXsrfProtection = true
+enableStaticServing = true
 
 maxUploadSize = 10
 
 [client]
 showErrorDetails = "none"
-toolbarMode = "minimal"
+# "viewer" keeps developer tools hidden but exposes the theme switcher.
+toolbarMode = "viewer"

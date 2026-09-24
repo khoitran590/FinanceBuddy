@@ -6,50 +6,49 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 
+# Mid-tone colors stay legible on both the light and the dark theme. Blue marks
+# money in and good news; orange marks money out and things that need attention.
 FINANCIAL_COLORS = {
-    "income": "#38BDF8",
-    "expense": "#FB923C",
-    "savings": "#A78BFA",
-    "category": "#60A5FA",
-    "higher_spending": "#FB7185",
-    "lower_spending": "#2DD4BF",
+    "income": "#2F6FCB",
+    "expense": "#D9701E",
+    "savings": "#9B7BD8",
+    "category": "#2F6FCB",
+    "higher_spending": "#D9701E",
+    "lower_spending": "#2F6FCB",
 }
-STATEMENT_COLORS = ["#60A5FA", "#2DD4BF", "#A78BFA"]
+STATEMENT_COLORS = ["#2F6FCB", "#2E9C95", "#9B7BD8"]
 CATEGORY_COLORS = [
-    "#60A5FA",
-    "#2DD4BF",
-    "#A78BFA",
-    "#FB923C",
-    "#FB7185",
-    "#94A3B8",
-    "#FACC15",
-    "#34D399",
+    "#2F6FCB",
+    "#E08A3C",
+    "#2E9C95",
+    "#9B7BD8",
+    "#C9A227",
+    "#6B9BE0",
+    "#B7652B",
+    "#8A8F98",
 ]
+NEUTRAL_LINE = "rgba(128,128,128,0.55)"
+# Labels drawn on top of a category color: white on the deeper colors, near-black on the light ones.
+_LABEL_ON = {"#2F6FCB": "#FFFFFF", "#2E9C95": "#FFFFFF", "#B7652B": "#FFFFFF", "#9B7BD8": "#FFFFFF"}
+
+
+def _labels_for(colors: List[str]) -> List[str]:
+    return [_LABEL_ON.get(color, "#111111") for color in colors]
 
 
 def _style_figure(figure):
-    """Apply an accessible chart theme that blends into Streamlit's dark UI."""
+    """Apply layout that works in both themes.
+
+    Text, grid, and hover colors are left unset so Streamlit's chart theme fills
+    them in for whichever light or dark theme the viewer is using.
+    """
     figure.update_layout(
-        template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font={"color": "#E5E7EB", "size": 13},
-        title={"font": {"color": "#F9FAFB", "size": 18}},
-        legend={"font": {"color": "#E5E7EB", "size": 12}, "title_text": ""},
+        font={"size": 13},
+        title={"font": {"size": 17}},
+        legend={"font": {"size": 12}, "title_text": ""},
         margin={"l": 24, "r": 24, "t": 64, "b": 48},
-        hoverlabel={"bgcolor": "#111827", "font_color": "#F9FAFB"},
-    )
-    figure.update_xaxes(
-        gridcolor="#374151",
-        zerolinecolor="#6B7280",
-        tickfont={"color": "#D1D5DB"},
-        title_font={"color": "#D1D5DB"},
-    )
-    figure.update_yaxes(
-        gridcolor="#374151",
-        zerolinecolor="#6B7280",
-        tickfont={"color": "#D1D5DB"},
-        title_font={"color": "#D1D5DB"},
     )
     return figure
 
@@ -102,12 +101,12 @@ def make_category_donut_chart(category_data: Dict[str, float]):
             direction="clockwise",
             marker={
                 "colors": CATEGORY_COLORS,
-                "line": {"color": "#0B0F14", "width": 2},
+                "line": {"color": "rgba(0,0,0,0)", "width": 0},
             },
             textinfo="percent",
             textposition="inside",
             insidetextorientation="horizontal",
-            textfont={"size": 15, "color": "#0B0F14"},
+            textfont={"size": 15, "color": _labels_for([CATEGORY_COLORS[i % len(CATEGORY_COLORS)] for i in range(len(rows))])},
             hovertemplate="<b>%{label}</b><br>$%{value:,.2f}<br>%{percent}<extra></extra>",
             domain={"x": [0, 1], "y": [0.12, 1]},
         )
@@ -120,7 +119,7 @@ def make_category_donut_chart(category_data: Dict[str, float]):
                 "x": 0.5,
                 "y": 0.56,
                 "showarrow": False,
-                "font": {"size": 24, "color": "#F8FAFC"},
+                "font": {"size": 24},
             }
         ],
     )
@@ -178,8 +177,8 @@ def make_profit_loss_line_chart(cumulative_data: List[Dict[str, Any]]):
             mode="lines+markers",
             name="Gain",
             connectgaps=False,
-            line={"color": "#34D399", "width": 3, "shape": "linear"},
-            marker={"size": 7, "color": "#34D399"},
+            line={"color": FINANCIAL_COLORS["income"], "width": 3, "shape": "linear"},
+            marker={"size": 7, "color": FINANCIAL_COLORS["income"]},
             hovertemplate=(
                 "<b>%{x|%b %-d, %Y}</b><br>Cumulative gain: $%{y:,.2f}"
                 "<br>Daily change: $%{customdata[0]:,.2f}<extra></extra>"
@@ -194,15 +193,15 @@ def make_profit_loss_line_chart(cumulative_data: List[Dict[str, Any]]):
             mode="lines+markers",
             name="Loss",
             connectgaps=False,
-            line={"color": "#FB7185", "width": 3, "shape": "linear"},
-            marker={"size": 7, "color": "#FB7185"},
+            line={"color": FINANCIAL_COLORS["expense"], "width": 3, "shape": "linear", "dash": "dash"},
+            marker={"size": 7, "color": FINANCIAL_COLORS["expense"]},
             hovertemplate=(
                 "<b>%{x|%b %-d, %Y}</b><br>Cumulative loss: $%{y:,.2f}"
                 "<br>Daily change: $%{customdata[0]:,.2f}<extra></extra>"
             ),
         )
     )
-    figure.add_hline(y=0, line_width=2, line_dash="dot", line_color="#94A3B8")
+    figure.add_hline(y=0, line_width=2, line_dash="dot", line_color=NEUTRAL_LINE)
     figure.update_layout(
         title="Gain and loss across the selected period",
         hovermode="x unified",
@@ -505,7 +504,7 @@ def make_daily_spending_chart(daily: List[Dict[str, Any]]):
     return _style_figure(figure)
 
 
-def make_fixed_flexible_chart(months: List[Dict[str, Any]]):
+def make_fixed_flexible_chart(months: List[Dict[str, Any]], stacked: bool = True):
     if not months:
         return _style_figure(px.bar(title="No spending available"))
     rows = []
@@ -525,7 +524,7 @@ def make_fixed_flexible_chart(months: List[Dict[str, Any]]):
             "Flexible spending": FINANCIAL_COLORS["expense"],
         },
     )
-    figure.update_layout(barmode="stack")
+    figure.update_layout(barmode="stack" if stacked else "group")
     return _style_figure(figure)
 
 
@@ -579,14 +578,14 @@ def make_cash_flow_sankey(income_sources: Dict[str, float], expenses: Dict[str, 
                 "color": colors,
                 "pad": 18,
                 "thickness": 16,
-                "line": {"color": "#0B0F14", "width": 1},
+                "line": {"width": 0},
                 "hovertemplate": "<b>%{label}</b><br>$%{value:,.2f}<extra></extra>",
             },
             link={
                 "source": sources,
                 "target": targets,
                 "value": values,
-                "color": "rgba(148,163,184,0.25)",
+                "color": "rgba(128,128,128,0.22)",
                 "hovertemplate": "%{source.label} → %{target.label}<br>$%{value:,.2f}<extra></extra>",
             },
         )
@@ -607,11 +606,11 @@ def make_budget_history_chart(cells: List[Dict[str, Any]]):
         zmin=0,
         zmax=200,
         color_continuous_scale=[
-            [0.0, "#134E4A"],
-            [0.45, "#2DD4BF"],
-            [0.5, "#FACC15"],
-            [0.6, "#FB923C"],
-            [1.0, "#BE123C"],
+            [0.0, "#9DC0EC"],
+            [0.45, "#2F6FCB"],
+            [0.5, "#C9A227"],
+            [0.6, "#E08A3C"],
+            [1.0, "#A8440A"],
         ],
         labels={"x": "Month", "y": "Budget", "color": "% of limit"},
         title="Share of each monthly budget used (%)",
@@ -680,4 +679,117 @@ def make_income_chart(months: List[Dict[str, Any]]):
         textposition="outside",
         cliponaxis=False,
     )
+    return _style_figure(figure)
+
+
+def make_monthly_line_chart(monthly_data: List[Dict[str, Any]]):
+    """Money in and money out as two lines, the "Lines" style of the cash flow card."""
+    if not monthly_data:
+        return _style_figure(go.Figure().update_layout(title="No Monthly Data Available"))
+    frame = pd.DataFrame(monthly_data)
+    figure = go.Figure()
+    for column, name, dash in (("inflow", "Money in", "solid"), ("outflow", "Money out", "dash")):
+        color = FINANCIAL_COLORS["income" if column == "inflow" else "expense"]
+        figure.add_trace(
+            go.Scatter(
+                x=frame["month"],
+                y=frame[column],
+                name=name,
+                mode="lines+markers",
+                line={"color": color, "width": 3, "dash": dash},
+                marker={"size": 8, "color": color},
+                hovertemplate=f"<b>%{{x}}</b><br>{name}: $%{{y:,.2f}}<extra></extra>",
+            )
+        )
+    figure.update_layout(
+        title="Monthly cash flow",
+        hovermode="x unified",
+        legend={"orientation": "h", "y": 1.08, "x": 1, "xanchor": "right"},
+    )
+    figure.update_yaxes(tickprefix="$", separatethousands=True, rangemode="tozero")
+    return _style_figure(figure)
+
+
+def make_monthly_net_chart(monthly_data: List[Dict[str, Any]]):
+    """Money kept each month; bars below zero are months with more out than in."""
+    if not monthly_data:
+        return _style_figure(go.Figure().update_layout(title="No Monthly Data Available"))
+    frame = pd.DataFrame(monthly_data)
+    frame["net"] = frame["inflow"] - frame["outflow"]
+    figure = go.Figure(
+        go.Bar(
+            x=frame["month"],
+            y=frame["net"],
+            name="Net",
+            marker_color=[
+                FINANCIAL_COLORS["income"] if value >= 0 else FINANCIAL_COLORS["expense"]
+                for value in frame["net"]
+            ],
+            marker_pattern_shape=["" if value >= 0 else "/" for value in frame["net"]],
+            text=[("+" if value >= 0 else "-") + f"${abs(value):,.0f}" for value in frame["net"]],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="<b>%{x}</b><br>Net: $%{y:,.2f}<extra></extra>",
+        )
+    )
+    figure.add_hline(y=0, line_width=2, line_color=NEUTRAL_LINE)
+    figure.update_layout(title="Saved each month", showlegend=False)
+    figure.update_yaxes(tickprefix="$", separatethousands=True)
+    return _style_figure(figure)
+
+
+def make_category_treemap(category_summary: List[Dict[str, Any]]):
+    """Spending by category as proportional tiles, the "Map" style of the category card."""
+    rows = [item for item in category_summary if item["amount"] > 0]
+    if not rows:
+        return _style_figure(go.Figure().update_layout(title="No Expense Data Available"))
+    rows = sorted(rows, key=lambda item: item["amount"], reverse=True)
+    figure = go.Figure(
+        go.Treemap(
+            labels=[item["category"] for item in rows],
+            parents=["" for _ in rows],
+            values=[item["amount"] for item in rows],
+            marker={"colors": [CATEGORY_COLORS[index % len(CATEGORY_COLORS)] for index in range(len(rows))]},
+            texttemplate="<b>%{label}</b><br>%{percentRoot:.0%}",
+            textfont={
+                "size": 14,
+                "color": _labels_for([CATEGORY_COLORS[index % len(CATEGORY_COLORS)] for index in range(len(rows))]),
+            },
+            hovertemplate="<b>%{label}</b><br>$%{value:,.2f}<br>%{percentRoot:.1%}<extra></extra>",
+            tiling={"pad": 3},
+            sort=True,
+        )
+    )
+    figure.update_layout(title="Spending by category")
+    figure = _style_figure(figure)
+    figure.update_layout(margin={"l": 8, "r": 8, "t": 56, "b": 8})
+    return figure
+
+
+def make_category_trend_lines(monthly_category_data: List[Dict[str, Any]], top_n: int = 6):
+    """The largest categories month by month, as lines instead of a heat map."""
+    if not monthly_category_data:
+        return _style_figure(go.Figure().update_layout(title="Monthly spending by category"))
+    frame = pd.DataFrame(monthly_category_data)
+    leaders = frame.groupby("category")["amount"].sum().sort_values(ascending=False).head(top_n).index
+    pivot = frame[frame["category"].isin(leaders)].pivot_table(
+        index="month", columns="category", values="amount", aggfunc="sum", fill_value=0
+    )
+    figure = go.Figure()
+    for index, category in enumerate(leaders):
+        figure.add_trace(
+            go.Scatter(
+                x=pivot.index,
+                y=pivot[category],
+                name=category,
+                mode="lines+markers",
+                line={"color": CATEGORY_COLORS[index % len(CATEGORY_COLORS)], "width": 3},
+                hovertemplate=f"<b>{category}</b><br>%{{x}}: $%{{y:,.2f}}<extra></extra>",
+            )
+        )
+    figure.update_layout(
+        title=f"Top {len(leaders)} categories by month",
+        legend={"orientation": "h", "y": -0.18},
+    )
+    figure.update_yaxes(tickprefix="$", separatethousands=True, rangemode="tozero")
     return _style_figure(figure)

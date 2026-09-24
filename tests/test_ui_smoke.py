@@ -65,7 +65,7 @@ def test_authenticated_budget_uses_all_spending_and_logout_clears_private_state(
     app.text_input(key='dashboard_search').set_value('Coffee').run()
     assert not app.exception
     assert any('Showing 1 of 2 saved transactions' in item.value for item in app.get('caption'))
-    app.selectbox(key='nav_page').set_value('Plan').run()
+    app.radio(key='nav_page').set_value('Plan').run()
     assert not app.exception
     assert any('Over budget by $20.00' in item.value for item in app.error)
     next(button for button in app.button if button.label == 'Log out').click().run()
@@ -230,7 +230,7 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     assert metrics['Credit utilization'].value == '25%'
     assert any('Netflix went up from $15.49 to $17.99' in item.value for item in app.markdown)
 
-    app.selectbox(key='dashboard_date_preset').set_value('Last month').run()
+    app.segmented_control(key='dashboard_date_preset').set_value('Last month').run()
     assert not app.exception
     assert app.session_state['dashboard_dates'] == (date(2026, 8, 1), date(2026, 8, 31))
     spending = next(metric for metric in app.metric if metric.label == 'Spending')
@@ -253,9 +253,23 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     assert not app.exception
     assert next(item for item in repo.get_all_saved() if item.id == 'legacy').category == 'Credit Card Payments'
 
-    app.selectbox(key='nav_page').set_value('Plan').run()
+    for key, style in (('chart_style_cash_flow', 'Net'), ('chart_style_cash_flow', 'Lines'),
+                       ('chart_style_categories', 'Map'), ('chart_style_categories', 'Bars'),
+                       ('chart_style_fixed_flexible', 'Side by side'), ('chart_style_category_trend', 'Lines')):
+        app.segmented_control(key=key).set_value(style).run()
+        assert not app.exception
+    assert repo.get_setting('chart_preferences') is not None
+
+    app.radio(key='nav_page').set_value('Transactions').run()
+    assert not app.exception
+    app.segmented_control(key='tx_view').set_value('Pending').run()
+    assert not app.exception
+    # The only pending purchase is outside the 'Last month' range chosen above.
+    assert any('Nothing is pending' in item.value for item in app.success)
+
+    app.radio(key='nav_page').set_value('Plan').run()
     assert not app.exception
     assert any('Over budget by $15.00' in item.value for item in app.error)
-    app.radio(key='plan_view').set_value('Savings goals').run()
+    app.segmented_control(key='plan_view').set_value('Savings goals').run()
     assert not app.exception
     assert any('projected to finish around' in item.value for item in app.markdown)

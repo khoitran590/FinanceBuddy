@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import html
+import json
 import time
 import uuid
 from datetime import date
@@ -34,6 +36,8 @@ from src.ui.charts import (
     make_category_bar_chart,
     make_category_donut_chart,
     make_category_heatmap,
+    make_category_treemap,
+    make_category_trend_lines,
     make_comparison_category_chart,
     make_comparison_delta_chart,
     make_comparison_summary_chart,
@@ -42,6 +46,8 @@ from src.ui.charts import (
     make_income_chart,
     make_merchant_bar_chart,
     make_monthly_bar_chart,
+    make_monthly_line_chart,
+    make_monthly_net_chart,
     make_net_worth_chart,
     make_profit_loss_line_chart,
     make_savings_rate_chart,
@@ -52,9 +58,10 @@ from src.ui.components import (
     format_currency,
     inject_app_styles,
     period_label,
-    render_feature_intro,
+    render_card_header,
     render_insights,
     render_metrics,
+    render_page_header,
     render_progress,
     render_transaction_table,
     transaction_frame,
@@ -407,13 +414,31 @@ DATE_PRESETS = [
 ]
 
 
+PRESET_LABELS = {
+    "This month": "This month",
+    "Last month": "Last month",
+    "Last 30 days": "30 days",
+    "Last 3 months": "3 months",
+    "Year to date": "YTD",
+    "Last 12 months": "12 months",
+    "All time": "All",
+    "Custom": "Custom",
+}
+TRANSACTION_TYPES = {
+    "Both": ["Income / credit", "Expense / purchase"],
+    "Money in": ["Income / credit"],
+    "Money out": ["Expense / purchase"],
+}
+
+
 def reset_dashboard_filters() -> None:
     for key in (
         "dashboard_dates",
+        "dashboard_custom_dates",
         "dashboard_date_preset",
         "dashboard_accounts",
         "dashboard_categories",
-        "dashboard_transaction_types",
+        "dashboard_type",
         "dashboard_search",
         "dashboard_minimum_amount",
         "dashboard_include_transfers",
@@ -421,18 +446,83 @@ def reset_dashboard_filters() -> None:
         st.session_state.pop(key, None)
 
 
+def apply_custom_dates() -> None:
+    # The picker reports one date while a range is half chosen; wait for both.
+    picked = st.session_state.get("dashboard_custom_dates")
+    if isinstance(picked, (tuple, list)) and len(picked) == 2:
+        st.session_state.dashboard_dates = tuple(picked)
+
+
+def view_switcher(label: str, options: list[str], key: str, **kwargs):
+    """A segmented control that always has one option selected."""
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = options[0]
+    return st.segmented_control(
+        label, options, key=key, required=True, label_visibility="collapsed", **kwargs
+    )
+
+
+CHART_PREFERENCES_SETTING = "chart_preferences"
+
+
+def chart_preferences() -> dict:
+    """Chart styles and Summary charts the person chose, kept with their account."""
+    if "chart_prefs" not in st.session_state:
+        try:
+            saved = json.loads(repo.get_setting(CHART_PREFERENCES_SETTING, "{}") or "{}")
+        except (ValueError, TypeError, SupabaseError):
+            saved = {}
+        st.session_state.chart_prefs = saved if isinstance(saved, dict) else {}
+    return st.session_state.chart_prefs
+
+
+def save_chart_preferences() -> None:
+    try:
+        repo.set_setting(CHART_PREFERENCES_SETTING, json.dumps(chart_preferences()))
+    except SupabaseError:
+        st.toast("Your chart choice applies now but couldn't be saved for next time.")
+
+
+def _remember_chart_style(name: str, widget_key: str) -> None:
+    chart_preferences()[name] = st.session_state[widget_key]
+    save_chart_preferences()
+
+
+def chart_style(name: str, options: list[str]) -> str:
+    """Let the viewer switch how one chart is drawn; the choice is remembered."""
+    widget_key = f"chart_style_{name}"
+    if st.session_state.get(widget_key) not in options:
+        saved = chart_preferences().get(name)
+        st.session_state[widget_key] = saved if saved in options else options[0]
+    return st.segmented_control(
+        "Chart style",
+        options,
+        key=widget_key,
+        required=True,
+        label_visibility="collapsed",
+        on_change=_remember_chart_style,
+        args=(name, widget_key),
+    )
+
+
+def card_chart(figure):
+    """Drop a chart's own title when it sits under a card heading."""
+    if figure.data:
+        figure.update_layout(title_text="", margin={"t": 16})
+    return figure
+
+
 def apply_date_preset(min_date: date, max_date: date) -> None:
     preset = st.session_state.dashboard_date_preset
     if preset != "Custom":
         st.session_state.dashboard_dates = AnalyticsService.preset_range(preset, min_date, max_date)
-
-
-def mark_custom_dates() -> None:
-    st.session_state.dashboard_date_preset = "Custom"
+    st.session_state.pop("dashboard_custom_dates", None)
 
 
 def navigate_to(page: str, section: str | None = None) -> None:
     st.session_state.nav_page = page
+    if section and page == "Transactions":
+        st.session_state.tx_view = section
     if section and page == "Accounts":
         st.session_state.accounts_view = section
     if section and page == "Settings":
@@ -462,7 +552,7 @@ def render_start_actions() -> None:
 def render_onboarding() -> None:
     with st.container(border=True):
         heading, close = st.columns([5, 1])
-        heading.subheader("Welcome to FinanceBuddy 👋")
+        heading.subheader("Welcome to FinanceBuddy")
         heading.caption("Your financial records are restricted to your signed-in account.")
         if close.button(
             "Hide guide",
@@ -589,72 +679,173 @@ def render_spending_drilldown(transactions, category_event, month_event) -> None
         )
 
 
-def render_overview_summary(analysis, categories, history) -> None:
-    monthly = AnalyticsService.monthly_breakdown(analysis)
-    left, right = st.columns(2)
-    with left:
-        month_event = st.plotly_chart(
-            make_monthly_bar_chart(monthly),
-            width="stretch",
-            on_select="rerun",
-            selection_mode="points",
-            key="overview_month_chart",
-        )
-    with right:
-        st.plotly_chart(
-            make_category_donut_chart({item["category"]: item["amount"] for item in categories}),
-            width="stretch",
-        )
+SUMMARY_CHARTS = {
+    "running_total": ("Running total", "Gain or loss built up across the selected dates."),
+    "savings_rate": ("Savings rate", "Share of income kept each month."),
+    "daily": ("Daily spending", "Each day's spending with a 7-day average."),
+    "fixed_flexible": ("Fixed vs flexible", "Bills you can't easily change vs spending you can."),
+    "cash_flow": ("Where the money went", "How money in flows to each kind of spending."),
+    "category_trend": ("Category by month", "Which categories grow or shrink over time."),
+    "weekday": ("Day of the week", "Which days you tend to spend the most."),
+    "week_of_month": ("Time of month", "Early, middle, or late-month spending."),
+    "merchants": ("Top merchants", "Where your money goes most often."),
+    "income": ("Income by month", "Paychecks and other income over time."),
+}
+DEFAULT_SUMMARY_CHARTS = ["running_total"]
 
-    st.plotly_chart(
-        make_profit_loss_line_chart(AnalyticsService.cumulative_cash_flow(analysis)),
+
+def summary_chart_keys() -> list[str]:
+    chosen = chart_preferences().get("summary_charts", DEFAULT_SUMMARY_CHARTS)
+    return [key for key in chosen if key in SUMMARY_CHARTS] if isinstance(chosen, list) else []
+
+
+@st.dialog("Add a chart", width="large")
+def choose_summary_charts() -> None:
+    st.write("Pick what you want to see on Summary. Every chart follows your filters.")
+    current = set(summary_chart_keys())
+    columns = st.columns(2)
+    picks = {}
+    for index, (key, (title, description)) in enumerate(SUMMARY_CHARTS.items()):
+        with columns[index % 2]:
+            picks[key] = st.checkbox(title, value=key in current, key=f"pick_chart_{key}")
+            st.caption(description)
+    if st.button("Save charts", type="primary", width="stretch"):
+        chart_preferences()["summary_charts"] = [key for key, picked in picks.items() if picked]
+        save_chart_preferences()
+        st.rerun()
+
+
+def summary_chart_figure(key: str, analysis, history, start_date: date, end_date: date):
+    if key == "running_total":
+        return make_profit_loss_line_chart(AnalyticsService.cumulative_cash_flow(analysis))
+    if key == "savings_rate":
+        return make_savings_rate_chart(AnalyticsService.monthly_savings_rate(analysis))
+    if key == "daily":
+        return make_daily_spending_chart(AnalyticsService.daily_spending(analysis, start_date, end_date))
+    if key == "fixed_flexible":
+        return make_fixed_flexible_chart(AnalyticsService.fixed_vs_flexible(analysis)["months"])
+    if key == "cash_flow":
+        return make_cash_flow_sankey(
+            AnalyticsService.income_sources(analysis), AnalyticsService.category_expenses(analysis)
+        )
+    if key == "category_trend":
+        return make_category_heatmap(AnalyticsService.monthly_category_expenses(analysis))
+    if key == "weekday":
+        return make_weekday_chart(AnalyticsService.weekday_spending(analysis, start_date, end_date))
+    if key == "week_of_month":
+        return make_week_of_month_chart(
+            AnalyticsService.week_of_month_spending(analysis, start_date, end_date)
+        )
+    if key == "merchants":
+        return make_merchant_bar_chart(AnalyticsService.merchant_summary(analysis, limit=10))
+    income = AnalyticsService.income_summary(history)
+    return make_income_chart(income["months"] if income else [])
+
+
+def render_summary_charts(analysis, history, start_date: date, end_date: date) -> None:
+    heading, action = st.columns([3, 1], vertical_alignment="bottom")
+    heading.subheader("Your charts")
+    if action.button(
+        "Add a chart",
+        icon=":material/add_chart:",
         width="stretch",
-    )
-    st.caption(
-        "Gain/loss is cumulative transaction cash flow from zero at the beginning of the selected "
-        "period. It is not an investment return or live account balance."
-    )
+        help="Choose which extra charts appear on Summary. Your choice is saved with your account.",
+    ):
+        choose_summary_charts()
+    keys = summary_chart_keys()
+    if not keys:
+        st.caption("No extra charts yet. Use Add a chart to pick some.")
+        return
+    columns = st.columns(2)
+    for index, key in enumerate(keys):
+        title, description = SUMMARY_CHARTS[key]
+        with columns[index % 2]:
+            with st.container(border=True, key=f"fbcard_extra_{key}"):
+                render_card_header(title, description)
+                st.plotly_chart(
+                    card_chart(summary_chart_figure(key, analysis, history, start_date, end_date)),
+                    width="stretch",
+                    key=f"summary_chart_{key}",
+                )
 
+
+def render_overview_summary(analysis, categories, history, start_date: date, end_date: date) -> None:
     uncategorized = next(
         (item for item in categories if item["category"] == "Uncategorized"), None
     )
     if uncategorized:
-        st.warning(
+        message, action = st.columns([4, 1], vertical_alignment="center")
+        message.warning(
             f"{uncategorized['transactions']} transaction(s), totaling "
-            f"{format_currency(uncategorized['amount'])}, still need a category. "
-            "Review them on the Transactions page."
+            f"{format_currency(uncategorized['amount'])}, still need a category."
+        )
+        action.button(
+            "Review them",
+            key="review_uncategorized",
+            width="stretch",
+            on_click=navigate_to,
+            args=("Transactions", "Needs a category"),
         )
 
+    monthly = AnalyticsService.monthly_breakdown(analysis)
+    month_event = category_event = None
+    left, right = st.columns(2)
+    with left, st.container(border=True, key="fbcard_cash_flow"):
+        title, picker = st.columns([1, 1], vertical_alignment="center")
+        with picker:
+            style = chart_style("cash_flow", ["Columns", "Lines", "Net"])
+        with title:
+            if style == "Net":
+                render_card_header("Saved each month", "Below zero means more went out than came in.")
+            else:
+                render_card_header("Money in vs money out", "Monthly totals.")
+        if style == "Columns":
+            month_event = st.plotly_chart(
+                card_chart(make_monthly_bar_chart(monthly)),
+                width="stretch",
+                on_select="rerun",
+                selection_mode="points",
+                key="overview_month_chart",
+            )
+        elif style == "Lines":
+            st.plotly_chart(card_chart(make_monthly_line_chart(monthly)), width="stretch", key="overview_month_lines")
+        else:
+            month_event = st.plotly_chart(
+                card_chart(make_monthly_net_chart(monthly)),
+                width="stretch",
+                on_select="rerun",
+                selection_mode="points",
+                key="overview_month_net",
+            )
+    with right, st.container(border=True, key="fbcard_categories"):
+        title, picker = st.columns([1, 1], vertical_alignment="center")
+        with picker:
+            style = chart_style("categories", ["Donut", "Bars", "Map"])
+        with title:
+            total = sum(item["amount"] for item in categories)
+            render_card_header("Where it went", f"{format_currency(total)} spent")
+        if style == "Donut":
+            st.plotly_chart(
+                card_chart(make_category_donut_chart({item["category"]: item["amount"] for item in categories})),
+                width="stretch",
+                key="overview_category_donut",
+            )
+        elif style == "Bars":
+            category_event = st.plotly_chart(
+                card_chart(make_category_bar_chart(categories)),
+                width="stretch",
+                on_select="rerun",
+                selection_mode="points",
+                key="overview_category_chart",
+            )
+        else:
+            st.plotly_chart(card_chart(make_category_treemap(categories)), width="stretch", key="overview_category_map")
+
     st.subheader("Explore spending")
-    st.caption("Click a category or month bar, or pick a category, to see the transactions behind it.")
-    category_event = st.plotly_chart(
-        make_category_bar_chart(categories),
-        width="stretch",
-        on_select="rerun",
-        selection_mode="points",
-        key="overview_category_chart",
-    )
+    st.caption("Click a bar in either chart, or pick a category, to see the transactions behind it.")
     render_spending_drilldown(analysis, category_event, month_event)
 
-    st.subheader("Category summary")
-    st.dataframe(
-        pd.DataFrame(categories).rename(
-            columns={
-                "category": "Category",
-                "amount": "Spend",
-                "transactions": "Transactions",
-                "share": "Share (%)",
-                "average": "Average",
-            }
-        ),
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Spend": st.column_config.NumberColumn(format="$%.2f"),
-            "Share (%)": st.column_config.NumberColumn(format="%.1f%%"),
-            "Average": st.column_config.NumberColumn(format="$%.2f"),
-        },
-    )
+    render_summary_charts(analysis, history, start_date, end_date)
 
     st.subheader("What changed")
     changes = AnalyticsService.category_changes(analysis)
@@ -678,15 +869,15 @@ def render_overview_summary(analysis, categories, history) -> None:
     unusual = AnalyticsService.unusual_expenses(analysis)
     forecast = AnalyticsService.cash_flow_forecast(history)
     first, second = st.columns(2)
-    with first:
-        st.markdown("#### Unusual expenses")
+    with first, st.container(border=True, key="fbcard_unusual"):
+        render_card_header("Unusual expenses")
         if unusual:
             for transaction in unusual:
                 st.write(f"{transaction.description} · {format_currency(abs(transaction.amount))}")
         else:
             st.caption("No unusually large expenses detected in this selection.")
-    with second:
-        st.markdown("#### Next-month estimate")
+    with second, st.container(border=True, key="fbcard_forecast"):
+        render_card_header("Next-month estimate")
         if forecast["months"]:
             st.metric(
                 "Estimated money out",
@@ -698,58 +889,100 @@ def render_overview_summary(analysis, categories, history) -> None:
                 f"{format_currency(forecast['outflow_high'])}: "
                 f"{format_currency(forecast['recurring'])} in expected recurring charges plus "
                 f"{format_currency(forecast['variable'])} of typical variable spending, based on "
-                f"the latest {forecast['months']} complete month(s) of history."
+                f"the latest {forecast['months']} complete month(s) of history.".replace("$", "\\$")
             )
         else:
             st.caption("More history is needed for an estimate.")
 
+    with st.expander("Category table"):
+        st.dataframe(
+            pd.DataFrame(categories).rename(
+                columns={
+                    "category": "Category",
+                    "amount": "Spend",
+                    "transactions": "Transactions",
+                    "share": "Share (%)",
+                    "average": "Average",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Spend": st.column_config.NumberColumn(format="$%.2f"),
+                "Share (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                "Average": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
+
 
 def render_overview_trends(analysis, start_date: date, end_date: date) -> None:
-    st.plotly_chart(
-        make_savings_rate_chart(AnalyticsService.monthly_savings_rate(analysis)), width="stretch"
-    )
+    with st.container(border=True, key="fbcard_savings_rate"):
+        render_card_header("Savings rate by month", "Net cash flow as bars, the share of income kept as a line.")
+        st.plotly_chart(
+            card_chart(make_savings_rate_chart(AnalyticsService.monthly_savings_rate(analysis))),
+            width="stretch",
+        )
 
-    st.subheader("Fixed costs vs flexible spending")
     split = AnalyticsService.fixed_vs_flexible(analysis)
-    first, second, third = st.columns(3)
-    first.metric("Fixed costs", format_currency(split["fixed"]),
-                 help="Housing, utilities, insurance, debt payments, and education.")
-    second.metric("Flexible spending", format_currency(split["flexible"]),
-                  help="Everything else: day-to-day spending you have the most control over.")
-    third.metric("Fixed share", f"{split['fixed_share']:.0f}%")
-    st.plotly_chart(make_fixed_flexible_chart(split["months"]), width="stretch")
+    with st.container(border=True, key="fbcard_fixed_flexible"):
+        title, picker = st.columns([1, 1], vertical_alignment="center")
+        with title:
+            render_card_header("Fixed costs vs flexible spending")
+        with picker:
+            style = chart_style("fixed_flexible", ["Stacked", "Side by side"])
+        first, second, third = st.columns(3)
+        first.metric("Fixed costs", format_currency(split["fixed"]),
+                     help="Housing, utilities, insurance, debt payments, and education.")
+        second.metric("Flexible spending", format_currency(split["flexible"]),
+                      help="Everything else: day-to-day spending you have the most control over.")
+        third.metric("Fixed share", f"{split['fixed_share']:.0f}%")
+        st.plotly_chart(
+            card_chart(make_fixed_flexible_chart(split["months"], stacked=style == "Stacked")),
+            width="stretch",
+        )
 
-    st.subheader("Daily spending")
-    pace = AnalyticsService.spending_pace(analysis, start_date, end_date)
-    first, second, third = st.columns(3)
-    first.metric("Average per day", format_currency(pace["average_daily"]),
-                 help=f"Across all {pace['days']} days in the selected range.")
-    second.metric(
-        "Last 7 days, per day",
-        format_currency(pace["last_7_days"]),
-        delta=format_currency(pace["last_7_days"] - pace["average_daily"]) + " vs average",
-        delta_color="inverse",
-    )
-    third.metric("Last 30 days, per day", format_currency(pace["last_30_days"]))
-    st.plotly_chart(
-        make_daily_spending_chart(AnalyticsService.daily_spending(analysis, start_date, end_date)),
-        width="stretch",
-    )
+    with st.container(border=True, key="fbcard_daily"):
+        render_card_header("Daily spending", "Each day with a 7-day average.")
+        pace = AnalyticsService.spending_pace(analysis, start_date, end_date)
+        first, second, third = st.columns(3)
+        first.metric("Average per day", format_currency(pace["average_daily"]),
+                     help=f"Across all {pace['days']} days in the selected range.")
+        second.metric(
+            "Last 7 days, per day",
+            format_currency(pace["last_7_days"]),
+            delta=format_currency(pace["last_7_days"] - pace["average_daily"]) + " vs average",
+            delta_color="inverse",
+        )
+        third.metric("Last 30 days, per day", format_currency(pace["last_30_days"]))
+        st.plotly_chart(
+            card_chart(make_daily_spending_chart(AnalyticsService.daily_spending(analysis, start_date, end_date))),
+            width="stretch",
+        )
 
-    st.plotly_chart(
-        make_cash_flow_sankey(
-            AnalyticsService.income_sources(analysis), AnalyticsService.category_expenses(analysis)
-        ),
-        width="stretch",
-    )
+    with st.container(border=True, key="fbcard_sankey"):
+        render_card_header("Where the money went", "Money in on the left, spending and savings on the right.")
+        st.plotly_chart(
+            card_chart(make_cash_flow_sankey(
+                AnalyticsService.income_sources(analysis), AnalyticsService.category_expenses(analysis)
+            )),
+            width="stretch",
+        )
 
-    month_count = len({item.date.strftime("%Y-%m") for item in analysis})
-    with st.expander("Monthly category trend", expanded=month_count >= 3):
+    with st.container(border=True, key="fbcard_category_trend"):
+        title, picker = st.columns([1, 1], vertical_alignment="center")
+        with title:
+            render_card_header("Category by month")
+        with picker:
+            style = chart_style("category_trend", ["Heat map", "Lines"])
+        month_count = len({item.date.strftime("%Y-%m") for item in analysis})
         if month_count >= 2:
-            st.plotly_chart(
-                make_category_heatmap(AnalyticsService.monthly_category_expenses(analysis)),
-                width="stretch",
+            monthly_categories = AnalyticsService.monthly_category_expenses(analysis)
+            figure = (
+                make_category_heatmap(monthly_categories)
+                if style == "Heat map"
+                else make_category_trend_lines(monthly_categories)
             )
+            st.plotly_chart(card_chart(figure), width="stretch")
         else:
             st.caption("Import at least two months to view this trend.")
 
@@ -765,38 +998,43 @@ def render_overview_habits(analysis, start_date: date, end_date: date) -> None:
             f"{direction} on weekends."
         )
     left, right = st.columns(2)
-    with left:
-        st.plotly_chart(make_weekday_chart(weekday), width="stretch")
-    with right:
+    with left, st.container(border=True, key="fbcard_weekday"):
+        render_card_header("Day of the week", "Average spending per day.")
+        st.plotly_chart(card_chart(make_weekday_chart(weekday)), width="stretch")
+    with right, st.container(border=True, key="fbcard_week_of_month"):
+        render_card_header("Time of month", "Average spending per day in each part of the month.")
         st.plotly_chart(
-            make_week_of_month_chart(
+            card_chart(make_week_of_month_chart(
                 AnalyticsService.week_of_month_spending(analysis, start_date, end_date)
-            ),
+            )),
             width="stretch",
         )
 
     st.subheader("Top merchants")
     merchants = AnalyticsService.merchant_summary(analysis, limit=10)
     if merchants:
-        st.plotly_chart(make_merchant_bar_chart(merchants), width="stretch")
-        _money_table(
-            pd.DataFrame(merchants).rename(
-                columns={
-                    "merchant": "Merchant",
-                    "amount": "Spend",
-                    "visits": "Purchases",
-                    "average": "Average ticket",
-                    "share": "Share (%)",
-                    "category": "Category",
-                    "last_date": "Last purchase",
-                }
-            ),
-            ["Spend", "Average ticket"],
-            column_config={
-                "Share (%)": st.column_config.NumberColumn(format="%.1f%%"),
-                "Last purchase": st.column_config.DateColumn(format="MMM D, YYYY"),
-            },
-        )
+        style = chart_style("merchants", ["Bars", "Table"])
+        if style == "Bars":
+            st.plotly_chart(card_chart(make_merchant_bar_chart(merchants)), width="stretch")
+        else:
+            _money_table(
+                pd.DataFrame(merchants).rename(
+                    columns={
+                        "merchant": "Merchant",
+                        "amount": "Spend",
+                        "visits": "Purchases",
+                        "average": "Average ticket",
+                        "share": "Share (%)",
+                        "category": "Category",
+                        "last_date": "Last purchase",
+                    }
+                ),
+                ["Spend", "Average ticket"],
+                column_config={
+                    "Share (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Last purchase": st.column_config.DateColumn(format="MMM D, YYYY"),
+                },
+            )
     else:
         st.caption("No spending in this selection.")
 
@@ -909,7 +1147,7 @@ def render_overview_recurring(history) -> None:
 
 def render_overview_balances(accounts: list[dict], history: list[dict], all_transactions) -> None:
     st.caption(
-        "Balances come from connected banks, refresh on every sync, and ignore the sidebar filters."
+        "Balances come from connected banks, refresh on every sync, and ignore the filters above."
     )
     overview = AnalyticsService.balance_overview(accounts)
     counted = AnalyticsService.exclude_transfers(all_transactions)
@@ -989,10 +1227,6 @@ def render_card_payment_fix(all_transactions) -> None:
 
 
 def render_overview(transactions, view: dict):
-    render_feature_intro(
-        "Overview",
-        "See totals compared with the previous period, quick insights, and tabs for trends, spending habits, recurring charges, income, and balances. Sidebar filters update everything except balances.",
-    )
     if not transactions:
         st.info("No transactions match the current filters. Reset them to see your full history.")
         return
@@ -1024,7 +1258,7 @@ def render_overview(transactions, view: dict):
     labels = ["Summary", "Trends", "Habits", "Recurring & income"] + (["Balances"] if has_balances else [])
     tabs = st.tabs(labels)
     with tabs[0]:
-        render_overview_summary(analysis, categories, history)
+        render_overview_summary(analysis, categories, history, view["start_date"], view["end_date"])
     with tabs[1]:
         render_overview_trends(analysis, view["start_date"], view["end_date"])
     with tabs[2]:
@@ -1037,57 +1271,92 @@ def render_overview(transactions, view: dict):
 
 
 def render_transactions(transactions):
-    render_feature_intro(
-        "Transactions",
-        "Search and inspect individual activity, download the filtered list, correct automatic categories, create reusable merchant rules, split purchases, and review potential duplicates.",
-    )
-    st.markdown(f'<p class="fb-period">{period_label(transactions)}</p>', unsafe_allow_html=True)
     if not transactions:
         st.info("No transactions match the current filters.")
         return
 
-    download_col, count_col = st.columns([1, 3])
-    with download_col:
-        st.download_button(
-            "Download filtered CSV",
-            transactions_to_csv(transactions),
-            file_name="financebuddy-transactions.csv",
-            mime="text/csv",
-            width="stretch",
-            help="Download only the transactions currently included by the sidebar filters.",
+    duplicates = AnalyticsService.duplicate_candidates(transactions)
+    duplicate_ids = {item.id for group in duplicates for item in group}
+    views = {
+        "All": transactions,
+        "Needs a category": [item for item in transactions if item.category == "Uncategorized"],
+        "Pending": [item for item in transactions if item.pending],
+        "Possible duplicates": [item for item in transactions if item.id in duplicate_ids],
+    }
+    view_col, export_col = st.columns([3, 1], vertical_alignment="center")
+    with view_col:
+        view = view_switcher(
+            "Show", list(views), "tx_view", format_func=lambda name: f"{name} ({len(views[name]):,})"
         )
-    count_col.caption("On phones, transactions are presented as readable cards instead of a wide table.")
-    render_transaction_table(transactions)
-
-    st.subheader("Review and correct categories")
-    review_candidates = [item for item in transactions if item.category == "Uncategorized"]
-    source = review_candidates or transactions
-    if not review_candidates:
-        st.success("Every visible transaction has a category. You can still revise one below.")
-    selected_id = st.selectbox(
-        "Transaction",
-        options=[item.id for item in source],
-        format_func=lambda item_id: next(
-            f"{item.date} · {item.description} · {format_currency(item.amount)}"
-            for item in source
-            if item.id == item_id
-        ),
-        key="category_transaction",
+    export_col.download_button(
+        "Export CSV",
+        transactions_to_csv(transactions),
+        file_name="financebuddy-transactions.csv",
+        mime="text/csv",
+        icon=":material/download:",
+        width="stretch",
+        help="Download every transaction the filters above include.",
     )
-    selected = next(item for item in source if item.id == selected_id)
-    current_index = CATEGORIES.index(selected.category) if selected.category in CATEGORIES else 0
-    with st.form("category_correction"):
-        new_category = st.selectbox("Category", CATEGORIES, index=current_index)
-        rule_keyword = st.text_input(
-            "Merchant keyword (optional)",
-            help="Save a short phrase such as 'indigo cow' to categorize similar imports automatically.",
+    shown = views[view]
+    if not shown:
+        st.success(
+            {
+                "Needs a category": "Every visible transaction has a category.",
+                "Pending": "Nothing is pending. Every visible transaction has posted.",
+                "Possible duplicates": "No exact duplicate date, amount, merchant, and account combinations found.",
+            }.get(view, "No transactions to show.")
         )
-        apply_similar = st.checkbox("Apply this keyword to existing transactions")
-        submitted = st.form_submit_button(
-            "Save category",
-            type="primary",
-            help="Update this transaction. If you entered a merchant keyword, future imports can use the same category automatically.",
+        shown = transactions
+
+    table_col, edit_col = st.columns([2.2, 1], gap="medium")
+    with table_col:
+        picked_row = render_transaction_table(shown, selection_key=f"transactions_table_{view}")
+    shown_ids = [item.id for item in shown]
+    if picked_row is not None and picked_row < len(shown):
+        picked_id = shown_ids[picked_row]
+        # Follow a new table click, but let the menu below change the choice afterwards.
+        if st.session_state.get("last_table_pick") != picked_id:
+            st.session_state.last_table_pick = picked_id
+            st.session_state.category_transaction = picked_id
+    if st.session_state.get("category_transaction") not in shown_ids:
+        st.session_state.category_transaction = shown_ids[0]
+
+    with edit_col, st.container(border=True, key="fbcard_edit_transaction"):
+        render_card_header("Edit a transaction", "Click a row in the table, or choose one here.")
+        selected_id = st.selectbox(
+            "Transaction",
+            options=shown_ids,
+            format_func=lambda item_id: next(
+                f"{item.date} · {item.description} · {format_currency(item.amount)}"
+                for item in shown
+                if item.id == item_id
+            ),
+            key="category_transaction",
         )
+        selected = next(item for item in shown if item.id == selected_id)
+        amount_class = "fb-positive" if selected.amount > 0 else "fb-negative"
+        st.markdown(
+            f'<p class="fb-card-sub">{selected.date.strftime("%b %-d, %Y")} · '
+            f"{html.escape(selected.account_name)}"
+            f'{" · Pending" if selected.pending else ""}</p>'
+            f'<p class="{amount_class}" style="font-family:Newsreader,Georgia,serif;font-size:2rem;margin:0">'
+            f"{format_currency(selected.amount)}</p>",
+            unsafe_allow_html=True,
+        )
+        current_index = CATEGORIES.index(selected.category) if selected.category in CATEGORIES else 0
+        with st.form("category_correction", border=False):
+            new_category = st.selectbox("Category", CATEGORIES, index=current_index)
+            rule_keyword = st.text_input(
+                "Merchant keyword (optional)",
+                help="Save a short phrase such as 'indigo cow' to categorize similar imports automatically.",
+            )
+            apply_similar = st.checkbox("Apply this keyword to existing transactions")
+            submitted = st.form_submit_button(
+                "Save category",
+                type="primary",
+                width="stretch",
+                help="Update this transaction. If you entered a merchant keyword, future imports can use the same category automatically.",
+            )
     if submitted:
         repo.update_category(selected_id, new_category)
         updated = 1
@@ -1095,7 +1364,7 @@ def render_transactions(transactions):
             repo.upsert_category_rule(CategoryRule(keyword=rule_keyword, category=new_category))
             if apply_similar:
                 updated = repo.apply_category_rule(rule_keyword, new_category)
-        st.success(f"Saved category and updated {updated} transaction(s).")
+        st.toast(f"Saved category and updated {updated} transaction(s).")
         st.rerun()
 
     with st.expander("Split a transaction between two categories"):
@@ -1140,7 +1409,6 @@ def render_transactions(transactions):
         else:
             st.caption("No expenses are available to split.")
 
-    duplicates = AnalyticsService.duplicate_candidates(transactions)
     with st.expander(f"Potential duplicates ({len(duplicates)})"):
         if not duplicates:
             st.caption("No exact duplicate date, amount, merchant, and account combinations found.")
@@ -1345,11 +1613,8 @@ def render_goals(transactions) -> None:
 
 
 def render_plan(transactions) -> None:
-    render_feature_intro(
-        "Plan",
-        "Set monthly spending limits, see whether you're on pace, review budget history, and learn what each savings goal needs per month.",
-    )
-    view = st.radio("Plan view", ["Budgets", "Savings goals"], horizontal=True, key="plan_view")
+    render_page_header("Plan", "Monthly spending limits and savings goals, with what each one needs.")
+    view = view_switcher("Plan view", ["Budgets", "Savings goals"], "plan_view")
     if view == "Budgets":
         render_budgets(transactions)
     else:
@@ -1357,9 +1622,9 @@ def render_plan(transactions) -> None:
 
 
 def render_compare():
-    render_feature_intro(
-        "Compare statements",
-        "Upload two to six statements for a temporary side-by-side analysis. Files are sorted by detected transaction dates and are never added to saved history.",
+    render_page_header(
+        "Compare",
+        "Upload two to six statements for a side-by-side look. Nothing here is saved to your history.",
     )
     st.caption(
         "Upload up to six statements. FinanceBuddy detects each date range and sorts periods automatically. "
@@ -1826,9 +2091,10 @@ def render_category_rules() -> None:
 
 
 def render_accounts(all_transactions) -> None:
-    render_feature_intro("Accounts", "Connect a bank, import a statement, or review saved accounts.")
-    view = st.radio("Accounts view", ["Bank connections", "Import statement", "Saved accounts"],
-                    horizontal=True, key="accounts_view")
+    render_page_header("Accounts", "Connect a bank, import a statement, or review saved accounts.")
+    view = view_switcher(
+        "Accounts view", ["Bank connections", "Import statement", "Saved accounts"], "accounts_view"
+    )
     if view == "Bank connections":
         render_bank_connections()
     elif view == "Import statement":
@@ -1838,151 +2104,193 @@ def render_accounts(all_transactions) -> None:
 
 
 def render_settings(all_transactions) -> None:
-    render_feature_intro("Settings", "Manage backups, restore data, and review category rules.")
-    view = st.radio("Settings view", ["Backup & restore", "Category rules"],
-                    horizontal=True, key="settings_view")
+    render_page_header("Settings", "Back up or restore your data, and review category rules.")
+    view = view_switcher("Settings view", ["Backup & restore", "Category rules"], "settings_view")
     if view == "Backup & restore":
         render_backup_restore(all_transactions)
     else:
         render_category_rules()
 
 
-title_column, account_column, guide_column = st.columns([4, 1, 1])
-title_column.title("💸 FinanceBuddy")
-title_column.caption("A private, account-isolated view of your money")
-user_metadata = user.get("user_metadata") or {}
-account_column.caption(
-    str(
-        user_metadata.get("full_name")
-        or user_metadata.get("name")
-        or user.get("email")
-        or "Your account"
+def clear_category_filter() -> None:
+    st.session_state.dashboard_categories = []
+
+
+def select_all_categories(category_options: list[str]) -> None:
+    st.session_state.dashboard_categories = category_options
+
+
+def _keep_valid_selection(key: str, options: list[str]) -> list[str]:
+    """Start with everything selected and drop choices that no longer exist."""
+    if key not in st.session_state:
+        st.session_state[key] = list(options)
+    else:
+        st.session_state[key] = [value for value in st.session_state[key] if value in options]
+    return st.session_state[key]
+
+
+def _selection_label(noun: str, selected: list[str], options: list[str]) -> str:
+    if set(selected) == set(options):
+        return f"All {noun}"
+    if not selected:
+        return f"No {noun}"
+    if len(selected) == 1:
+        return selected[0]
+    return f"{len(selected)} of {len(options)} {noun}"
+
+
+def render_filter_bar(all_transactions) -> dict:
+    """The compact filter bar shared by Overview and Transactions."""
+    min_date = min(item.date for item in all_transactions)
+    max_date = max(item.date for item in all_transactions)
+    account_options = sorted({item.account_name for item in all_transactions})
+    category_options = sorted({item.category for item in all_transactions})
+
+    if st.session_state.get("dashboard_date_preset") not in DATE_PRESETS:
+        st.session_state.dashboard_date_preset = "All time"
+    stored_dates = st.session_state.get("dashboard_dates")
+    # Keep the chosen range, but repair dates outside the saved history.
+    if (
+        not isinstance(stored_dates, (tuple, list))
+        or len(stored_dates) != 2
+        or any(not min_date <= value <= max_date for value in stored_dates)
+    ):
+        st.session_state.dashboard_dates = (min_date, max_date)
+    st.session_state.setdefault("dashboard_type", "Both")
+    st.session_state.setdefault("dashboard_minimum_amount", 0.0)
+    st.session_state.setdefault("dashboard_include_transfers", False)
+    selected_accounts = _keep_valid_selection("dashboard_accounts", account_options)
+    selected_categories = _keep_valid_selection("dashboard_categories", category_options)
+    extra_count = sum(
+        (
+            st.session_state.dashboard_type != "Both",
+            bool(st.session_state.dashboard_minimum_amount),
+            bool(st.session_state.dashboard_include_transfers),
+        )
     )
-)
-if account_column.button(
-    "Log out", help="End this browser's FinanceBuddy login session.", width="stretch"
-):
-    try:
-        auth.sign_out(session["access_token"])
-    except SupabaseError:
-        pass
-    _clear_supabase_session()
-    st.rerun()
-if guide_column.button(
-    "How it works",
-    help="Open the getting-started guide and a short explanation of the main workflow.",
-    width="stretch",
-):
-    st.session_state.show_onboarding = True
 
-show_onboarding = (
-    repo.get_setting("onboarding_complete", "false") != "true"
-    or st.session_state.get("show_onboarding", False)
-)
-if show_onboarding:
-    render_onboarding()
+    with st.container(border=True, key="fbcard_filters"):
+        range_col, search_col = st.columns([2.6, 1], vertical_alignment="center")
+        with range_col:
+            st.segmented_control(
+                "Date range",
+                DATE_PRESETS[1:-1] + ["All time", "Custom"],
+                key="dashboard_date_preset",
+                required=True,
+                format_func=PRESET_LABELS.get,
+                on_change=apply_date_preset,
+                args=(min_date, max_date),
+                label_visibility="collapsed",
+                help="Ranges count back from your most recent transaction.",
+            )
+        with search_col:
+            search = st.text_input(
+                "Merchant search",
+                placeholder="Search merchants, e.g. Costco",
+                key="dashboard_search",
+                icon=":material/search:",
+                label_visibility="collapsed",
+            )
+        if st.session_state.dashboard_date_preset == "Custom":
+            st.date_input(
+                "Custom dates",
+                value=tuple(st.session_state.dashboard_dates),
+                min_value=min_date,
+                max_value=max_date,
+                key="dashboard_custom_dates",
+                on_change=apply_custom_dates,
+            )
 
-page = st.selectbox(
-    "Go to",
-    ["Overview", "Transactions", "Plan", "Accounts", "Compare", "Settings"],
-    key="nav_page",
-    help="Choose the part of FinanceBuddy you want to use. Your place is kept while saving.",
-)
-
-all_transactions = repo.get_all()
-if all_transactions and page in ("Overview", "Transactions"):
-    with st.sidebar:
-        st.header("Dashboard filters")
-        st.caption("These controls update Overview and Transactions. Monthly budgets always include all saved spending for the selected month.")
-        min_date = min(item.date for item in all_transactions)
-        max_date = max(item.date for item in all_transactions)
-        account_options = sorted({item.account_name for item in all_transactions})
-        category_options = sorted({item.category for item in all_transactions})
-        clear_column, all_column = st.columns(2)
-        clear_column.button(
-            "Clear accounts",
-            on_click=clear_account_filter,
-            width="stretch",
-            help="Temporarily hide every account from Overview and Transactions.",
+        accounts_col, categories_col, more_col, reset_col = st.container(key="filter_buttons").columns(
+            [1.2, 1.2, 1.2, 0.7]
         )
-        all_column.button(
-            "Select all",
-            on_click=select_all_accounts,
-            args=(account_options,),
+        with accounts_col.popover(
+            _selection_label("accounts", selected_accounts, account_options),
+            icon=":material/account_balance:",
             width="stretch",
-            help="Include every account in Overview and Transactions.",
+        ):
+            all_col, none_col = st.columns(2)
+            all_col.button("Select all", key="accounts_all", on_click=select_all_accounts,
+                           args=(account_options,), width="stretch")
+            none_col.button("Clear", key="accounts_none", on_click=clear_account_filter, width="stretch")
+            selected_accounts = st.multiselect("Accounts", account_options, key="dashboard_accounts")
+        with categories_col.popover(
+            _selection_label("categories", selected_categories, category_options),
+            icon=":material/category:",
+            width="stretch",
+        ):
+            all_col, none_col = st.columns(2)
+            all_col.button("Select all", key="categories_all", on_click=select_all_categories,
+                           args=(category_options,), width="stretch")
+            none_col.button("Clear", key="categories_none", on_click=clear_category_filter, width="stretch")
+            selected_categories = st.multiselect("Categories", category_options, key="dashboard_categories")
+        with more_col.popover(
+            "More filters" + (f" ({extra_count})" if extra_count else ""),
+            icon=":material/tune:",
+            width="stretch",
+        ):
+            transaction_type = st.segmented_control(
+                "Money in or out", list(TRANSACTION_TYPES), key="dashboard_type", required=True
+            )
+            minimum_amount = st.number_input(
+                "Minimum amount", min_value=0.0, step=10.0, key="dashboard_minimum_amount"
+            )
+            include_transfers = st.toggle(
+                "Count transfers & card payments",
+                key="dashboard_include_transfers",
+                help=(
+                    "Off by default: money moved between your own accounts, including credit-card "
+                    "payments, is left out of income and spending so purchases aren't counted twice."
+                ),
+            )
+            st.caption("Filters apply to Overview and Transactions. Budgets in Plan always use all spending.")
+
+        start_date, end_date = st.session_state.dashboard_dates
+        selected_types = TRANSACTION_TYPES[transaction_type]
+        filter_arguments = (selected_accounts, selected_categories, selected_types, search, minimum_amount)
+        filtered = AnalyticsService.filter_transactions(
+            all_transactions, start_date, end_date, *filter_arguments
         )
-        st.button(
-            "Reset overview & transactions",
+
+        chips = []
+        if (start_date, end_date) != (min_date, max_date):
+            chips.append(f"{start_date.strftime('%b %-d, %Y')} – {end_date.strftime('%b %-d, %Y')}")
+        if set(selected_accounts) != set(account_options):
+            chips.append("Accounts: " + _selection_label("accounts", selected_accounts, account_options))
+        if set(selected_categories) != set(category_options):
+            chips.append("Categories: " + _selection_label("categories", selected_categories, category_options))
+        if transaction_type != "Both":
+            chips.append(transaction_type)
+        if search.strip():
+            chips.append(f"Merchant: {search.strip()}")
+        if minimum_amount:
+            chips.append(f"At least {format_currency(minimum_amount)}")
+        reset_col.button(
+            "Reset",
+            key="reset_filters",
+            icon=":material/restart_alt:",
+            type="tertiary",
+            width="stretch",
+            disabled=not chips and not include_transfers and st.session_state.dashboard_date_preset == "All time",
             on_click=reset_dashboard_filters,
-            width="stretch",
-            help="Restore the full date range, all accounts, all categories, and clear search and amount filters.",
+            help="Show every date, account, and category again and clear search and amount filters.",
         )
-        st.selectbox(
-            "Quick range",
-            DATE_PRESETS,
-            key="dashboard_date_preset",
-            on_change=apply_date_preset,
-            args=(min_date, max_date),
-            help="Ranges count back from your most recent transaction.",
+        transfer_chip = (
+            "Counting transfers & card payments" if include_transfers
+            else "Transfers & card payments not counted"
         )
-        stored_dates = st.session_state.get("dashboard_dates")
-        # Keep a half-finished range selection, but repair dates outside the saved history.
-        if not stored_dates or any(not min_date <= value <= max_date for value in stored_dates):
-            st.session_state.dashboard_dates = (min_date, max_date)
-        selected_dates = st.date_input(
-            "Date range",
-            min_value=min_date,
-            max_value=max_date,
-            key="dashboard_dates",
-            on_change=mark_custom_dates,
+        count_col, chips_col = st.columns([1.5, 2.5], vertical_alignment="center")
+        count_col.caption(f"Showing {len(filtered):,} of {len(all_transactions):,} saved transactions")
+        chips_col.markdown(
+            '<div class="fb-chips">'
+            + "".join(f'<span class="fb-chip">{html.escape(chip)}</span>' for chip in chips + [transfer_chip])
+            + "</div>",
+            unsafe_allow_html=True,
         )
-        if isinstance(selected_dates, tuple) and len(selected_dates) == 2:
-            start_date, end_date = selected_dates
-        else:
-            start_date, end_date = min_date, max_date
-        selected_accounts = st.multiselect(
-            "Accounts", account_options, default=account_options, key="dashboard_accounts"
-        )
-        selected_categories = st.multiselect(
-            "Categories", category_options, default=category_options, key="dashboard_categories"
-        )
-        selected_types = st.multiselect(
-            "Transaction type",
-            ["Income / credit", "Expense / purchase"],
-            default=["Income / credit", "Expense / purchase"],
-            key="dashboard_transaction_types",
-        )
-        search = st.text_input(
-            "Merchant search", placeholder="e.g. Costco", key="dashboard_search"
-        )
-        minimum_amount = st.number_input(
-            "Minimum absolute amount",
-            min_value=0.0,
-            value=0.0,
-            step=10.0,
-            key="dashboard_minimum_amount",
-        )
-        include_transfers = st.toggle(
-            "Count transfers & card payments",
-            key="dashboard_include_transfers",
-            help=(
-                "Off by default: money moved between your own accounts, including credit-card "
-                "payments, is left out of income and spending so purchases aren't counted twice."
-            ),
-        )
-    filter_arguments = (
-        selected_accounts,
-        selected_categories,
-        selected_types,
-        search,
-        minimum_amount,
-    )
-    filtered_transactions = AnalyticsService.filter_transactions(
-        all_transactions, start_date, end_date, *filter_arguments
-    )
+
     previous_range = AnalyticsService.previous_period(start_date, end_date)
-    overview_view = {
+    return {
+        "filtered": filtered,
         "start_date": start_date,
         "end_date": end_date,
         "previous_range": previous_range,
@@ -1995,39 +2303,100 @@ if all_transactions and page in ("Overview", "Transactions"):
             all_transactions, min_date, max_date, *filter_arguments
         ),
     }
-else:
-    filtered_transactions = all_transactions
 
-if page in ("Overview", "Transactions") and all_transactions:
-    active_count = len(filtered_transactions)
-    st.caption(f"Showing {active_count:,} of {len(all_transactions):,} saved transactions")
-    active_filters = []
-    if (start_date, end_date) != (min_date, max_date):
-        active_filters.append("date range")
-    if set(selected_accounts) != set(account_options):
-        active_filters.append("accounts")
-    if set(selected_categories) != set(category_options):
-        active_filters.append("categories")
-    if len(selected_types) != 2:
-        active_filters.append("transaction type")
-    if search.strip():
-        active_filters.append(f"merchant: {search.strip()}")
-    if minimum_amount:
-        active_filters.append(f"minimum: {format_currency(minimum_amount)}")
-    if active_filters:
-        st.info("Active filters: " + " · ".join(active_filters))
-        st.button("Reset filters and show all", on_click=reset_dashboard_filters)
 
-if page == "Overview":
+PAGES = ["Overview", "Transactions", "Plan", "Accounts", "Compare", "Settings"]
+PAGE_INTROS = {
+    "Overview": "Where your money came from and where it went, compared with the period before.",
+    "Transactions": "Search, review, and correct individual activity.",
+}
+
+all_transactions = repo.get_all()
+needs_review = sum(1 for item in all_transactions if item.category == "Uncategorized")
+user_metadata = user.get("user_metadata") or {}
+account_label = str(
+    user_metadata.get("full_name")
+    or user_metadata.get("name")
+    or user.get("email")
+    or "Your account"
+)
+
+with st.sidebar:
+    st.markdown(
+        '<div class="fb-brand"><span class="fb-mark" aria-hidden="true">F</span>'
+        '<span class="fb-brand-name">FinanceBuddy</span></div>',
+        unsafe_allow_html=True,
+    )
+    with st.container(key="nav_menu"):
+        if st.session_state.get("nav_page") not in PAGES:
+            st.session_state.nav_page = PAGES[0]
+        page = st.radio(
+            "Menu",
+            PAGES,
+            key="nav_page",
+            label_visibility="collapsed",
+            format_func=lambda name: (
+                f"{name} ({needs_review} to review)" if name == "Transactions" and needs_review else name
+            ),
+        )
+    st.markdown('<p class="fb-menu-label">Add data</p>', unsafe_allow_html=True)
+    menu_actions = st.container(key="menu_actions")
+    menu_actions.button(
+        "Connect a bank",
+        key="menu_connect_bank",
+        icon=":material/add_link:",
+        type="tertiary",
+        on_click=navigate_to,
+        args=("Accounts", "Bank connections"),
+    )
+    menu_actions.button(
+        "Upload a statement",
+        key="menu_upload_statement",
+        icon=":material/upload_file:",
+        type="tertiary",
+        on_click=navigate_to,
+        args=("Accounts", "Import statement"),
+    )
+    st.divider()
+    if st.button(
+        "How it works",
+        key="menu_guide",
+        icon=":material/help:",
+        type="tertiary",
+        help="Open the getting-started guide and a short explanation of the main workflow.",
+    ):
+        st.session_state.show_onboarding = True
+    st.caption(f"Signed in as {account_label}")
+    if st.button(
+        "Log out",
+        icon=":material/logout:",
+        help="End this browser's FinanceBuddy login session.",
+    ):
+        try:
+            auth.sign_out(session["access_token"])
+        except SupabaseError:
+            pass
+        _clear_supabase_session()
+        st.rerun()
+    st.caption("Light or dark follows your device. Switch it anytime under ⋮ → Settings.")
+
+show_onboarding = (
+    repo.get_setting("onboarding_complete", "false") != "true"
+    or st.session_state.get("show_onboarding", False)
+)
+if show_onboarding:
+    render_onboarding()
+
+if page in ("Overview", "Transactions"):
+    render_page_header(page, PAGE_INTROS[page])
     if not all_transactions:
         render_start_actions()
     else:
-        render_overview(filtered_transactions, overview_view)
-elif page == "Transactions":
-    if not all_transactions:
-        render_start_actions()
-    else:
-        render_transactions(filtered_transactions)
+        overview_view = render_filter_bar(all_transactions)
+        if page == "Overview":
+            render_overview(overview_view["filtered"], overview_view)
+        else:
+            render_transactions(overview_view["filtered"])
 elif page == "Plan":
     render_plan(all_transactions)
 elif page == "Compare":
