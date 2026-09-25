@@ -32,6 +32,17 @@ def test_valid_production_configuration(monkeypatch):
     assert validate_production_configuration(_valid_secrets()) == []
 
 
+def test_production_flag_can_come_from_secrets(monkeypatch):
+    monkeypatch.delenv("FINANCEBUDDY_ENV", raising=False)
+    secrets = _valid_secrets()
+    secrets["FINANCEBUDDY_ENV"] = "production"
+    secrets["supabase"]["public_app_url"] = "http://localhost:8501"
+
+    errors = validate_production_configuration(secrets)
+
+    assert any("supabase.public_app_url" in error for error in errors)
+
+
 def test_production_rejects_local_app_url_and_sandbox_plaid(monkeypatch):
     monkeypatch.setenv("FINANCEBUDDY_ENV", "production")
     secrets = _valid_secrets()

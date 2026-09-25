@@ -61,7 +61,11 @@ def _is_privileged_supabase_key(value: str) -> bool:
 
 def validate_production_configuration(secrets: Mapping[str, Any]) -> list[str]:
     """Return safe, field-level errors without exposing any configured secret."""
-    if os.getenv("FINANCEBUDDY_ENV", "development").lower() != "production":
+    # Hosts like Streamlit Community Cloud only offer secrets, so accept the flag there too.
+    environment = os.getenv("FINANCEBUDDY_ENV") or (
+        secrets.get("FINANCEBUDDY_ENV") if hasattr(secrets, "get") else None
+    )
+    if str(environment or "development").strip().lower() != "production":
         return []
 
     supabase = _section(secrets, "supabase")

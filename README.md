@@ -31,7 +31,7 @@ authority for every read and write.
 4. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set the project
    URL, publishable key, and local `public_app_url`.
 5. Under **Authentication → URL Configuration**, set the Site URL to the final deployed
-   HTTPS Render URL and allowlist that exact URL. Do not allowlist localhost in the
+   HTTPS app URL (for example `https://financebuddy.streamlit.app`) and allowlist that exact URL. Do not allowlist localhost in the
    production Supabase project; use a separate development project for local email-link
    testing. Keep `PUBLIC_APP_URL` identical to the allowlisted production URL.
 6. Keep **Confirm email** enabled. Under **Authentication → Emails → Templates**, use
@@ -140,27 +140,27 @@ python -m pytest
 
 ## Production deployment
 
-The included `Dockerfile` and `render.yaml` define a stateless free-tier Render deployment:
-the process runs as a non-root user, dependencies are pinned, health checks use Streamlit's
-health endpoint, secrets are assembled from environment variables at startup, and all
-durable state lives in Supabase.
+FinanceBuddy is deployed on the free tier of Streamlit Community Cloud, which runs `app.py`
+straight from GitHub, installs `requirements.txt`, and redeploys on every push. The app is
+stateless: all durable state lives in Supabase. See
+[`docs/STREAMLIT_CLOUD_DEPLOY.md`](docs/STREAMLIT_CLOUD_DEPLOY.md) for the full walkthrough.
 
 Apply every migration in `supabase/migrations` before deploying a new app version. The
 `202609240001_spending_insights.sql` migration adds the optional transaction detail columns,
 account balances, and the `account_balances` history table that the Balances tab reads.
 
-1. Create a Render Blueprint from this repository. It declares the free web-service plan
-   and does not request a disk or payment method.
-2. Set `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, and `PUBLIC_APP_URL`. `PUBLIC_APP_URL`
-   must be the final HTTPS `onrender.com` URL. If Render has not assigned it yet,
-   create the service first, then set the exact assigned URL and redeploy. The app will
-   intentionally refuse to start until that value is valid.
-3. Set `PLAID_CLIENT_ID` and `PLAID_SECRET`. Render generates a private
-   `PLAID_TOKEN_ENCRYPTION_KEY` on the initial Blueprint deployment. Keep that value
-   stable: rotating it makes existing encrypted bank tokens unreadable.
-4. Keep `PLAID_ENV=production`; use the Production secret supplied for the Plaid Trial.
-   Leave `PLAID_REDIRECT_URI` unset until the OAuth return flow is implemented. Set
-   `PLAID_WEBHOOK_URL` only if you run a separate HTTPS webhook receiver for automatic
+1. At <https://share.streamlit.io>, create an app from this repository with branch `main`,
+   main file `app.py`, and Python 3.12 (under **Advanced settings**).
+2. Paste the secrets from `docs/STREAMLIT_CLOUD_DEPLOY.md` into **Advanced settings →
+   Secrets**, including `FINANCEBUDDY_ENV = "production"` at the top. `public_app_url`
+   must be the exact `https://<name>.streamlit.app` URL. The app will intentionally refuse
+   to start until that value is valid.
+3. Set the Plaid `client_id` and `secret`, and a private `token_encryption_key`. Keep that
+   value stable: rotating it makes existing encrypted bank tokens unreadable. When moving
+   from another host, copy the existing key rather than generating a new one.
+4. Keep the Plaid `environment = "production"`; use the Production secret supplied for the Plaid Trial.
+   Leave `redirect_uri` unset until the OAuth return flow is implemented. Set
+   `webhook_url` only if you run a separate HTTPS webhook receiver for automatic
    Transactions updates; Link tokens will register it with Plaid.
 5. Keep Supabase **Confirm email** enabled, configure SendGrid custom SMTP, and install
    the two email templates above before inviting real users. Review the available CAPTCHA,
@@ -173,15 +173,20 @@ account balances, and the `account_balances` history table that the Balances tab
    It removes the compatibility ciphertext column from the public Data API. Do not run it
    while an older app version still reads that column.
 
-Required production variables are `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`,
-`PUBLIC_APP_URL`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, and
-`PLAID_TOKEN_ENCRYPTION_KEY`. The app refuses to start when these are missing, Supabase or
+Required production settings are the Supabase `url`, `publishable_key`, and
+`public_app_url`, and the Plaid `client_id`, `secret`, and `token_encryption_key`. Each can
+come from Streamlit secrets or the matching environment variable (`SUPABASE_URL`,
+`SUPABASE_PUBLISHABLE_KEY`, `PUBLIC_APP_URL`, `PLAID_CLIENT_ID`, `PLAID_SECRET`,
+`PLAID_TOKEN_ENCRYPTION_KEY`). The app refuses to start when these are missing, Supabase or
 application URLs are unsafe, or Plaid is not in Production.
+
+To self-host instead, the included `Dockerfile` builds a non-root image whose
+`scripts/start.py` assembles `.streamlit/secrets.toml` from those environment variables.
 
 Before public launch, verify sign-up, confirmation link and code, password recovery,
 cross-account isolation, Plaid Link, transaction sync, and disconnect on the deployed
-HTTPS URL. The free Render service sleeps when idle and has an ephemeral filesystem;
-Supabase Free does not provide downloadable database backups. These free tiers are useful
+HTTPS URL. The free Streamlit Community Cloud app sleeps after about 12 hours without
+visitors and has an ephemeral filesystem; Supabase Free does not provide downloadable database backups. These free tiers are useful
 for a pilot but do not provide always-on availability or managed backup recovery.
 
 ## CSV import behavior
