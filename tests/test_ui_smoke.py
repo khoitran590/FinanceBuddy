@@ -9,7 +9,7 @@ def test_app_stops_at_authentication_boundary_without_exceptions():
 
     assert not app.exception
     assert app.title[0].value == "💸 FinanceBuddy"
-    messages = [item.value for item in app.error] + [item.value for item in app.subheader]
+    messages = [item.value for item in app.error] + [item.value for item in app.header]
     assert any(
         expected in message
         for expected in (
@@ -116,8 +116,8 @@ def test_first_run_actions_open_the_selected_account_flow(tmp_path, monkeypatch)
     assert not app.exception
     assert app.session_state['nav_page'] == 'Accounts'
     assert app.session_state['accounts_view'] == 'Import statement'
-    assert any(item.value == 'Import a statement' for item in app.subheader)
-    assert not any(item.value == 'Saved accounts' for item in app.subheader)
+    assert any(item.value == 'Import a statement' for item in app.header)
+    assert not any(item.value == 'Saved accounts' for item in app.header)
 
 
 def test_mobile_history_can_reach_rows_after_first_page():
@@ -224,13 +224,36 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     assert not app.exception
     assert [tab.label for tab in app.tabs] == ['Summary', 'Trends', 'Habits', 'Recurring & income', 'Balances']
     metrics = {metric.label: metric for metric in app.metric}
+    assert [metric.label for metric in app.metric][:3] == ['Spending', 'Money in', 'Net cash flow']
+    assert any(expander.label == 'More spending details' for expander in app.expander)
+    assert any(expander.label == 'Filters' for expander in app.expander)
+    assert any(button.label == 'View all transactions' for button in app.button)
     assert metrics['Spending'].value == '$11,155.44'
     assert metrics['Moved between accounts'].value == '$3,600.00'
     assert metrics['Net worth'].value == '$3,500.00'
     assert metrics['Credit utilization'].value == '25%'
     assert any('Netflix went up from $15.49 to $17.99' in item.value for item in app.markdown)
 
-    app.segmented_control(key='dashboard_date_preset').set_value('Last month').run()
+    # A main-chart selection must coexist with the deeper category explorer.
+    import streamlit as st
+    original_plotly_chart = st.plotly_chart
+
+    def select_dining(*args, **kwargs):
+        event = original_plotly_chart(*args, **kwargs)
+        if kwargs.get('key') == 'summary_top_categories':
+            return {'selection': {'points': [{'y': 'Dining'}]}}
+        return event
+
+    monkeypatch.setattr(st, 'plotly_chart', select_dining)
+    app.run()
+    assert not app.exception
+    selected_frame = next(frame.value for frame in app.dataframe if list(frame.value.columns) ==
+                          ['Date', 'Amount', 'Category', 'Description', 'Account', 'Type'])
+    assert len(selected_frame) == 6
+    assert set(selected_frame['Category']) == {'Dining'}
+    monkeypatch.setattr(st, 'plotly_chart', original_plotly_chart)
+
+    app.selectbox(key='dashboard_date_preset').set_value('Last month').run()
     assert not app.exception
     assert app.session_state['dashboard_dates'] == (date(2026, 8, 1), date(2026, 8, 31))
     spending = next(metric for metric in app.metric if metric.label == 'Spending')
@@ -262,10 +285,45 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
 
     app.radio(key='nav_page').set_value('Transactions').run()
     assert not app.exception
+    assert app.selectbox(key='dashboard_date_preset').value == 'Last month'
     app.segmented_control(key='tx_view').set_value('Pending').run()
     assert not app.exception
     # The only pending purchase is outside the 'Last month' range chosen above.
     assert any('Nothing is pending' in item.value for item in app.success)
+    assert not app.dataframe
+    app.button(key='tx_empty_all').click().run()
+    assert not app.exception
+    assert app.segmented_control(key='tx_view').value == 'All'
+    app.button(key='mobile_edit_transactions_table_All_tv4').click().run()
+    assert not app.exception
+    assert app.selectbox(key='category_transaction').value == 'tv4'
+    app.selectbox(key='category_transaction').set_value('food4').run()
+    assert not app.exception
+    next(box for box in app.selectbox if box.label == 'Category').set_value('Entertainment')
+    from src.services.supabase import SupabaseError
+    original_update = repo.update_category
+
+    def fail_save(*args, **kwargs):
+        raise SupabaseError('private server error details')
+
+    monkeypatch.setattr(repo, 'update_category', fail_save)
+    next(button for button in app.button if button.label == 'Save category').click().run()
+    assert not app.exception
+    assert any("Couldn't confirm the category save" in item.value for item in app.error)
+    assert not any('private server error details' in item.value for item in app.error)
+    assert next(box for box in app.selectbox if box.label == 'Category').value == 'Entertainment'
+    assert next(item for item in repo.get_all() if item.id == 'food4').category == 'Dining'
+    monkeypatch.setattr(repo, 'update_category', original_update)
+    next(button for button in app.button if button.label == 'Save category').click().run()
+    assert not app.exception
+    assert next(item for item in repo.get_all() if item.id == 'food4').category == 'Entertainment'
+    app.button(key='mobile_edit_transactions_table_All_food4').click().run()
+    assert not app.exception
+    assert app.selectbox(key='category_transaction').value == 'food4'
+    next(button for button in app.button if button.label == 'Cancel').click().run()
+    assert not app.exception
+    # Restore the category so the subsequent budget check uses the original spend.
+    repo.update_category('food4', 'Dining')
 
     app.radio(key='nav_page').set_value('Plan').run()
     assert not app.exception
@@ -273,6 +331,28 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     app.segmented_control(key='plan_view').set_value('Savings goals').run()
     assert not app.exception
     assert any('projected to finish around' in item.value for item in app.markdown)
+
+    app.radio(key='nav_page').set_value('Overview').run()
+    app.session_state['dashboard_date_preset'] = 'Custom'
+    app.session_state['dashboard_dates'] = (date(2020, 1, 1), date(2020, 1, 31))
+    app.run()
+    assert not app.exception
+    assert any('No transactions match' in item.value for item in app.info)
+    assert not app.metric
+    app.button(key='overview_empty_reset').click().run()
+    assert not app.exception
+    assert any(metric.label == 'Spending' for metric in app.metric)
+
+    original_get_all = repo.get_all
+    monkeypatch.setattr(repo, 'get_all', fail_save)
+    app.run()
+    assert not app.exception
+    assert any("Couldn't load your transactions" in item.value for item in app.error)
+    assert not any('private server error details' in item.value for item in app.error)
+    monkeypatch.setattr(repo, 'get_all', original_get_all)
+    app.button(key='retry_transactions').click().run()
+    assert not app.exception
+    assert any(metric.label == 'Spending' for metric in app.metric)
 
 
 def test_mobile_history_page_recovers_from_stale_label(monkeypatch):
@@ -297,5 +377,5 @@ def test_mobile_history_page_recovers_from_stale_label(monkeypatch):
     monkeypatch.setattr(components.st, "selectbox", fake_selectbox)
     monkeypatch.setattr(components.st, "dataframe", lambda *args, **kwargs: None)
     components.render_transaction_table([])
-    assert captured["value"] == 1
-    assert captured["labels"] == ["Page 1"]
+    assert state.mobile_history_page == 1
+    assert not captured  # No page selector is needed for a single page.

@@ -30,7 +30,7 @@ def inject_app_styles() -> None:
         [data-testid="stMainBlockContainer"] { font-variant-numeric: tabular-nums; }
         h1 { letter-spacing: -0.015em; }
         .st-key-auth_shell { max-width: 34rem; margin-inline: auto; }
-        :is(button, input, select, textarea, [role="radio"], [role="combobox"]):focus-visible {
+        :is(button, input, select, textarea, [role="radio"], [role="combobox"], a):focus-visible {
             outline: 3px solid var(--fb-focus) !important;
             outline-offset: 2px;
         }
@@ -41,18 +41,51 @@ def inject_app_styles() -> None:
 
         /* Cards: metrics and every container keyed fbcard_* */
         [data-testid="stMetric"] {
-            background: var(--fb-surface);
-            border: 1px solid var(--fb-line);
-            border-radius: 14px;
-            padding: 1rem 1.1rem;
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            padding: .65rem 0;
         }
         [data-testid="stMetricLabel"] p { font-weight: 600; }
         [data-testid="stMetricLabel"] * { white-space: normal !important; overflow: visible !important; }
         [data-testid="stMetricValue"] { font-size: clamp(1.35rem, 1.9vw, 2rem) !important; }
         [data-testid="stMetricValue"] * { overflow: visible !important; text-overflow: clip !important; }
         [class*="st-key-fbcard"] { background: var(--fb-surface); }
-        .fb-card-title { font-size: 1.05rem; font-weight: 600; margin: 0; }
         .fb-card-sub { color: var(--fb-muted); font-size: .85rem; margin: .1rem 0 0; }
+
+        /* Overview: let the spending total and activity carry the hierarchy. */
+        .st-key-overview_totals [data-testid="stMetric"] {
+            background: transparent; border: 0; border-radius: 0; padding: .4rem 0 .8rem;
+        }
+        .st-key-overview_totals [data-testid="stColumn"]:first-child [data-testid="stMetricValue"] {
+            font-size: clamp(2rem, 3vw, 2.75rem) !important;
+        }
+        .st-key-overview_totals [data-testid="stColumn"]:not(:first-child) [data-testid="stMetricValue"] {
+            font-size: 1.5rem !important;
+        }
+        .fb-activity-row { display: flex; align-items: center; justify-content: space-between;
+            gap: 1rem; padding: .65rem 0; border-bottom: 1px solid var(--fb-line); }
+        .fb-activity-row:last-child { border-bottom: 0; }
+        .fb-activity-copy { min-width: 0; }
+        .fb-activity-name { font-weight: 500; overflow-wrap: anywhere; }
+        .fb-activity-amount { flex-shrink: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+        .st-key-summary_review { border-top: 1px solid var(--fb-line); padding-top: .75rem; }
+        .st-key-overview_summary h2 {
+            font-family: "Public Sans", system-ui, sans-serif !important; font-size: 1.25rem !important;
+            font-weight: 600; letter-spacing: normal;
+        }
+        ::selection { background: var(--fb-focus); color: var(--fb-surface); }
+        input, textarea { caret-color: var(--fb-focus); }
+        [data-testid="stMainBlockContainer"] h2 { overflow-wrap: anywhere; }
+        .fb-card-title { font-family: "Public Sans", system-ui, sans-serif !important;
+            font-size: 1.05rem !important; font-weight: 600 !important; padding: 0 !important; margin: 0; }
+        @media (max-width: 640px) {
+            input, textarea { font-size: 1rem !important; }
+        }
+        @media (forced-colors: active) {
+            .fb-chip, .fb-card { border: 1px solid CanvasText; }
+            .fb-positive, .fb-negative { color: CanvasText; }
+        }
 
         /* Filter bar */
         .st-key-fbcard_filters [data-testid="stHorizontalBlock"] { align-items: center; }
@@ -73,10 +106,9 @@ def inject_app_styles() -> None:
         }
         .fb-insight {
             margin: 0;
-            border-radius: 12px;
-            padding: .85rem 1rem;
-            background: var(--fb-surface-2);
-            line-height: 1.45;
+            padding: .65rem 0;
+            background: transparent;
+            line-height: 1.5;
         }
 
         /* Sidebar menu */
@@ -92,7 +124,7 @@ def inject_app_styles() -> None:
             border-radius: 50%; background: #E08A3C;
         }
         .fb-menu-label {
-            font-size: .75rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+            font-size: .85rem; font-weight: 500; letter-spacing: normal;
             color: var(--fb-muted); margin: .5rem 0 .1rem .75rem;
         }
         .st-key-nav_menu [data-testid="stElementContainer"], .st-key-nav_menu .stRadio { width: 100%; }
@@ -104,8 +136,8 @@ def inject_app_styles() -> None:
         }
         .st-key-nav_menu [data-testid="stRadioOption"] > div > div:first-child:not([data-testid]) { display: none; }
         .st-key-nav_menu [data-testid="stRadioOption"]:hover { background: var(--fb-surface-2); }
-        .st-key-nav_menu [data-testid="stRadioOption"][data-selected="true"] { background: var(--fb-ink); }
-        .st-key-nav_menu [data-testid="stRadioOption"][data-selected="true"] p { color: var(--fb-surface); font-weight: 600; }
+        .st-key-nav_menu [data-testid="stRadioOption"][data-selected="true"] { background: var(--fb-surface-2); }
+        .st-key-nav_menu [data-testid="stRadioOption"][data-selected="true"] p { color: var(--fb-ink); font-weight: 600; }
         .st-key-nav_menu [data-testid="stRadioOption"]:has(input:focus-visible) {
             outline: 3px solid var(--fb-focus); outline-offset: 2px;
         }
@@ -121,20 +153,75 @@ def inject_app_styles() -> None:
             margin-bottom: .65rem;
             background: var(--fb-surface);
         }
-        .fb-card-top { display:flex; justify-content:space-between; gap:1rem; font-weight:600; }
+        .fb-card-top > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+        .fb-card-top > span:last-child { flex-shrink: 0; }
+        .fb-card-top { display:flex; justify-content:space-between; gap:1rem; font-weight:500; }
         .fb-card-meta { color: var(--fb-muted); font-size:.85rem; margin-top:.3rem; }
         .fb-positive { color: var(--fb-income); }
         .fb-negative { color: var(--fb-spend); }
-        .fb-mobile-transactions, .st-key-mobile_history_controls { display:none; }
-        .fb-progress-label { display:flex; justify-content:space-between; gap:1rem; }
+        .fb-mobile-transactions, .st-key-mobile_history_controls, .st-key-mobile_history_cards { display:none; }
+        .fb-progress-label { display:flex; flex-wrap:wrap; justify-content:space-between; gap:.25rem 1rem; }
+        .fb-progress-label strong { min-width:0; overflow-wrap:anywhere; }
+        .fb-progress-label > span { font-variant-numeric:tabular-nums; }
         .fb-budget-meta { color: var(--fb-muted); font-size:.85rem; margin: -.4rem 0 .9rem; }
 
+        /* Adapt to the available content width, including an open sidebar. */
+        [data-testid="stMainBlockContainer"] { container-type: inline-size; }
+        .st-key-tx_toolbar [role="radiogroup"] { flex-wrap: wrap; }
+        .st-key-fbcard_filters [data-testid="stButtonGroup"] [role="radiogroup"] { flex-wrap: wrap; }
+        .fb-card-meta { overflow-wrap: anywhere; }
+        [role="dialog"] { max-height: calc(100dvh - 2rem); overflow-y: auto; }
+        @media (pointer: coarse), (max-width: 900px) {
+            .stButton button, .stDownloadButton button, [data-testid="stPopoverButton"],
+            [data-testid="stFormSubmitButton"] button { min-height: 44px; }
+            [data-testid="stButtonGroup"] button { min-height: 44px; }
+            [data-baseweb="select"] > div { min-height: 44px; }
+        }
+        @container (max-width: 700px) {
+            .st-key-fb_metrics [data-testid="stHorizontalBlock"] {
+                display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem;
+            }
+            .st-key-fb_metrics [data-testid="stColumn"] { width: auto !important; min-width: 0 !important; }
+            .st-key-overview_totals .st-key-fb_metrics [data-testid="stColumn"]:first-child { grid-column: 1 / -1; }
+            .st-key-desktop_transactions { display: none; }
+            .fb-mobile-transactions, .st-key-mobile_history_controls, .st-key-mobile_history_cards { display: block; }
+            .st-key-mobile_history_cards [class*="st-key-mobile_tx_"] {
+                border-bottom: 1px solid var(--fb-line); padding-bottom: .75rem;
+            }
+            .st-key-mobile_history_cards .fb-card { border: 0; background: transparent; padding: .35rem 0; margin: 0; }
+            .st-key-mobile_history_cards button { justify-content: flex-start; }
+            .st-key-tx_desktop_edit { display: none; }
+            .st-key-overview_detail_charts > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"],
+            .st-key-overview_extra_charts > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"],
+            .st-key-overview_summary > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"],
+            .st-key-tx_toolbar [data-testid="stHorizontalBlock"],
+            .st-key-filter_search_row [data-testid="stHorizontalBlock"] { flex-direction: column; }
+            :is(.st-key-overview_summary, .st-key-overview_detail_charts, .st-key-overview_extra_charts,
+                 .st-key-tx_toolbar, .st-key-filter_search_row)
+            > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+                width: 100% !important; flex: 1 1 auto !important;
+            }
+            .st-key-filter_buttons [data-testid="stHorizontalBlock"] {
+                display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem;
+            }
+            .st-key-filter_buttons [data-testid="stColumn"] { width: auto !important; min-width: 0 !important; }
+        }
         @media (max-width: 640px) {
-            .block-container { padding-left: 1rem; padding-right: 1rem; padding-top: 1.2rem; }
+            .block-container {
+                padding-left: max(1rem, env(safe-area-inset-left));
+                padding-right: max(1rem, env(safe-area-inset-right));
+                padding-bottom: max(2rem, env(safe-area-inset-bottom)); padding-top: 1.2rem;
+            }
             .st-key-desktop_transactions { display:none; }
-            .fb-mobile-transactions, .st-key-mobile_history_controls { display:block; }
+            .fb-mobile-transactions, .st-key-mobile_history_controls, .st-key-mobile_history_cards { display:block; }
             h1 { font-size: 2rem !important; }
             [data-testid="stMetricValue"] { font-size: 1.45rem !important; }
+            .st-key-overview_totals [data-testid="stColumn"]:not(:first-child) [data-testid="stMetricValue"] {
+                font-size: clamp(1.1rem, 5vw, 1.3rem) !important;
+            }
+            .st-key-overview_totals .st-key-fb_metrics [data-testid="stColumn"]:first-child {
+                grid-column: 1 / -1;
+            }
             /* Two-up key numbers and filter buttons instead of one long column. */
             :is(.st-key-fb_metrics, .st-key-filter_buttons) [data-testid="stHorizontalBlock"] {
                 display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem;
@@ -158,7 +245,7 @@ def render_page_header(title: str, description: str | None = None) -> None:
 
 def render_card_header(title: str, subtitle: str | None = None) -> None:
     sub = f'<p class="fb-card-sub">{html.escape(subtitle)}</p>' if subtitle else ""
-    st.markdown(f'<p class="fb-card-title">{html.escape(title)}</p>{sub}', unsafe_allow_html=True)
+    st.markdown(f'<h3 class="fb-card-title">{html.escape(title)}</h3>{sub}', unsafe_allow_html=True)
 
 
 def format_currency(value: float) -> str:
@@ -185,8 +272,8 @@ def format_delta(metric: Dict[str, Any]) -> str | None:
     return f"{int(delta):+,}"
 
 
-def render_metrics(metrics: List[Dict[str, Any]], delta_caption: str | None = None) -> None:
-    columns = st.container(key="fb_metrics").columns(len(metrics))
+def render_metrics(metrics: List[Dict[str, Any]], delta_caption: str | None = None, container_key: str = "fb_metrics") -> None:
+    columns = st.container(key=container_key).columns(len(metrics))
     for column, metric in zip(columns, metrics):
         column.metric(
             metric["label"],
@@ -241,6 +328,11 @@ def _status_column(transactions: List[Transaction]) -> List[str] | None:
     return ["Pending" if transaction.pending else "Posted" for transaction in transactions]
 
 
+def _request_transaction_edit(transaction_id: str) -> None:
+    st.session_state.category_transaction = transaction_id
+    st.session_state.transaction_editor_requested = True
+
+
 def render_transaction_table(
     transactions: List[Transaction], height: int = 520, selection_key: str | None = None
 ) -> int | None:
@@ -265,7 +357,7 @@ def render_transaction_table(
             **selection,
             column_config={
                 "Date": st.column_config.DateColumn(format="MMM D, YYYY", width=110),
-                "Amount": st.column_config.NumberColumn(format="dollar", width=100),
+                "Amount": st.column_config.NumberColumn(format="dollar", width=160),
                 "Category": st.column_config.TextColumn(width="medium"),
                 "Description": st.column_config.TextColumn(width="medium"),
                 "Account": st.column_config.TextColumn(width="medium"),
@@ -280,24 +372,25 @@ def render_transaction_table(
     stored_page = st.session_state.get("mobile_history_page", 1)
     if not isinstance(stored_page, int) or not 1 <= stored_page <= page_count:
         st.session_state.mobile_history_page = page_count if isinstance(stored_page, int) and stored_page > page_count else 1
+    page = 1
     with st.container(key="mobile_history_controls"):
-        page = st.selectbox(
-            "Mobile history page",
-            options=list(range(1, page_count + 1)),
-            format_func=lambda number: f"Page {number}",
-            key="mobile_history_page",
-        )
-        st.caption(
-            f"Page {page} of {page_count} · transactions {(page - 1) * page_size + 1}–"
-            f"{min(page * page_size, len(transactions))} of {len(transactions):,}"
-        )
+        if page_count > 1:
+            page = st.selectbox(
+                "History page", options=list(range(1, page_count + 1)),
+                format_func=lambda number: f"Page {number}", key="mobile_history_page",
+            )
+            st.caption(
+                f"Page {page} of {page_count} · transactions {(page - 1) * page_size + 1}–"
+                f"{min(page * page_size, len(transactions))} of {len(transactions):,}"
+            )
+    page_transactions = transactions[(page - 1) * page_size:page * page_size]
     cards = []
-    for transaction in transactions[(page - 1) * page_size:page * page_size]:
+    for transaction in page_transactions:
         amount_class = "fb-positive" if transaction.amount > 0 else "fb-negative"
         cards.append(
             (
                 '<div class="fb-card"><div class="fb-card-top">'
-                '<span>{description}</span><span class="{amount_class}">{amount}</span>'
+                '<span><bdi>{description}</bdi></span><span class="{amount_class}"><bdi>{amount}</bdi></span>'
                 '</div><div class="fb-card-meta">{date}{pending} · {category} · {account}</div></div>'
             ).format(
                 pending=" · Pending" if transaction.pending else "",
@@ -309,10 +402,22 @@ def render_transaction_table(
                 account=html.escape(transaction.account_name),
             )
         )
-    st.markdown(
-        '<div class="fb-mobile-transactions">' + "".join(cards) + "</div>",
-        unsafe_allow_html=True,
-    )
+    if selection_key:
+        with st.container(key="mobile_history_cards"):
+            for transaction, card in zip(page_transactions, cards):
+                with st.container(key=f"mobile_tx_{transaction.id}"):
+                    st.markdown(card, unsafe_allow_html=True)
+                    st.button(
+                        "Edit transaction", key=f"mobile_edit_{selection_key}_{transaction.id}",
+                        icon=":material/edit:", width="stretch",
+                        help=f"Edit {transaction.description} from {transaction.date.strftime('%b %-d, %Y')}",
+                        on_click=_request_transaction_edit, args=(transaction.id,),
+                    )
+    else:
+        st.markdown(
+            '<div class="fb-mobile-transactions">' + "".join(cards) + "</div>",
+            unsafe_allow_html=True,
+        )
     if not selection_key:
         return None
     try:

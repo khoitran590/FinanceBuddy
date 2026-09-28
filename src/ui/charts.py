@@ -28,12 +28,18 @@ CATEGORY_COLORS = [
     "#8A8F98",
 ]
 NEUTRAL_LINE = "rgba(128,128,128,0.55)"
-# Labels drawn on top of a category color: white on the deeper colors, near-black on the light ones.
-_LABEL_ON = {"#2F6FCB": "#FFFFFF", "#2E9C95": "#FFFFFF", "#B7652B": "#FFFFFF", "#9B7BD8": "#FFFFFF"}
-
-
 def _labels_for(colors: List[str]) -> List[str]:
-    return [_LABEL_ON.get(color, "#111111") for color in colors]
+    """Choose the higher-contrast label against each actual chart fill."""
+    labels = []
+    for color in colors:
+        channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+                  for value in channels]
+        luminance = sum(value * weight for value, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+        white_contrast = 1.05 / (luminance + 0.05)
+        black_contrast = (luminance + 0.05) / 0.05
+        labels.append("#FFFFFF" if white_contrast >= black_contrast else "#000000")
+    return labels
 
 
 def _style_figure(figure):

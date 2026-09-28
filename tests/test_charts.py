@@ -106,3 +106,22 @@ def test_alternative_chart_styles_render_with_data_and_when_empty():
 
     for builder in (make_monthly_line_chart, make_monthly_net_chart, make_category_treemap, make_category_trend_lines):
         assert builder([]).layout.title.text
+
+
+def test_category_labels_meet_normal_text_contrast_for_every_palette_fill():
+    from src.ui.charts import CATEGORY_COLORS, make_category_treemap
+
+    def luminance(color):
+        channels = [int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+                  for value in channels]
+        return sum(value * weight for value, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+    rows = [{'category': f'Category {index}', 'amount': 100} for index in range(len(CATEGORY_COLORS))]
+    figures = [make_category_donut_chart({row['category']: row['amount'] for row in rows}),
+               make_category_treemap(rows)]
+    for figure in figures:
+        trace = figure.data[0]
+        for fill, label in zip(trace.marker.colors, trace.textfont.color):
+            lighter, darker = sorted([luminance(fill), luminance(label)], reverse=True)
+            assert (lighter + 0.05) / (darker + 0.05) >= 4.5
