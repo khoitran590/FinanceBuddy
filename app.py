@@ -1426,6 +1426,9 @@ def render_transactions(transactions):
         st.button("Reset filters", key="transactions_empty_reset", on_click=reset_dashboard_filters)
         return
 
+    if any(item.split_needs_review for item in transactions):
+        st.warning("A bank update changed the amount of a split transaction. Its current total is counted once; review and split it again below.")
+
     duplicates = AnalyticsService.duplicate_candidates(transactions)
     duplicate_ids = {item.id for group in duplicates for item in group}
     views = {
@@ -1480,14 +1483,22 @@ def render_transactions(transactions):
         render_transaction_editor(shown)
 
     with st.expander("Split a transaction between two categories"):
-        expense_options = [item for item in transactions if item.amount < 0]
+        # Split the source, not a projected allocation. Re-splitting replaces its
+        # category allocations and keeps the provider/import ID unchanged.
+        sources = {}
+        for item in transactions:
+            source_id = item.source_transaction_id or item.id
+            amount = item.source_amount if item.source_amount is not None else item.amount
+            if amount < 0 or (amount > 0 and item.allocations):
+                sources[source_id] = item.model_copy(update={"id": source_id, "amount": amount})
+        expense_options = list(sources.values())
         if expense_options:
             expenses_by_id = {item.id: item for item in expense_options}
-            # A split replaces the original, so drop a choice that no longer exists.
+            # Filters and provider removals can invalidate a remembered source.
             if st.session_state.get("split_transaction") not in expenses_by_id:
                 st.session_state.pop("split_transaction", None)
             split_id = st.selectbox(
-                "Expense to split",
+                "Transaction to split",
                 [item.id for item in expense_options],
                 format_func=lambda item_id: (
                     f"{expenses_by_id[item_id].date} · {expenses_by_id[item_id].description} · "
@@ -1510,7 +1521,7 @@ def render_transactions(transactions):
                 st.caption(f"Second amount: {format_currency(amount_two)}")
                 split_submitted = st.form_submit_button(
                     "Split transaction",
-                    help="Replace the original transaction with two categorized entries whose amounts add up to the original.",
+                    help="Keep the original transaction and divide its amount between two categories. Existing allocations are replaced.",
                 )
             if split_submitted:
                 try:
@@ -1865,6 +1876,8 @@ def render_bank_connections() -> None:
                 account_count = len(plaid_repo.get_accounts(item.item_id))
                 last_sync = item.last_synced_at.replace("T", " ").replace("+00:00", " UTC") if item.last_synced_at else "Not synced yet"
                 heading.caption(f"{account_count} account(s) · Last sync: {last_sync}")
+                if item.needs_reconciliation:
+                    st.info("Bank history needs to be reconciled after a restore or account replacement. Sync transactions to refresh the full available history.")
                 if item.status == "error":
                     status.error("Needs attention")
                     st.warning("Reconnect this institution to continue syncing.")
@@ -1890,6 +1903,8 @@ def render_bank_connections() -> None:
                                 else " Balances could not be refreshed this time."
                             )
                         )
+                        if result.get("reconciliation_pending"):
+                            st.session_state.plaid_notice = "Plaid is still preparing the full history. Your restored data is kept; sync again when it is ready."
                         st.rerun()
                     except Exception as error:
                         st.error(f"Plaid sync failed: {service._friendly_error(error)}")
@@ -2059,7 +2074,7 @@ def render_import_statement() -> None:
             )
             if mode == "Replace this account":
                 existing_count = sum(item.account_name == account_name.strip() for item in repo.get_all())
-                st.warning(f"This replaces {existing_count} saved transaction(s) for “{account_name}” with {len(parsed)} parsed row(s). Replacement cannot be undone.")
+                st.warning(f"This replaces {existing_count} saved transaction(s) for “{account_name}” with {len(parsed)} parsed row(s). Replacement cannot be undone. If this account is connected to a bank, its next sync will reconcile the full available bank history.")
                 st.download_button(
                     "Download backup before replacing",
                     repo.export_backup(),
@@ -2120,10 +2135,10 @@ def render_backup_restore(all_transactions) -> None:
     if restore:
         try:
             preview = read_backup(restore.getvalue())
-            st.warning("Restoring replaces the four collections below for your account. Bank connections and settings stay in place.")
+            st.warning("Restoring replaces the four collections below for your account. Bank connections and settings stay in place. Connected banks will need a full sync to reconcile restored history with the bank's current records.")
             st.dataframe(
                 pd.DataFrame([
-                    {"Collection": "Transactions", "Saved now": len(all_transactions), "In backup": len(preview["transactions"])},
+                    {"Collection": "Transactions", "Saved now": len({item.source_transaction_id or item.id for item in all_transactions}), "In backup": len(preview["transactions"])},
                     {"Collection": "Budgets", "Saved now": len(repo.get_budgets()), "In backup": len(preview["budgets"])},
                     {"Collection": "Savings goals", "Saved now": len(repo.get_goals()), "In backup": len(preview["goals"])},
                     {"Collection": "Category rules", "Saved now": len(repo.get_category_rules()), "In backup": len(preview["category_rules"])},
@@ -2141,7 +2156,7 @@ def render_backup_restore(all_transactions) -> None:
                 st.session_state.restore_receipt = (
                     f"Restore complete: {result['transactions']} transactions, "
                     f"{result['budgets']} budgets, {result['goals']} goals, and "
-                    f"{result['category_rules']} category rules."
+                    f"{result['category_rules']} category rules. Sync connected banks to reconcile their history."
                 )
                 st.rerun()
         except (ValueError, SupabaseError):
@@ -2173,7 +2188,7 @@ def render_saved_accounts(all_transactions) -> None:
         if st.button(
             "Remove account",
             disabled=typed_name != remove_account,
-            help="Permanently delete every saved transaction for this account. Other accounts are not affected.",
+            help="Delete saved transactions for this account. If its bank connection stays active, the next sync will restore the bank's available history.",
         ):
             deleted = repo.delete_account(remove_account)
             st.success(f"Removed {deleted} transaction(s) from {remove_account}.")

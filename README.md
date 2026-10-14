@@ -139,6 +139,57 @@ The first Transactions Sync response can contain no activity while Plaid prepare
 python -m pytest
 ```
 
+Database regression checks can run in an isolated PostgreSQL WASM runtime without
+connecting to a Supabase project. Node.js is needed only for this optional check:
+
+```bash
+npm install --prefix /tmp/financebuddy-sql --no-audit --no-fund @electric-sql/pglite@0.5.9
+node scripts/test_database.mjs /tmp/financebuddy-sql/node_modules/@electric-sql/pglite/dist/index.js
+```
+
+This applies every migration, checks legacy split recovery, and executes rollback,
+sync, token, category-rule, allocation isolation, and restore reconciliation checks.
+It supplies a minimal Auth schema; also verify the flow in a development Supabase
+project before production rollout.
+
+## Source transactions, splits, and restore
+
+Apply `202610130001_source_splits_and_reconciliation.sql` while the app is stopped,
+then deploy the matching app version. Older app versions do not render the new
+allocation table. Export a backup before the migration and retain it until rollout
+verification is complete.
+
+Splitting keeps the original bank/import transaction and saves its category
+allocations separately. Bank updates refresh the source; bank removals delete its
+allocations together. If an update changes the total so the allocations no longer
+match, the dashboard counts the current source total once and Transactions prompts
+for review. Splitting that source again replaces its allocations.
+
+The migration recovers complete legacy split pairs, including nested splits, and
+keeps a source already re-created by an earlier sync authoritative. Incomplete or
+edited pairs are retained for manual review. It associates old bank transactions
+with provider accounts only when the current account label matches uniquely.
+
+New JSON backups use version 2 and contain canonical transactions, allocations, and
+provider item/account IDs. Version 1 backups still import, recovering complete split
+pairs. Settings, credentials, and bank connections remain excluded.
+
+Restore, full replacement, and connected-account replacement/removal reset affected
+bank cursors and require reconciliation. Use **Accounts → Bank connections → Sync
+transactions** after restore. The sync waits for Plaid's complete historical pull,
+fetches all available pages, then atomically updates bank rows, removes stale rows
+for that item, preserves surviving allocations/categories, and saves the new cursor.
+Statement imports and other bank items are not pruned. A generation check rejects
+syncs started before the restore, even when both cursors were empty.
+
+Plaid may still be preparing history, in which case restored data and the reset
+cursor remain intact and the UI asks you to sync again. Readiness uses
+[`transactions_update_status` in Plaid's API](https://plaid.com/docs/api/products/transactions/).
+An older backup with unmapped bank rows cannot be restored over active connections
+when account matching is ambiguous: sync those connections first, or reconcile the
+legacy account identities in a development copy before retrying. Disconnected
+historical records with explicit provider IDs remain portable.
+
 ## Production deployment
 
 FinanceBuddy is deployed on the free tier of Streamlit Community Cloud, which runs `app.py`

@@ -16,6 +16,8 @@ class PlaidItem:
     status: str
     last_synced_at: Optional[str]
     error_message: Optional[str]
+    sync_generation: int = 0
+    needs_reconciliation: bool = False
 
 
 def account_balances(account: dict) -> dict:
@@ -102,6 +104,11 @@ class PlaidRepository:
             ):
                 if column not in columns:
                     connection.execute(f"ALTER TABLE plaid_accounts ADD COLUMN {column} {kind}")
+            item_columns = {row[1] for row in connection.execute("PRAGMA table_info(plaid_items)")}
+            for column, kind in (("sync_generation", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("needs_reconciliation", "INTEGER NOT NULL DEFAULT 0")):
+                if column not in item_columns:
+                    connection.execute(f"ALTER TABLE plaid_items ADD COLUMN {column} {kind}")
 
     def save_item(
         self, item_id: str, encrypted_access_token: str, institution_name: str
@@ -192,6 +199,8 @@ class PlaidRepository:
                 status=row["status"],
                 last_synced_at=row["last_synced_at"],
                 error_message=row["error_message"],
+                sync_generation=row["sync_generation"],
+                needs_reconciliation=bool(row["needs_reconciliation"]),
             )
             for row in rows
         ]

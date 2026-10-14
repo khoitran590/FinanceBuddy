@@ -52,12 +52,12 @@ begin
   if v_after <> v_before then raise exception 'Failed backup changed transactions'; end if;
 
   insert into public.transactions(user_id,id,date,description,amount,category,account_name)
-  values (auth.uid(),'__atomic_split',current_date,'test',-3,'Test','Test'),
-         (auth.uid(),'__atomic_split-split-1',current_date,'test',-1,'Test','Test');
+  values (auth.uid(),'__atomic_split',current_date,'test',-3,'Test','Test');
   begin
-    perform public.fb_split_transaction('__atomic_split','Test',1,'Test',2);
-    raise exception 'Split collision did not fail';
-  exception when unique_violation then null;
+    perform public.fb_split_transaction('__atomic_split','Test',1,'Test',1);
+    raise exception 'Invalid split did not fail';
+  exception when raise_exception then
+    if sqlerrm = 'Invalid split did not fail' then raise; end if;
   end;
   if not exists (select 1 from public.transactions where id='__atomic_split') then
     raise exception 'Failed split lost original';

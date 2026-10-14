@@ -1,4 +1,5 @@
 import json
+import math
 import sqlite3
 from datetime import date
 from pathlib import Path
@@ -6,7 +7,8 @@ from typing import Iterable, List, Optional
 
 from src.services.security import read_backup
 
-from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction
+from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction, TransactionAllocation
+from src.domain.allocations import project_transactions, recover_legacy_splits
 
 
 class TransactionRepository:
@@ -21,6 +23,7 @@ class TransactionRepository:
     def _get_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def _init_db(self) -> None:
@@ -70,24 +73,66 @@ class TransactionRepository:
                     "ALTER TABLE transactions ADD COLUMN account_type TEXT NOT NULL DEFAULT 'Checking'"
                 )
 
-    def get_all(self) -> List[Transaction]:
-        with self._get_connection() as connection:
-            rows = connection.execute(
-                "SELECT * FROM transactions ORDER BY date DESC, id DESC"
-            ).fetchall()
+            for column in ("plaid_item_id", "plaid_account_id"):
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE transactions ADD COLUMN {column} TEXT")
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS transaction_allocations (
+                    id TEXT PRIMARY KEY,
+                    transaction_id TEXT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+                    amount REAL NOT NULL,
+                    category TEXT NOT NULL
+                );
+            """)
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE name='plaid_items'").fetchone():
+                item_columns = {row[1] for row in connection.execute("PRAGMA table_info(plaid_items)")}
+                for column, kind in (("sync_generation", "INTEGER NOT NULL DEFAULT 0"),
+                                     ("needs_reconciliation", "INTEGER NOT NULL DEFAULT 0")):
+                    if column not in item_columns:
+                        connection.execute(f"ALTER TABLE plaid_items ADD COLUMN {column} {kind}")
+            self._recover_legacy_splits(connection)
 
-        return [
-            Transaction(
-                id=row["id"],
-                date=date.fromisoformat(row["date"]),
-                description=row["description"],
-                amount=row["amount"],
-                category=row["category"],
-                account_name=row["account_name"],
-                account_type=row["account_type"],
-            )
-            for row in rows
-        ]
+    @staticmethod
+    def _recover_legacy_splits(connection):
+        rows = connection.execute("SELECT * FROM transactions").fetchall()
+        allocations = {}
+        for row in connection.execute("SELECT * FROM transaction_allocations"):
+            allocations.setdefault(row["transaction_id"], []).append(dict(row))
+        original = [Transaction(**dict(row), allocations=allocations.get(row["id"], [])) for row in rows]
+        recovered = recover_legacy_splits(original)
+        consumed = {item.id for item in original} - {item.id for item in recovered}
+        if not consumed:
+            return
+        # Recover before export, so a legacy SQLite file produces a canonical v2
+        # backup. Only complete pairs are consumed; partial records stay intact.
+        for item in recovered:
+            connection.execute("""INSERT OR IGNORE INTO transactions
+                (id,date,description,amount,category,account_name,account_type,plaid_item_id,plaid_account_id)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (item.id,item.date.isoformat(),item.description,item.amount,item.category,
+                 item.account_name,item.account_type,item.plaid_item_id,item.plaid_account_id))
+        for identifier in consumed:
+            connection.execute("DELETE FROM transactions WHERE id=?", (identifier,))
+        for item in recovered:
+            if item.allocations:
+                connection.execute("DELETE FROM transaction_allocations WHERE transaction_id=?", (item.id,))
+                connection.executemany("INSERT INTO transaction_allocations VALUES (?,?,?,?)", [
+                    (str(allocation.id),item.id,allocation.amount,allocation.category) for allocation in item.allocations
+                ])
+
+    def get_canonical_all(self) -> List[Transaction]:
+        with self._get_connection() as connection:
+            rows = connection.execute("SELECT * FROM transactions ORDER BY date DESC, id DESC").fetchall()
+            allocations = connection.execute("SELECT * FROM transaction_allocations ORDER BY id").fetchall()
+        by_id = {}
+        for allocation in allocations:
+            by_id.setdefault(allocation["transaction_id"], []).append({
+                "id": allocation["id"], "amount": allocation["amount"], "category": allocation["category"],
+            })
+        return [Transaction(**dict(row), allocations=by_id.get(row["id"], [])) for row in rows]
+
+    def get_all(self) -> List[Transaction]:
+        return project_transactions(self.get_canonical_all())
 
     def get_existing_ids(self) -> set[str]:
         with self._get_connection() as connection:
@@ -104,6 +149,8 @@ class TransactionRepository:
                 transaction.category,
                 transaction.account_name,
                 transaction.account_type,
+                transaction.plaid_item_id,
+                transaction.plaid_account_id,
             )
             for transaction in transactions
         ]
@@ -114,8 +161,8 @@ class TransactionRepository:
             cursor = connection.executemany(
                 """
                 INSERT OR IGNORE INTO transactions
-                    (id, date, description, amount, category, account_name, account_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 payload,
             )
@@ -132,6 +179,8 @@ class TransactionRepository:
                 transaction.category,
                 transaction.account_name,
                 transaction.account_type,
+                transaction.plaid_item_id,
+                transaction.plaid_account_id,
             )
             for transaction in transactions
         ]
@@ -142,8 +191,8 @@ class TransactionRepository:
             connection.executemany(
                 """
                 INSERT INTO transactions
-                    (id, date, description, amount, category, account_name, account_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     date = excluded.date,
                     description = excluded.description,
@@ -153,7 +202,9 @@ class TransactionRepository:
                         ELSE transactions.category
                     END,
                     account_name = excluded.account_name,
-                    account_type = excluded.account_type
+                    account_type = excluded.account_type,
+                    plaid_item_id = excluded.plaid_item_id,
+                    plaid_account_id = excluded.plaid_account_id
                 """,
                 payload,
             )
@@ -176,7 +227,10 @@ class TransactionRepository:
     def replace_account(self, account_name: str, transactions: Iterable[Transaction]) -> int:
         """Replace one account without disturbing the user's other accounts."""
         payload = list(transactions)
+        if any(item.account_name != account_name for item in payload):
+            raise ValueError("Statement account does not match the selected account.")
         with self._get_connection() as connection:
+            self._invalidate_sync(connection, account_name)
             connection.execute(
                 "DELETE FROM transactions WHERE account_name = ?", (account_name,)
             )
@@ -185,8 +239,8 @@ class TransactionRepository:
             cursor = connection.executemany(
                 """
                 INSERT OR IGNORE INTO transactions
-                    (id, date, description, amount, category, account_name, account_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -197,6 +251,8 @@ class TransactionRepository:
                         transaction.category,
                         transaction.account_name,
                         transaction.account_type,
+                        transaction.plaid_item_id,
+                        transaction.plaid_account_id,
                     )
                     for transaction in payload
                 ],
@@ -204,6 +260,11 @@ class TransactionRepository:
             return cursor.rowcount
 
     def update_category(self, transaction_id: str, category: str) -> None:
+        if transaction_id.startswith("allocation:"):
+            with self._get_connection() as connection:
+                connection.execute("UPDATE transaction_allocations SET category=? WHERE id=?",
+                                   (category, transaction_id.removeprefix("allocation:")))
+            return
         with self._get_connection() as connection:
             connection.execute(
                 "UPDATE transactions SET category = ? WHERE id = ?",
@@ -212,70 +273,33 @@ class TransactionRepository:
 
     def apply_category_rule(self, keyword: str, category: str) -> int:
         with self._get_connection() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE transactions
-                SET category = ?
-                WHERE lower(description) LIKE ?
-                """,
-                (category, f"%{keyword.strip().lower()}%"),
-            )
+            cursor = connection.execute("UPDATE transactions SET category=? WHERE instr(lower(description),?)>0",
+                                        (category, keyword.strip().lower()))
+            connection.execute("""UPDATE transaction_allocations SET category=? WHERE transaction_id IN (
+                SELECT id FROM transactions WHERE instr(lower(description),?)>0)""",
+                (category, keyword.strip().lower()))
             return cursor.rowcount
 
     def split_transaction(
-        self,
-        transaction_id: str,
-        first_category: str,
-        first_amount: float,
-        second_category: str,
-        second_amount: float,
+        self, transaction_id: str, first_category: str, first_amount: float,
+        second_category: str, second_amount: float,
     ) -> None:
-        transactions = {transaction.id: transaction for transaction in self.get_all()}
-        original = transactions.get(transaction_id)
-        if original is None:
-            raise ValueError("Transaction no longer exists.")
-        if abs((first_amount + second_amount) - abs(original.amount)) > 0.01:
-            raise ValueError("Split amounts must equal the original transaction amount.")
-        sign = -1 if original.amount < 0 else 1
-        split_rows = [
-            original.model_copy(
-                update={
-                    "id": f"{original.id}-split-1",
-                    "description": f"{original.description} (split 1)",
-                    "amount": sign * first_amount,
-                    "category": first_category,
-                }
-            ),
-            original.model_copy(
-                update={
-                    "id": f"{original.id}-split-2",
-                    "description": f"{original.description} (split 2)",
-                    "amount": sign * second_amount,
-                    "category": second_category,
-                }
-            ),
-        ]
+        if not all(math.isfinite(value) and value > 0 for value in (first_amount, second_amount)):
+            raise ValueError("Split amounts must be positive and finite.")
         with self._get_connection() as connection:
-            connection.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
-            connection.executemany(
-                """
-                INSERT INTO transactions
-                    (id, date, description, amount, category, account_name, account_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        item.id,
-                        item.date.isoformat(),
-                        item.description,
-                        item.amount,
-                        item.category,
-                        item.account_name,
-                        item.account_type,
-                    )
-                    for item in split_rows
-                ],
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
+            if row is None:
+                raise ValueError("Transaction no longer exists.")
+            if abs(first_amount + second_amount - abs(row["amount"])) > 0.005:
+                raise ValueError("Split amounts must equal the original transaction amount.")
+            sign = -1 if row["amount"] < 0 else 1
+            allocations = [TransactionAllocation(category=category, amount=sign * amount)
+                           for category, amount in ((first_category, first_amount), (second_category, second_amount))]
+            connection.execute("DELETE FROM transaction_allocations WHERE transaction_id=?", (transaction_id,))
+            connection.executemany("INSERT INTO transaction_allocations VALUES (?,?,?,?)", [
+                (str(item.id), transaction_id, item.amount, item.category) for item in allocations
+            ])
 
     def get_budgets(self) -> List[Budget]:
         with self._get_connection() as connection:
@@ -373,6 +397,7 @@ class TransactionRepository:
 
     def delete_account(self, account_name: str) -> int:
         with self._get_connection() as connection:
+            self._invalidate_sync(connection, account_name)
             cursor = connection.execute(
                 "DELETE FROM transactions WHERE account_name = ?", (account_name,)
             )
@@ -397,8 +422,8 @@ class TransactionRepository:
 
     def export_backup(self) -> str:
         payload = {
-            "version": 1,
-            "transactions": [item.model_dump(mode="json") for item in self.get_all()],
+            "version": 2,
+            "transactions": [item.model_dump(mode="json") for item in self.get_canonical_all()],
             "budgets": [item.model_dump(mode="json") for item in self.get_budgets()],
             "goals": [item.model_dump(mode="json") for item in self.get_goals()],
             "category_rules": [
@@ -410,10 +435,13 @@ class TransactionRepository:
     def restore_backup(self, raw_json: bytes) -> dict:
         data = read_backup(raw_json)
         transactions = [Transaction.model_validate(item) for item in data.get("transactions", [])]
+        if data["version"] == 1:
+            transactions = recover_legacy_splits(transactions)
         budgets = [Budget.model_validate(item) for item in data.get("budgets", [])]
         goals = [SavingsGoal.model_validate(item) for item in data.get("goals", [])]
         rules = [CategoryRule.model_validate(item) for item in data.get("category_rules", [])]
         with self._get_connection() as connection:
+            transactions = self._prepare_transactions(connection, transactions)
             connection.execute("DELETE FROM transactions")
             connection.execute("DELETE FROM budgets")
             connection.execute("DELETE FROM savings_goals")
@@ -421,8 +449,8 @@ class TransactionRepository:
             connection.executemany(
                 """
                 INSERT INTO transactions
-                    (id, date, description, amount, category, account_name, account_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -433,10 +461,17 @@ class TransactionRepository:
                         item.category,
                         item.account_name,
                         item.account_type,
+                        item.plaid_item_id,
+                        item.plaid_account_id,
                     )
                     for item in transactions
                 ],
             )
+            connection.executemany("INSERT INTO transaction_allocations VALUES (?,?,?,?)", [
+                (str(allocation.id), item.id, allocation.amount, allocation.category)
+                for item in transactions for allocation in item.allocations
+            ])
+            self._invalidate_sync(connection)
             connection.executemany(
                 "INSERT INTO budgets (category, monthly_limit) VALUES (?, ?)",
                 [(item.category, item.monthly_limit) for item in budgets],
@@ -479,20 +514,97 @@ class TransactionRepository:
                 transaction.category,
                 transaction.account_name,
                 transaction.account_type,
+                transaction.plaid_item_id,
+                transaction.plaid_account_id,
             )
             for transaction in transactions
         ]
 
         with self._get_connection() as connection:
+            self._invalidate_sync(connection, None)
             connection.execute("DELETE FROM transactions")
             if not payload:
                 return 0
             cursor = connection.executemany(
                 """
                 INSERT OR IGNORE INTO transactions
-                    (id, date, description, amount, category, account_name, account_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 payload,
             )
             return cursor.rowcount
+
+    @staticmethod
+    def _invalidate_sync(connection, account_name=None):
+        exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='plaid_items'").fetchone()
+        if not exists:
+            return
+        if account_name is None:
+            connection.execute("UPDATE plaid_items SET cursor=NULL, sync_generation=sync_generation+1, needs_reconciliation=1")
+        else:
+            connection.execute("""UPDATE plaid_items SET cursor=NULL,
+                sync_generation=sync_generation+1, needs_reconciliation=1
+                WHERE item_id IN (SELECT plaid_item_id FROM transactions WHERE account_name=?)
+                OR item_id IN (SELECT item_id FROM plaid_accounts WHERE coalesce(nullif(official_name,''),name) ||
+                    CASE WHEN mask IS NULL OR mask='' THEN '' ELSE ' ••••'||mask END=?)""",
+                (account_name, account_name))
+
+    def apply_plaid_sync(self, item_id, expected_cursor, next_cursor, upserts, removed_ids, synced_at,
+                         *, expected_generation=0, reconcile=False):
+        items = list(upserts)
+        removed_ids = set(removed_ids)
+        with self._get_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state = connection.execute("SELECT * FROM plaid_items WHERE item_id=?", (item_id,)).fetchone()
+            if (state is None or state["cursor"] != expected_cursor
+                    or state["sync_generation"] != expected_generation):
+                raise ValueError("Bank cursor changed; retry sync.")
+            if bool(state["needs_reconciliation"]) != reconcile:
+                raise ValueError("Bank reconciliation state changed; retry sync.")
+            for item in items:
+                connection.execute("""INSERT INTO transactions
+                    (id,date,description,amount,category,account_name,account_type,plaid_item_id,plaid_account_id)
+                    VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                    date=excluded.date,description=excluded.description,amount=excluded.amount,
+                    category=CASE WHEN transactions.category='Uncategorized' THEN excluded.category ELSE transactions.category END,
+                    account_name=excluded.account_name,account_type=excluded.account_type,
+                    plaid_item_id=excluded.plaid_item_id,plaid_account_id=excluded.plaid_account_id""",
+                    (item.id,item.date.isoformat(),item.description,item.amount,item.category,
+                     item.account_name,item.account_type,item_id,item.plaid_account_id))
+            removed = 0
+            for identifier in set(removed_ids):
+                removed += connection.execute("DELETE FROM transactions WHERE id=? AND plaid_item_id=?",
+                                              (identifier,item_id)).rowcount
+            if reconcile:
+                ids = {item.id for item in items} - set(removed_ids)
+                stale = connection.execute("SELECT id FROM transactions WHERE plaid_item_id=?", (item_id,)).fetchall()
+                for row in stale:
+                    if row["id"] not in ids:
+                        removed += connection.execute("DELETE FROM transactions WHERE id=?", (row["id"],)).rowcount
+            connection.execute("""UPDATE plaid_items SET cursor=?,last_synced_at=?,status='connected',
+                error_message=NULL,needs_reconciliation=0 WHERE item_id=?""", (next_cursor,synced_at,item_id))
+            return {"upserted": len(items), "removed": removed}
+
+    @staticmethod
+    def _prepare_transactions(connection, transactions):
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='plaid_items'").fetchone():
+            return transactions
+        has_items = connection.execute("SELECT 1 FROM plaid_items LIMIT 1").fetchone()
+        result = []
+        for item in transactions:
+            if item.id.startswith('plaid:') and item.plaid_item_id is None:
+                existing = connection.execute("SELECT plaid_item_id,plaid_account_id FROM transactions WHERE id=?",
+                                              (item.id,)).fetchone()
+                source = existing if existing and existing['plaid_item_id'] else None
+                if source is None:
+                    matches = connection.execute("""SELECT item_id AS plaid_item_id,account_id AS plaid_account_id
+                        FROM plaid_accounts WHERE coalesce(nullif(official_name,''),name) ||
+                        CASE WHEN mask IS NULL OR mask='' THEN '' ELSE ' ••••'||mask END=?""", (item.account_name,)).fetchall()
+                    source = matches[0] if len(matches) == 1 else None
+                if source:
+                    item = item.model_copy(update=dict(source))
+                elif has_items:
+                    raise ValueError("Bank history must be matched before restore; sync connections and retry.")
+            result.append(item)
+        return result

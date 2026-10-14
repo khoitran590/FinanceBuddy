@@ -21,6 +21,63 @@ def test_app_stops_at_authentication_boundary_without_exceptions():
     )
 
 
+def test_transaction_ui_edits_allocations_and_resplits_the_source(tmp_path, monkeypatch):
+    import time
+    from datetime import date
+    from src.domain.models import Transaction
+    from src.repositories.transaction_repo import TransactionRepository
+    import src.repositories.supabase_repo as cloud_repos
+    from src.services.supabase import SupabaseAuth, SupabaseConfig
+    from src.services.plaid_service import PlaidConfig
+
+    repo = TransactionRepository(str(tmp_path / "allocations-ui.db"))
+    source = Transaction(id="plaid:source", date=date(2026, 9, 1), description="Store", amount=-100,
+                         category="Shopping", account_name="Card")
+    repo.insert_many([source])
+    repo.split_transaction(source.id, "Groceries", 60, "Shopping", 40)
+    repo.set_setting("onboarding_complete", "true")
+    monkeypatch.setenv("FINANCEBUDDY_ENV", "development")
+    monkeypatch.setattr(SupabaseConfig, "from_sources", classmethod(lambda cls, secrets: SupabaseConfig("https://test.supabase.co", "test")))
+    monkeypatch.setattr(SupabaseAuth, "get_user", lambda self, token: {"id": "alice", "email": "alice@example.com", "email_confirmed_at": "2026-09-01"})
+    monkeypatch.setattr(cloud_repos, "SupabaseTransactionRepository", lambda client, user_id: repo)
+    monkeypatch.setattr(PlaidConfig, "from_sources", classmethod(lambda cls, secrets: PlaidConfig("", "")))
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+    app.session_state["supabase_session"] = {"access_token": "test", "refresh_token": "test", "expires_at": time.time() + 3600}
+    app.session_state["session_owner"] = "alice"
+    app.session_state["nav_page"] = "Transactions"
+    app.run(timeout=20)
+    assert not app.exception
+    assert app.selectbox(key="split_transaction").value == source.id
+    next(button for button in app.button if button.label == "Edit selected transaction").click().run()
+    assert not app.exception
+    assert app.selectbox(key="category_transaction").value.startswith("allocation:")
+    next(box for box in app.selectbox if box.label == "Category").set_value("Travel")
+    next(button for button in app.button if button.label == "Save category").click().run()
+    assert not app.exception
+    assert "Travel" in {row.category for row in repo.get_all()}
+    assert repo.get_canonical_all()[0].category == "Shopping"
+    repo.upsert_many([source.model_copy(update={"amount": -110})])
+    app.run()
+    assert not app.exception
+    assert any("changed the amount of a split" in item.value for item in app.warning)
+    next(button for button in app.button if button.label == "Split transaction").click().run()
+    assert not app.exception
+    assert len(repo.get_canonical_all()) == 1
+    assert len(repo.get_all()) == 2
+    assert sum(item.amount for item in repo.get_all()) == -110
+    assert not any(item.split_needs_review for item in repo.get_all())
+    # A provider reversal can change direction; the existing split remains
+    # reviewable even though the source is now an inflow.
+    repo.upsert_many([source.model_copy(update={"amount": 110})])
+    app.run()
+    assert not app.exception
+    assert app.selectbox(key="split_transaction").value == source.id
+    next(button for button in app.button if button.label == "Split transaction").click().run()
+    assert not app.exception
+    assert sum(item.amount for item in repo.get_all()) == 110
+    assert not any(item.split_needs_review for item in repo.get_all())
+
+
 def test_plaid_link_component_mounts_without_invalid_defaults():
     app = AppTest.from_string(
         """

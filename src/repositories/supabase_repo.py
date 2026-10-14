@@ -5,12 +5,13 @@ from datetime import date
 from typing import Iterable, Optional
 
 from src.services.security import read_backup
+from src.services.supabase import SupabaseDataClient, SupabaseError
 
 from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction
+from src.domain.allocations import project_transactions, recover_legacy_splits
 from src.repositories.plaid_repo import PlaidItem, account_balances
 
-OPTIONAL_TRANSACTION_FIELDS = ("merchant_name", "subcategory", "payment_channel", "location", "pending")
-from src.services.supabase import SupabaseDataClient, SupabaseError
+OPTIONAL_TRANSACTION_FIELDS = ("merchant_name", "subcategory", "payment_channel", "location", "pending", "plaid_item_id", "plaid_account_id")
 
 
 class SupabaseTransactionRepository:
@@ -65,16 +66,23 @@ class SupabaseTransactionRepository:
             payment_channel=row.get("payment_channel"),
             location=row.get("location"),
             pending=bool(row.get("pending") or False),
+            plaid_item_id=row.get("plaid_item_id"),
+            plaid_account_id=row.get("plaid_account_id"),
+            allocations=row.get("allocations") or [],
         )
 
-    def get_all(self) -> list[Transaction]:
+    def get_canonical_all(self) -> list[Transaction]:
         rows = self.client.select(
-            "transactions", user_id=self._owner, order="date.desc,id.desc"
+            "transactions", user_id=self._owner, order="date.desc,id.desc",
+            select="*,allocations:transaction_allocations(id,amount,category)",
         )
         return [self._transaction(row) for row in rows]
 
+    def get_all(self) -> list[Transaction]:
+        return project_transactions(self.get_canonical_all())
+
     def get_existing_ids(self) -> set[str]:
-        return {item.id for item in self.get_all()}
+        return {item.id for item in self.get_canonical_all()}
 
     def insert_many(self, transactions: Iterable[Transaction]) -> int:
         payload = self._transaction_rows(transactions)
@@ -87,7 +95,7 @@ class SupabaseTransactionRepository:
         items = list(transactions)
         if not items:
             return 0
-        existing_categories = {item.id: item.category for item in self.get_all()}
+        existing_categories = {item.id: item.category for item in self.get_canonical_all()}
         payload = self._transaction_rows(items)
         for item, row in zip(items, payload):
             existing = existing_categories.get(item.id)
@@ -119,6 +127,15 @@ class SupabaseTransactionRepository:
         }))
 
     def update_category(self, transaction_id: str, category: str) -> None:
+        if transaction_id.startswith("allocation:"):
+            from uuid import UUID
+
+            allocation_id = str(UUID(transaction_id.removeprefix("allocation:")))
+            self.client.update(
+                "transaction_allocations", {"category": category},
+                user_id=self._owner, id=f"eq.{allocation_id}",
+            )
+            return
         self.client.update(
             "transactions",
             {"category": category},
@@ -211,11 +228,7 @@ class SupabaseTransactionRepository:
         self.client.delete("category_rules", user_id=self._owner, keyword=f"eq.{keyword}")
 
     def delete_account(self, account_name: str) -> int:
-        return len(
-            self.client.delete(
-                "transactions", user_id=self._owner, account_name=f"eq.{account_name}"
-            )
-        )
+        return int(self.client.rpc("fb_delete_account_transactions", {"p_account": account_name}))
 
     def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
         rows = self.client.select("app_settings", user_id=self._owner, key=f"eq.{key}")
@@ -231,8 +244,8 @@ class SupabaseTransactionRepository:
     def export_backup(self) -> str:
         return json.dumps(
             {
-                "version": 1,
-                "transactions": [item.model_dump(mode="json") for item in self.get_all()],
+                "version": 2,
+                "transactions": [item.model_dump(mode="json") for item in self.get_canonical_all()],
                 "budgets": [item.model_dump(mode="json") for item in self.get_budgets()],
                 "goals": [item.model_dump(mode="json") for item in self.get_goals()],
                 "category_rules": [item.model_dump(mode="json") for item in self.get_category_rules()],
@@ -243,11 +256,13 @@ class SupabaseTransactionRepository:
     def restore_backup(self, raw_json: bytes) -> dict:
         data = read_backup(raw_json)
         transactions = [Transaction.model_validate(item) for item in data.get("transactions", [])]
+        if data["version"] == 1:
+            transactions = recover_legacy_splits(transactions)
         budgets = [Budget.model_validate(item) for item in data.get("budgets", [])]
         goals = [SavingsGoal.model_validate(item) for item in data.get("goals", [])]
         rules = [CategoryRule.model_validate(item) for item in data.get("category_rules", [])]
         payload = {
-            "version": 1,
+            "version": 2,
             "transactions": [item.model_dump(mode="json") for item in transactions],
             "budgets": [item.model_dump(mode="json") for item in budgets],
             "goals": [item.model_dump(mode="json") for item in goals],
@@ -269,6 +284,7 @@ class SupabaseTransactionRepository:
     def apply_plaid_sync(
         self, item_id: str, expected_cursor: str | None, next_cursor: str,
         upserts: Iterable[Transaction], removed_ids: Iterable[str], synced_at: str,
+        *, expected_generation: int = 0, reconcile: bool = False,
     ) -> dict:
         return self.client.rpc("fb_apply_plaid_sync", {
             "p_item_id": item_id,
@@ -277,6 +293,8 @@ class SupabaseTransactionRepository:
             "p_synced_at": synced_at,
             "p_upserts": [self._transaction_payload(item) for item in upserts],
             "p_removed_ids": list(removed_ids),
+            "p_expected_generation": expected_generation,
+            "p_reconcile": reconcile,
         })
 
 
@@ -328,6 +346,8 @@ class SupabasePlaidRepository:
                 status=row["status"],
                 last_synced_at=row.get("last_synced_at"),
                 error_message=row.get("error_message"),
+                sync_generation=int(row.get("sync_generation") or 0),
+                needs_reconciliation=bool(row.get("needs_reconciliation", False)),
             ))
         return items
 
