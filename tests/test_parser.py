@@ -64,6 +64,7 @@ def test_credit_card_transactions_are_normalized_for_analytics():
         csv_data,
         "Rewards Card",
         "Credit Card",
+        sign_convention="outflow_positive",
     )
 
     assert metrics.is_valid

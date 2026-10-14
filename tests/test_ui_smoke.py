@@ -78,6 +78,46 @@ def test_transaction_ui_edits_allocations_and_resplits_the_source(tmp_path, monk
     assert not any(item.split_needs_review for item in repo.get_all())
 
 
+def test_statement_ui_previews_repeated_rows_saves_retries_and_undoes(tmp_path, monkeypatch):
+    import time
+    from io import BytesIO
+    import streamlit as st
+    import src.repositories.supabase_repo as cloud_repos
+    from src.repositories.transaction_repo import TransactionRepository
+    from src.services.supabase import SupabaseAuth, SupabaseConfig
+    from src.services.plaid_service import PlaidConfig
+
+    repo = TransactionRepository(str(tmp_path / "imports-ui.db"))
+    repo.set_setting("onboarding_complete", "true")
+    upload = BytesIO(b"Date,Description,Amount\n2026-10-01,Coffee,-4.50\n2026-10-01,Coffee,-4.50\n")
+    upload.name = "checking.csv"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload if kwargs.get("key") == "statement_import" else None)
+    monkeypatch.setenv("FINANCEBUDDY_ENV", "development")
+    monkeypatch.setattr(SupabaseConfig, "from_sources", classmethod(lambda cls, secrets: SupabaseConfig("https://test.supabase.co", "test")))
+    monkeypatch.setattr(SupabaseAuth, "get_user", lambda self, token: {"id": "alice", "email": "alice@example.com", "email_confirmed_at": "2026-09-01"})
+    monkeypatch.setattr(cloud_repos, "SupabaseTransactionRepository", lambda client, user_id: repo)
+    monkeypatch.setattr(PlaidConfig, "from_sources", classmethod(lambda cls, secrets: PlaidConfig("", "")))
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+    app.session_state["supabase_session"] = {"access_token": "test", "refresh_token": "test", "expires_at": time.time() + 3600}
+    app.session_state["session_owner"] = "alice"
+    app.session_state["nav_page"] = "Accounts"
+    app.session_state["accounts_view"] = "Import statement"
+    app.run(timeout=20)
+    assert not app.exception
+    assert app.dataframe[0].value["Save action"].tolist() == ["New purchase", "New purchase"]
+    next(box for box in app.checkbox if box.label.startswith("I reviewed the account")).set_value(True).run()
+    next(button for button in app.button if button.label == "Save statement").click().run()
+    assert not app.exception
+    assert len(repo.get_all()) == 2 and sum(row.amount for row in repo.get_all()) == -9
+    assert app.dataframe[0].value["Save action"].tolist() == ["Already saved", "Already saved"]
+    next(button for button in app.button if button.label == "Undo last import").click().run()
+    assert not app.exception and repo.get_all() == []
+    assert any("Removed 2 imported" in item.value for item in app.success)
+    next(button for button in app.button if button.label == "Save statement").click().run()
+    next(button for button in app.button if button.label == "Save statement").click().run()
+    assert not app.exception and len(repo.get_all()) == 2
+
+
 def test_plaid_link_component_mounts_without_invalid_defaults():
     app = AppTest.from_string(
         """

@@ -7,7 +7,8 @@ from typing import Iterable, List, Optional
 
 from src.services.security import read_backup
 
-from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction, TransactionAllocation
+from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction, TransactionAllocation, StatementImportRow
+from src.services.imports import plan_statement_import, normalize_text
 from src.domain.allocations import project_transactions, recover_legacy_splits
 
 
@@ -23,6 +24,7 @@ class TransactionRepository:
     def _get_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
+        connection.create_function("fb_import_normalize", 1, normalize_text, deterministic=True)
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
@@ -73,7 +75,7 @@ class TransactionRepository:
                     "ALTER TABLE transactions ADD COLUMN account_type TEXT NOT NULL DEFAULT 'Checking'"
                 )
 
-            for column in ("plaid_item_id", "plaid_account_id"):
+            for column in ("plaid_item_id", "plaid_account_id", "statement_file_id", "statement_reference"):
                 if column not in columns:
                     connection.execute(f"ALTER TABLE transactions ADD COLUMN {column} TEXT")
             connection.executescript("""
@@ -90,6 +92,22 @@ class TransactionRepository:
                                      ("needs_reconciliation", "INTEGER NOT NULL DEFAULT 0")):
                     if column not in item_columns:
                         connection.execute(f"ALTER TABLE plaid_items ADD COLUMN {column} {kind}")
+            if "statement_match_bank" not in columns:
+                connection.execute("ALTER TABLE transactions ADD COLUMN statement_match_bank INTEGER NOT NULL DEFAULT 0")
+            if "statement_row" not in columns:
+                connection.execute("ALTER TABLE transactions ADD COLUMN statement_row INTEGER")
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS statement_import_rows (
+                    file_id TEXT NOT NULL, row_number INTEGER NOT NULL,
+                    transaction_id TEXT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+                    PRIMARY KEY(file_id,row_number)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS transactions_file_row_idx
+                    ON transactions(statement_file_id,statement_row) WHERE statement_file_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS transactions_reference_idx
+                    ON transactions(fb_import_normalize(account_name),fb_import_normalize(account_type),statement_reference)
+                    WHERE statement_reference IS NOT NULL;
+            """)
             self._recover_legacy_splits(connection)
 
     @staticmethod
@@ -140,6 +158,9 @@ class TransactionRepository:
         return {row["id"] for row in rows}
 
     def insert_many(self, transactions: Iterable[Transaction]) -> int:
+        transactions = list(transactions)
+        if transactions and all(item.statement_file_id for item in transactions):
+            return self.append_statement(transactions)["inserted"]
         payload = [
             (
                 transaction.id,
@@ -151,6 +172,7 @@ class TransactionRepository:
                 transaction.account_type,
                 transaction.plaid_item_id,
                 transaction.plaid_account_id,
+                transaction.statement_file_id, transaction.statement_row, transaction.statement_reference, transaction.statement_match_bank,
             )
             for transaction in transactions
         ]
@@ -161,12 +183,77 @@ class TransactionRepository:
             cursor = connection.executemany(
                 """
                 INSERT OR IGNORE INTO transactions
-                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id, statement_file_id, statement_row, statement_reference, statement_match_bank)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 payload,
             )
             return cursor.rowcount
+
+    def get_import_rows(self, file_id=None):
+        with self._get_connection() as connection:
+            if file_id:
+                rows = connection.execute("SELECT * FROM statement_import_rows WHERE file_id=?", (file_id,)).fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM statement_import_rows").fetchall()
+        return [dict(row) for row in rows]
+
+    def preview_statement_import(self, transactions, *, keep_matching=False):
+        return plan_statement_import(transactions, self.get_canonical_all(), self.get_import_rows(),
+                                     keep_matching=keep_matching)
+
+    def is_connected_account(self, account_name):
+        with self._get_connection() as connection:
+            if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='plaid_items'").fetchone():
+                return False
+            return bool(connection.execute("""SELECT 1 FROM plaid_items i WHERE
+                EXISTS(SELECT 1 FROM transactions t WHERE t.plaid_item_id=i.item_id AND fb_import_normalize(t.account_name)=fb_import_normalize(?))
+                OR EXISTS(SELECT 1 FROM plaid_accounts a WHERE a.item_id=i.item_id AND
+                    fb_import_normalize(coalesce(nullif(a.official_name,''),a.name) || CASE WHEN a.mask IS NULL OR a.mask='' THEN '' ELSE ' ••••'||a.mask END)=fb_import_normalize(?))
+                LIMIT 1""", (account_name, account_name)).fetchone())
+
+    def append_statement(self, transactions, *, keep_matching=False):
+        items = list(transactions)
+        with self._get_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # Read the planning snapshot and commit its exact inserted IDs under
+            # one writer lock, so concurrent imports cannot create extra copies.
+            existing = [Transaction(**dict(row)) for row in connection.execute("SELECT * FROM transactions")]
+            mappings = [dict(row) for row in connection.execute("SELECT * FROM statement_import_rows")]
+            plan = plan_statement_import(items, existing, mappings, keep_matching=keep_matching)
+            plan["inserted_rows"] = [item.model_copy(update={"statement_match_bank": not keep_matching})
+                                     for item in plan["inserted_rows"]]
+            for item in plan["inserted_rows"]:
+                connection.execute("""INSERT INTO transactions
+                    (id,date,description,amount,category,account_name,account_type,plaid_item_id,plaid_account_id,
+                     statement_file_id,statement_row,statement_reference,statement_match_bank) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (item.id,item.date.isoformat(),item.description,item.amount,item.category,item.account_name,
+                     item.account_type,item.plaid_item_id,item.plaid_account_id,item.statement_file_id,
+                     item.statement_row,item.statement_reference,item.statement_match_bank))
+            for identifier, reference in plan["references_added"]:
+                connection.execute("UPDATE transactions SET statement_reference=? WHERE id=?", (reference, identifier))
+            for identifier, file_id, row in plan["provenance_added"]:
+                connection.execute("UPDATE transactions SET statement_file_id=?,statement_row=?,statement_match_bank=1 WHERE id=?",
+                                   (file_id, row, identifier))
+            connection.executemany("INSERT OR REPLACE INTO statement_import_rows VALUES (?,?,?)", [
+                (row["file_id"],row["row_number"],row["transaction_id"]) for row in plan["mappings"]
+            ])
+            return plan
+
+    def undo_append(self, transactions):
+        items = list(transactions)
+        with self._get_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for item in items:
+                actual = connection.execute("SELECT * FROM transactions WHERE id=?", (item.id,)).fetchone()
+                split = connection.execute("SELECT 1 FROM transaction_allocations WHERE transaction_id=?", (item.id,)).fetchone()
+                if actual is None or split:
+                    raise ValueError("Imported transactions changed; cannot undo.")
+                saved = Transaction(**dict(actual))
+                if saved.model_dump(mode="json") != item.model_dump(mode="json"):
+                    raise ValueError("Imported transactions changed; cannot undo.")
+            connection.executemany("DELETE FROM transactions WHERE id=?", [(item.id,) for item in items])
+        return len(items)
 
     def upsert_many(self, transactions: Iterable[Transaction]) -> int:
         """Insert synced rows and refresh mutable fields without losing user categories."""
@@ -181,6 +268,7 @@ class TransactionRepository:
                 transaction.account_type,
                 transaction.plaid_item_id,
                 transaction.plaid_account_id,
+                transaction.statement_file_id, transaction.statement_row, transaction.statement_reference, transaction.statement_match_bank,
             )
             for transaction in transactions
         ]
@@ -191,8 +279,8 @@ class TransactionRepository:
             connection.executemany(
                 """
                 INSERT INTO transactions
-                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id, statement_file_id, statement_row, statement_reference, statement_match_bank)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     date = excluded.date,
                     description = excluded.description,
@@ -229,6 +317,8 @@ class TransactionRepository:
         payload = list(transactions)
         if any(item.account_name != account_name for item in payload):
             raise ValueError("Statement account does not match the selected account.")
+        if payload and any(not item.id.startswith("plaid:") for item in payload) and self.is_connected_account(account_name):
+            raise ValueError("Append statements for a connected bank, or disconnect it before replacing history.")
         with self._get_connection() as connection:
             self._invalidate_sync(connection, account_name)
             connection.execute(
@@ -239,8 +329,8 @@ class TransactionRepository:
             cursor = connection.executemany(
                 """
                 INSERT OR IGNORE INTO transactions
-                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id, statement_file_id, statement_row, statement_reference, statement_match_bank)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -253,6 +343,7 @@ class TransactionRepository:
                         transaction.account_type,
                         transaction.plaid_item_id,
                         transaction.plaid_account_id,
+                        transaction.statement_file_id, transaction.statement_row, transaction.statement_reference, transaction.statement_match_bank,
                     )
                     for transaction in payload
                 ],
@@ -429,6 +520,7 @@ class TransactionRepository:
             "category_rules": [
                 item.model_dump(mode="json") for item in self.get_category_rules()
             ],
+            "statement_import_rows": self.get_import_rows(),
         }
         return json.dumps(payload, indent=2)
 
@@ -440,6 +532,7 @@ class TransactionRepository:
         budgets = [Budget.model_validate(item) for item in data.get("budgets", [])]
         goals = [SavingsGoal.model_validate(item) for item in data.get("goals", [])]
         rules = [CategoryRule.model_validate(item) for item in data.get("category_rules", [])]
+        import_rows = [StatementImportRow.model_validate(item) for item in data.get("statement_import_rows", [])]
         with self._get_connection() as connection:
             transactions = self._prepare_transactions(connection, transactions)
             connection.execute("DELETE FROM transactions")
@@ -449,8 +542,8 @@ class TransactionRepository:
             connection.executemany(
                 """
                 INSERT INTO transactions
-                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id, statement_file_id, statement_row, statement_reference, statement_match_bank)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -463,6 +556,7 @@ class TransactionRepository:
                         item.account_type,
                         item.plaid_item_id,
                         item.plaid_account_id,
+                        item.statement_file_id, item.statement_row, item.statement_reference, item.statement_match_bank,
                     )
                     for item in transactions
                 ],
@@ -470,6 +564,9 @@ class TransactionRepository:
             connection.executemany("INSERT INTO transaction_allocations VALUES (?,?,?,?)", [
                 (str(allocation.id), item.id, allocation.amount, allocation.category)
                 for item in transactions for allocation in item.allocations
+            ])
+            connection.executemany("INSERT INTO statement_import_rows VALUES (?,?,?)", [
+                (row.file_id,row.row_number,row.transaction_id) for row in import_rows
             ])
             self._invalidate_sync(connection)
             connection.executemany(
@@ -516,6 +613,7 @@ class TransactionRepository:
                 transaction.account_type,
                 transaction.plaid_item_id,
                 transaction.plaid_account_id,
+                transaction.statement_file_id, transaction.statement_row, transaction.statement_reference, transaction.statement_match_bank,
             )
             for transaction in transactions
         ]
@@ -528,8 +626,8 @@ class TransactionRepository:
             cursor = connection.executemany(
                 """
                 INSERT OR IGNORE INTO transactions
-                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, date, description, amount, category, account_name, account_type, plaid_item_id, plaid_account_id, statement_file_id, statement_row, statement_reference, statement_match_bank)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 payload,
             )
@@ -562,7 +660,15 @@ class TransactionRepository:
                 raise ValueError("Bank cursor changed; retry sync.")
             if bool(state["needs_reconciliation"]) != reconcile:
                 raise ValueError("Bank reconciliation state changed; retry sync.")
+            reconciled = 0
             for item in items:
+                imported = None
+                if item.id not in removed_ids and not connection.execute("SELECT 1 FROM transactions WHERE id=?", (item.id,)).fetchone():
+                    imported = connection.execute("""SELECT * FROM transactions
+                        WHERE id NOT LIKE 'plaid:%' AND plaid_item_id IS NULL AND statement_match_bank=1 AND date=? AND amount=?
+                        AND fb_import_normalize(description)=? AND fb_import_normalize(account_name)=? AND fb_import_normalize(account_type)=?
+                        ORDER BY id LIMIT 1""", (item.date.isoformat(),item.amount,normalize_text(item.description),
+                                              normalize_text(item.account_name),normalize_text(item.account_type))).fetchone()
                 connection.execute("""INSERT INTO transactions
                     (id,date,description,amount,category,account_name,account_type,plaid_item_id,plaid_account_id)
                     VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
@@ -572,6 +678,17 @@ class TransactionRepository:
                     plaid_item_id=excluded.plaid_item_id,plaid_account_id=excluded.plaid_account_id""",
                     (item.id,item.date.isoformat(),item.description,item.amount,item.category,
                      item.account_name,item.account_type,item_id,item.plaid_account_id))
+                if imported:
+                    connection.execute("UPDATE transactions SET statement_file_id=NULL,statement_row=NULL,statement_reference=NULL WHERE id=?", (imported["id"],))
+                    connection.execute("""UPDATE transactions SET
+                        category=CASE WHEN ?='Uncategorized' THEN category ELSE ? END,
+                        statement_file_id=?,statement_row=?,statement_reference=?,statement_match_bank=1 WHERE id=?""",
+                        (imported["category"],imported["category"],imported["statement_file_id"],imported["statement_row"],
+                         imported["statement_reference"],item.id))
+                    connection.execute("UPDATE transaction_allocations SET transaction_id=? WHERE transaction_id=?", (item.id,imported["id"]))
+                    connection.execute("UPDATE statement_import_rows SET transaction_id=? WHERE transaction_id=?", (item.id,imported["id"]))
+                    connection.execute("DELETE FROM transactions WHERE id=?", (imported["id"],))
+                    reconciled += 1
             removed = 0
             for identifier in set(removed_ids):
                 removed += connection.execute("DELETE FROM transactions WHERE id=? AND plaid_item_id=?",
@@ -584,7 +701,7 @@ class TransactionRepository:
                         removed += connection.execute("DELETE FROM transactions WHERE id=?", (row["id"],)).rowcount
             connection.execute("""UPDATE plaid_items SET cursor=?,last_synced_at=?,status='connected',
                 error_message=NULL,needs_reconciliation=0 WHERE item_id=?""", (next_cursor,synced_at,item_id))
-            return {"upserted": len(items), "removed": removed}
+            return {"upserted": len(items), "removed": removed, "reconciled_imports": reconciled}
 
     @staticmethod
     def _prepare_transactions(connection, transactions):

@@ -7,11 +7,12 @@ from typing import Iterable, Optional
 from src.services.security import read_backup
 from src.services.supabase import SupabaseDataClient, SupabaseError
 
-from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction
+from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction, StatementImportRow
+from src.services.imports import plan_statement_import
 from src.domain.allocations import project_transactions, recover_legacy_splits
 from src.repositories.plaid_repo import PlaidItem, account_balances
 
-OPTIONAL_TRANSACTION_FIELDS = ("merchant_name", "subcategory", "payment_channel", "location", "pending", "plaid_item_id", "plaid_account_id")
+OPTIONAL_TRANSACTION_FIELDS = ("merchant_name", "subcategory", "payment_channel", "location", "pending", "plaid_item_id", "plaid_account_id", "statement_file_id", "statement_row", "statement_reference", "statement_match_bank")
 
 
 class SupabaseTransactionRepository:
@@ -48,7 +49,7 @@ class SupabaseTransactionRepository:
         present = {field for row in rows for field in OPTIONAL_TRANSACTION_FIELDS if field in row}
         for row in rows:
             for field in present:
-                row.setdefault(field, False if field == "pending" else None)
+                row.setdefault(field, False if field in ("pending", "statement_match_bank") else None)
         return rows
 
     @staticmethod
@@ -69,6 +70,10 @@ class SupabaseTransactionRepository:
             plaid_item_id=row.get("plaid_item_id"),
             plaid_account_id=row.get("plaid_account_id"),
             allocations=row.get("allocations") or [],
+            statement_file_id=row.get("statement_file_id"),
+            statement_row=row.get("statement_row"),
+            statement_reference=row.get("statement_reference"),
+            statement_match_bank=bool(row.get("statement_match_bank", False)),
         )
 
     def get_canonical_all(self) -> list[Transaction]:
@@ -85,11 +90,39 @@ class SupabaseTransactionRepository:
         return {item.id for item in self.get_canonical_all()}
 
     def insert_many(self, transactions: Iterable[Transaction]) -> int:
-        payload = self._transaction_rows(transactions)
+        items = list(transactions)
+        if items and all(item.statement_file_id for item in items):
+            return self.append_statement(items)["inserted"]
+        payload = self._transaction_rows(items)
         if not payload:
             return 0
         rows = self.client.insert("transactions", payload, ignore_duplicates=True)
         return len(rows)
+
+    def get_import_rows(self, file_id=None) -> list[dict]:
+        params = {"user_id": self._owner, "order": "file_id.asc,row_number.asc"}
+        if file_id:
+            params["file_id"] = f"eq.{file_id}"
+        return self.client.select("statement_import_rows", **params)
+
+    def preview_statement_import(self, transactions, *, keep_matching=False) -> dict:
+        items = list(transactions)
+        return plan_statement_import(items, self.get_canonical_all(),
+                                     self.get_import_rows(items[0].statement_file_id) if items else [],
+                                     keep_matching=keep_matching)
+
+    def is_connected_account(self, account_name: str) -> bool:
+        return bool(self.client.rpc("fb_statement_account_is_connected", {"p_account": account_name}))
+
+    def append_statement(self, transactions, *, keep_matching=False) -> dict:
+        items = list(transactions)
+        if not items:
+            return {"inserted": 0, "matched": 0, "inserted_rows": []}
+        result = self.client.rpc("fb_append_statement", {
+            "p_rows": [item.model_dump(mode="json") for item in items],
+            "p_keep_matching": keep_matching,
+        })
+        return {**result, "inserted_rows": [self._transaction(row) for row in result["inserted_rows"]]}
 
     def upsert_many(self, transactions: Iterable[Transaction]) -> int:
         items = list(transactions)
@@ -249,6 +282,7 @@ class SupabaseTransactionRepository:
                 "budgets": [item.model_dump(mode="json") for item in self.get_budgets()],
                 "goals": [item.model_dump(mode="json") for item in self.get_goals()],
                 "category_rules": [item.model_dump(mode="json") for item in self.get_category_rules()],
+                "statement_import_rows": [StatementImportRow.model_validate(row).model_dump() for row in self.get_import_rows()],
             },
             indent=2,
         )
@@ -261,12 +295,14 @@ class SupabaseTransactionRepository:
         budgets = [Budget.model_validate(item) for item in data.get("budgets", [])]
         goals = [SavingsGoal.model_validate(item) for item in data.get("goals", [])]
         rules = [CategoryRule.model_validate(item) for item in data.get("category_rules", [])]
+        import_rows = [StatementImportRow.model_validate(item) for item in data.get("statement_import_rows", [])]
         payload = {
             "version": 2,
             "transactions": [item.model_dump(mode="json") for item in transactions],
             "budgets": [item.model_dump(mode="json") for item in budgets],
             "goals": [item.model_dump(mode="json") for item in goals],
             "category_rules": [item.model_dump(mode="json") for item in rules],
+            "statement_import_rows": [item.model_dump() for item in import_rows],
         }
         return self.client.rpc("fb_restore_backup", {"p_backup": payload})
 

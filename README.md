@@ -148,7 +148,8 @@ node scripts/test_database.mjs /tmp/financebuddy-sql/node_modules/@electric-sql/
 ```
 
 This applies every migration, checks legacy split recovery, and executes rollback,
-sync, token, category-rule, allocation isolation, and restore reconciliation checks.
+sync, token, category-rule, allocation isolation, restore reconciliation, and
+statement-import checks.
 It supplies a minimal Auth schema; also verify the flow in a development Supabase
 project before production rollout.
 
@@ -174,7 +175,7 @@ New JSON backups use version 2 and contain canonical transactions, allocations, 
 provider item/account IDs. Version 1 backups still import, recovering complete split
 pairs. Settings, credentials, and bank connections remain excluded.
 
-Restore, full replacement, and connected-account replacement/removal reset affected
+Restore, full replacement, and connected-account removal reset affected
 bank cursors and require reconciliation. Use **Accounts → Bank connections → Sync
 transactions** after restore. The sync waits for Plaid's complete historical pull,
 fetches all available pages, then atomically updates bank rows, removes stale rows
@@ -189,6 +190,67 @@ An older backup with unmapped bank rows cannot be restored over active connectio
 when account matching is ambiguous: sync those connections first, or reconcile the
 legacy account identities in a development copy before retrying. Disconnected
 historical records with explicit provider IDs remain portable.
+
+## Statement identity and format choices
+
+Apply `202610130002_statement_import_identity.sql` after the split/reconciliation
+migration while the app is stopped, then deploy the matching code. This adds import
+row history and changes the append RPC. Existing transactions keep their IDs,
+categories, amounts, and allocations; the migration does not reinterpret old files.
+
+New statement IDs identify a file, account/format interpretation, and source row.
+Two identical legitimate purchases in one file therefore get different IDs.
+Retrying or renaming that same file does not add extra rows. Import history survives
+JSON backup/restore and records matches to existing bank or legacy transactions.
+
+Append consumes each matching saved occurrence once. For example, importing three
+identical purchases when two are already saved adds one. Matching requires the same
+date, amount, description, account name, and account type; surrounding ASCII spaces
+and ASCII letter case are ignored consistently in Python and SQL. A bank transaction
+reference takes precedence. Different references can represent genuinely different
+purchases; conflicting details for an existing reference stop the append.
+
+The preview marks rows as **New purchase**, **Already saved**, or **Matched bank
+transaction**. When identical rows in another file are genuinely separate purchases,
+select **Keep matching rows as separate purchases**. File/row and bank-reference
+identities still prevent retries from creating duplicates. If Reference contains
+shared labels such as ACH rather than transaction IDs, turn off **Use bank
+transaction references** before reviewing the import.
+
+Exact matching also works when statements are imported before a bank is connected:
+sync transfers categories, allocations, and import aliases to the provider record,
+so spending stays counted once. Rows explicitly kept separate are excluded from
+this reconciliation. Non-exact merchant/date/account matches need review; matching
+does not guess that two different descriptions or account labels are one purchase.
+Use Append for connected accounts. Replacing their history with a statement is
+blocked until the bank is disconnected, to prevent a later sync recreating it beside
+the statement rows.
+
+For **Debit/Credit columns**, direction comes from the columns, even when an Amount
+column is also present. Descriptions such as PAYMENT, REFUND, and CREDIT never change
+the sign. Rows with both nonzero Debit and Credit reject the file for review.
+For a **single Amount column**, checking defaults to money out being negative;
+credit cards require an explicit choice between money out being negative or positive.
+For example, a card export with positive purchases and negative payments uses
+**Money out is positive**. The same controls apply to comparison files and PDFs.
+
+Select month/day or day/month dates and `1,234.56` or `1.234,56` numbers. ISO dates
+remain supported. A year can be supplied for yearless dates. PDFs infer a year only
+from clear statement header information, not transaction amounts; a dated statement
+period can resolve December/January rollover. Ambiguous yearless dates require a
+year choice or a source with complete dates. Malformed grouping/decimal separators are rejected instead of
+being stripped into different amounts. The optional statement-total check compares
+parsed money in minus money out with the declared movement total, not the closing
+balance. A mismatch prevents import. Correct older ambiguous imports by reviewing
+their source and deliberately replacing an unconnected account after backup;
+their stored signs/dates are not silently changed.
+
+Append commits occurrence matching, inserted rows, and import history in one
+transaction and returns the exact newly inserted rows for undo. Undo refuses changed
+rows or splits. A later bank reconciliation changes their source identity, so an
+older undo snapshot is also refused. PDF processing starts a fresh interpreter,
+retains the existing timeout and Linux resource limits, and passes format options
+through stdin without importing the Streamlit UI.
 
 ## Production deployment
 
@@ -245,8 +307,8 @@ for a pilot but do not provide always-on availability or managed backup recovery
 
 The importer accepts CSV and text-based PDF statements. It detects common delimiters and encodings, extracts PDF tables or date-description-amount text rows, maps common bank header names, supports signed `Amount` or `Debit`/`Credit` columns, and refuses to commit an import when fewer than 80% of data rows are valid. Image-only/scanned PDFs are not supported yet because they require OCR.
 
-Choose `Checking` or `Credit Card` before importing. Credit-card purchases are normalized as outflows, while payments, refunds, and credits are normalized as inflows. The import preview reports its detected period, parsed and skipped rows, and exact duplicates. Appending is the default and ignores duplicates. The current-session undo removes only appended rows that have not changed since import. Replacement clears only the named account and is not undoable; download a backup first.
+Choose `Checking` or `Credit Card` and the file's sign/format conventions before importing. Explicit Debit/Credit columns determine direction; descriptions do not. The preview reports the period, parsed/skipped rows, and save action for each displayed row. Append matches saved occurrences while preserving legitimate repeated purchases. Undo removes only newly inserted unchanged rows. Replacement is limited to an unconnected named account and is not undoable; download a backup first.
 
 The dashboard includes expanded categories, accessible cash-flow and category charts, a category share table, and an optional monthly category heatmap. Comparison statements are sorted automatically by their detected transaction dates.
 
-Transaction identifiers are deterministic hashes of date, amount, and description, so re-importing the same statement does not create duplicates.
+Transaction IDs for new statement rows come from file/row identity. Content matching is separate from identity, so re-imports stay idempotent without collapsing repeated purchases.

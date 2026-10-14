@@ -259,6 +259,7 @@ class PlaidService:
             "modified": len(modified),
             "removed": removed_count,
             "balances_updated": self.refresh_balances(item_id, access_token),
+            "reconciled_imports": result.get("reconciled_imports", 0),
         }
 
     def refresh_balances(self, item_id: str, access_token: str) -> bool:

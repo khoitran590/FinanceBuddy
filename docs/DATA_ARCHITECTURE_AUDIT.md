@@ -2,10 +2,11 @@
 
 Reviewed October 13, 2026.
 
-Implementation follow-up: findings 1 and 2 are addressed in the working tree by
-`202610130001_source_splits_and_reconciliation.sql` and the matching app changes.
-See the README section “Source transactions, splits, and restore” for rollout and
-legacy-data handling. The findings below record the architecture at audit time.
+Implementation follow-up: findings 1–4 are addressed by the two
+`20261013` migrations and the matching app changes. See the README sections
+“Source transactions, splits, and restore” and “Statement identity and format
+choices” for rollout, matching policy, and legacy-data handling. The findings below
+record the architecture at audit time.
 
 ## Assessment
 

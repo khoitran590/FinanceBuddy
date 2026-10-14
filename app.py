@@ -372,19 +372,59 @@ def apply_custom_rules(transactions):
     return transactions
 
 
-def parse_statement(upload, account_name: str, account_type: str):
+def parse_statement(upload, account_name: str, account_type: str, **options):
     raw = upload.getvalue()
     cache_key = (hashlib.sha256(raw).hexdigest(), upload.name.lower().endswith(".pdf"),
-                 account_name, account_type)
+                 account_name, account_type, tuple(sorted(options.items())))
     cache = st.session_state.setdefault("statement_parse_cache", {})
     if cache_key not in cache:
         if len(cache) >= 6:
             cache.clear()
         cache[cache_key] = BankStatementParser.parse_file(
-            raw, upload.name, account_name, account_type
+            raw, upload.name, account_name, account_type, **options
         )
     parsed, metrics = cache[cache_key]
     return apply_custom_rules([item.model_copy(deep=True) for item in parsed]), metrics
+
+
+def statement_format_options(account_type: str, key: str) -> dict:
+    convention = st.selectbox(
+        "Amount column sign convention", [None, "outflow_negative", "outflow_positive"],
+        index=0 if account_type == "Credit Card" else 1,
+        format_func=lambda value: {None: "Choose for a single Amount column",
+                                  "outflow_negative": "Money out is negative",
+                                  "outflow_positive": "Money out is positive"}[value],
+        key=f"{key}_sign_{account_type}",
+        help="Debit/Credit columns always determine direction. For a single Amount column, use the sign convention shown in your bank's file.",
+    )
+    with st.expander("Statement date, number format, and total"):
+        date_order = st.selectbox(
+            "Date format", ["month_first", "day_first"],
+            format_func=lambda value: "Month/day/year" if value == "month_first" else "Day/month/year",
+            key=f"{key}_date_order", help="ISO dates such as 2026-10-13 work with either choice.",
+        )
+        number_format = st.selectbox(
+            "Number format", ["decimal_dot", "decimal_comma"],
+            format_func=lambda value: "1,234.56" if value == "decimal_dot" else "1.234,56",
+            key=f"{key}_number_format",
+        )
+        use_references = st.checkbox(
+            "Use bank transaction references", value=True, key=f"{key}_use_references",
+            help="Turn this off if the Reference column contains shared labels rather than unique bank transaction IDs.",
+        )
+        override_year = st.checkbox("Choose a year for dates without a year", key=f"{key}_override_year")
+        statement_year = int(st.number_input(
+            "Statement year", min_value=1, max_value=9999, value=date.today().year, step=1,
+            key=f"{key}_statement_year",
+        )) if override_year else None
+        check_total = st.checkbox("Check against a statement total", key=f"{key}_check_total")
+        total = st.number_input(
+            "Expected money in minus money out", step=0.01, value=0.0,
+            key=f"{key}_expected_total", help="Use the net transaction movement, not the ending account balance.",
+        ) if check_total else None
+    return dict(sign_convention=convention, date_order=date_order,
+                number_format=number_format, expected_total=total, use_references=use_references,
+                statement_year=statement_year)
 
 
 def sync_import_account_name() -> None:
@@ -1782,7 +1822,8 @@ def render_compare():
             value=upload.name.rsplit(".", 1)[0],
             key=f"compare_account_{index}_{upload.name}",
         )
-        parsed, metrics = parse_statement(upload, account_name, account_type)
+        options = statement_format_options(account_type, f"compare_{index}_{upload.name}")
+        parsed, metrics = parse_statement(upload, account_name, account_type, **options)
         if not metrics.is_valid:
             errors.append(f"{upload.name}: {' '.join(metrics.errors[:2])}")
             continue
@@ -1905,6 +1946,8 @@ def render_bank_connections() -> None:
                         )
                         if result.get("reconciliation_pending"):
                             st.session_state.plaid_notice = "Plaid is still preparing the full history. Your restored data is kept; sync again when it is ready."
+                        elif result.get("reconciled_imports"):
+                            st.session_state.plaid_notice += f" Matched {result['reconciled_imports']} previously imported transaction(s)."
                         st.rerun()
                     except Exception as error:
                         st.error(f"Plaid sync failed: {service._friendly_error(error)}")
@@ -2009,6 +2052,8 @@ def render_import_statement() -> None:
     if receipt:
         st.success(f"Saved {receipt['count']} transaction(s) to {receipt['account']}.")
         st.button("Review categories", on_click=navigate_to, args=("Transactions",))
+    if st.session_state.get("import_undo_notice"):
+        st.success(st.session_state.import_undo_notice)
     if "import_account_type" not in st.session_state:
         st.session_state.import_account_type = "Checking"
     if "import_account_name" not in st.session_state:
@@ -2030,7 +2075,8 @@ def render_import_statement() -> None:
         help="CSV and TXT files are read as tables. PDFs must contain selectable text; scanned images require OCR and are not supported yet.",
     )
     if upload:
-        parsed, metrics = parse_statement(upload, account_name.strip(), account_type)
+        options = statement_format_options(account_type, "statement_import")
+        parsed, metrics = parse_statement(upload, account_name.strip(), account_type, **options)
         if not metrics.is_valid:
             st.error("This statement could not be imported safely.")
             for error in metrics.errors:
@@ -2038,7 +2084,19 @@ def render_import_statement() -> None:
             st.info("Check the account type and file format, then choose a corrected file. Nothing was saved.")
         else:
             st.markdown("#### 3. Review the preview")
-            duplicates = repo.count_existing_ids(parsed)
+            keep_matching = st.checkbox(
+                "Keep matching rows as separate purchases", key="import_keep_matching",
+                help="Use for genuinely new identical purchases from another file. Saved rows from this exact file or with the same bank reference are still skipped.",
+            )
+            conflict = None
+            import_plan = None
+            try:
+                import_plan = repo.preview_statement_import(parsed, keep_matching=keep_matching)
+                duplicates = import_plan["matched"]
+            except ValueError as error:
+                conflict = str(error)
+                duplicates = 0
+                st.error(conflict)
             start = min(item.date for item in parsed)
             end = max(item.date for item in parsed)
             st.success(
@@ -2048,8 +2106,16 @@ def render_import_statement() -> None:
                 f"Detected period: {start.strftime('%b %-d, %Y')}–{end.strftime('%b %-d, %Y')} · "
                 f"{duplicates} already saved · {metrics.skipped_rows} skipped"
             )
+            preview_frame = transaction_frame(parsed[:20])
+            new_ids = {item.id for item in import_plan["inserted_rows"]} if import_plan else set()
+            destinations = {row["row_number"]: row["transaction_id"] for row in import_plan["mappings"]} if import_plan else {}
+            preview_frame["Save action"] = [
+                "Review reference" if conflict else "New purchase" if item.id in new_ids
+                else "Matched bank transaction" if destinations.get(item.statement_row, "").startswith("plaid:")
+                else "Already saved" for item in parsed[:20]
+            ]
             st.dataframe(
-                transaction_frame(parsed[:20]),
+                preview_frame,
                 width="stretch",
                 hide_index=True,
                 column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")},
@@ -2062,7 +2128,7 @@ def render_import_statement() -> None:
                         st.write(f"• {error}")
                     if metrics.skipped_rows > len(metrics.errors):
                         st.caption("Only the first few row issues are shown. Export a cleaner CSV if important rows are missing.")
-            st.caption("Append new transactions keeps your saved history and skips rows with matching transaction IDs.")
+            st.caption("Repeated purchases within this statement stay separate. Append matches overlapping statements by occurrence count, including exact matches from connected banks. Review matches or keep them as separate purchases when they are genuinely new.")
             st.markdown("#### 4. Choose how to save")
             mode = st.radio(
                 "How should these transactions be saved?",
@@ -2073,6 +2139,9 @@ def render_import_statement() -> None:
                 "I reviewed the account, statement type, period, and preview"
             )
             if mode == "Replace this account":
+                if repo.is_connected_account(account_name.strip()):
+                    st.info("This account is connected to a bank. Use Append to reconcile a statement with its saved transactions, or disconnect the bank before replacing its history.")
+                    return
                 existing_count = sum(item.account_name == account_name.strip() for item in repo.get_all())
                 st.warning(f"This replaces {existing_count} saved transaction(s) for “{account_name}” with {len(parsed)} parsed row(s). Replacement cannot be undone. If this account is connected to a bank, its next sync will reconcile the full available bank history.")
                 st.download_button(
@@ -2084,38 +2153,41 @@ def render_import_statement() -> None:
             if st.button(
                 "Save statement",
                 type="primary",
-                disabled=not confirmation or not account_name.strip(),
+                disabled=not confirmation or not account_name.strip() or (conflict is not None and mode == "Append new transactions"),
                 help="Append only new transactions, or replace history for the named account when that mode is selected.",
             ):
                 try:
-                    st.session_state.pop("undo_import_rows", None)
+                    st.session_state.import_save_pending = True
                     if mode == "Append new transactions":
-                        before_ids = repo.get_existing_ids()
-                        inserted = repo.insert_many(parsed)
-                        new_ids = {item.id for item in parsed} - before_ids
-                        if new_ids:
-                            st.session_state.undo_import_rows = list({
-                                item.id: item for item in parsed if item.id in new_ids
-                            }.values())
+                        result = repo.append_statement(parsed, keep_matching=keep_matching)
+                        inserted = result["inserted"]
+                        st.session_state.pop("undo_import_rows", None)
+                        if result["inserted_rows"]:
+                            st.session_state.undo_import_rows = result["inserted_rows"]
                     else:
                         inserted = repo.replace_account(account_name.strip(), parsed)
+                        st.session_state.pop("undo_import_rows", None)
+                    st.session_state.import_save_pending = False
+                    st.session_state.pop("import_undo_notice", None)
                     st.session_state.import_receipt = {
                         "count": inserted, "account": account_name.strip(), "mode": mode,
                     }
                     st.rerun()
-                except SupabaseError:
-                    st.error("The statement could not be saved. Your existing history is unchanged; please retry.")
+                except (ValueError, SupabaseError):
+                    st.error("The statement save could not be confirmed. Review the preview and retry; the same file will not create extra copies.")
     if st.session_state.get("undo_import_rows"):
         if st.button(
             "Undo last import",
+            disabled=bool(st.session_state.get("import_save_pending")),
             help="Remove only the new rows from the latest appended statement, if none have changed since import.",
         ):
             try:
                 removed = repo.undo_append(st.session_state.undo_import_rows)
                 st.session_state.pop("undo_import_rows", None)
-                st.success(f"Removed {removed} imported transaction(s).")
+                st.session_state.pop("import_receipt", None)
+                st.session_state.import_undo_notice = f"Removed {removed} imported transaction(s)."
                 st.rerun()
-            except SupabaseError:
+            except (ValueError, SupabaseError):
                 st.error("Some imported transactions changed. Nothing was removed; review your history before retrying.")
 
 

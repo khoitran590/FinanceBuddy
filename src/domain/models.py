@@ -22,6 +22,12 @@ class TransactionAllocation(BaseModel):
         return value
 
 
+class StatementImportRow(BaseModel):
+    file_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    row_number: int = Field(ge=1, le=50_000)
+    transaction_id: str = Field(min_length=1, max_length=256)
+
+
 class Transaction(BaseModel):
     """A normalized transaction record shared by storage, analytics, and UI.
 
@@ -48,6 +54,10 @@ class Transaction(BaseModel):
     plaid_item_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
     plaid_account_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
     allocations: List[TransactionAllocation] = Field(default_factory=list, max_length=100)
+    statement_file_id: Optional[str] = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    statement_row: Optional[int] = Field(default=None, ge=1, le=50_000)
+    statement_reference: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    statement_match_bank: bool = False
     # Read projection only. Never written into a backup or source record.
     source_transaction_id: Optional[str] = Field(default=None, exclude=True)
     source_amount: Optional[float] = Field(default=None, exclude=True)

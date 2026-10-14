@@ -31,7 +31,10 @@ def read_backup(raw: bytes) -> dict:
         raise ValueError("Backup must be valid UTF-8 JSON.") from error
     if not isinstance(data, dict) or data.get("version") not in (1, 2):
         raise ValueError("Unsupported FinanceBuddy backup version.")
-    for key in ("transactions", "budgets", "goals", "category_rules"):
+    keys = ["transactions", "budgets", "goals", "category_rules"]
+    if "statement_import_rows" in data:
+        keys.append("statement_import_rows")
+    for key in keys:
         rows = data.get(key)
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
             raise ValueError(f"Backup must contain a {key} list of records.")
