@@ -15,11 +15,12 @@ def normalize_text(value: str) -> str:
 
 def match_key(item: Transaction) -> tuple:
     return (item.date, Decimal(str(item.amount)), normalize_text(item.description),
-            normalize_text(item.account_name), normalize_text(item.account_type))
+            str(item.account_id) if item.account_id else normalize_text(item.account_name),
+            normalize_text(item.account_type), item.currency)
 
 
 def reference_key(item: Transaction) -> tuple:
-    return (normalize_text(item.account_name), normalize_text(item.account_type), item.statement_reference)
+    return (str(item.account_id) if item.account_id else normalize_text(item.account_name), normalize_text(item.account_type), item.statement_reference)
 
 
 def plan_statement_import(incoming, existing, mappings=(), *, keep_matching=False) -> dict:
@@ -51,6 +52,8 @@ def plan_statement_import(incoming, existing, mappings=(), *, keep_matching=Fals
         if not item.statement_file_id or not item.statement_row or item.source_transaction_id:
             raise ValueError('A statement row must have file and row identity.')
         selected = by_id.get(receipts.get((item.statement_file_id, item.statement_row), item.id))
+        if selected is not None and item.account_id and selected.account_id and item.account_id != selected.account_id:
+            raise ValueError("Statement belongs to a different account.")
         if selected is None and item.statement_reference:
             selected = references.get(reference_key(item))
             if selected is not None and match_key(selected) != match_key(item):

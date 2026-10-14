@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import os
 import time
+import json
+import re
+from decimal import Decimal
+from uuid import uuid4
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -9,7 +13,12 @@ import httpx
 
 
 class SupabaseError(RuntimeError):
-    pass
+    def __init__(self, message, *, code=None, correlation_id=None, uncertain=False):
+        super().__init__(message)
+        self.code = code
+        self.correlation_id = correlation_id
+        self.uncertain = uncertain
+        self.operation_id = None
 
 
 @dataclass(frozen=True)
@@ -46,7 +55,10 @@ class SupabaseConfig:
 class SupabaseAuth:
     def __init__(self, config: SupabaseConfig, transport: httpx.BaseTransport | None = None):
         self.config = config
-        self.client = httpx.Client(timeout=20, transport=transport)
+        self.transport = transport
+
+    def close(self):
+        pass  # Requests own and close their HTTP clients.
 
     def _request(
         self,
@@ -61,13 +73,11 @@ class SupabaseAuth:
         if access_token:
             headers["Authorization"] = f"Bearer {access_token}"
         try:
-            response = self.client.request(
-                method,
-                f"{self.config.url}/auth/v1/{path}",
-                headers=headers,
-                params=params,
-                json=json,
-            )
+            with httpx.Client(timeout=20, transport=self.transport) as client:
+                response = client.request(
+                    method, f"{self.config.url}/auth/v1/{path}",
+                    headers=headers, params=params, json=json,
+                )
         except httpx.RequestError as error:
             raise SupabaseError("Supabase authentication is temporarily unavailable.") from error
         if response.is_error:
@@ -174,12 +184,15 @@ class SupabaseDataClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.base_url = f"{config.url}/rest/v1"
-        self.client = httpx.Client(timeout=30, transport=transport)
+        self.transport = transport
         self.headers = {
             "apikey": config.publishable_key,
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
+
+    def close(self):
+        pass  # Requests own and close their HTTP clients.
 
     def request(
         self,
@@ -191,28 +204,45 @@ class SupabaseDataClient:
         prefer: Optional[str] = None,
         range_start: Optional[int] = None,
         range_end: Optional[int] = None,
+        scalar: bool = False,
     ) -> list[dict]:
         headers = dict(self.headers)
+        correlation_id = str(uuid4())
+        headers["X-Request-ID"] = correlation_id
         if prefer:
             headers["Prefer"] = prefer
         if range_start is not None and range_end is not None:
             headers["Range-Unit"] = "items"
             headers["Range"] = f"{range_start}-{range_end}"
         try:
-            response = self.client.request(
-                method,
-                f"{self.base_url}/{table}",
-                headers=headers,
-                params=params,
-                json=payload,
-            )
+            with httpx.Client(timeout=30, transport=self.transport) as client:
+                response = client.request(
+                    method, f"{self.base_url}/{table}",
+                    headers=headers, params=params, json=payload,
+                )
         except httpx.RequestError as error:
-            raise SupabaseError("Supabase data storage is temporarily unavailable.") from error
+            raise SupabaseError("The database response could not be confirmed. Retry to recover the saved result.",
+                                correlation_id=correlation_id, uncertain=method not in ("GET", "HEAD")) from error
         if response.is_error:
-            raise SupabaseError("Unable to complete the database request. Please try again.")
+            try:
+                code = response.json().get("code", "")
+            except (ValueError, AttributeError):
+                code = ""
+            code = code if re.fullmatch(r"[A-Z0-9_]{1,64}", str(code)) else None
+            message = {
+                "23505": "This record already exists. Refresh and review the saved data.",
+                "23503": "A related record changed. Refresh and try again.",
+                "23514": "The data does not satisfy the storage rules. Review the values.",
+                "42501": "This request is not allowed for your account.",
+                "P0001": "The operation could not be completed. Refresh and review the current data.",
+            }.get(code, "Unable to complete the database request. Please try again.")
+            raise SupabaseError(message, code=code, correlation_id=correlation_id,
+                                uncertain=response.status_code >= 500 and method not in ("GET", "HEAD"))
         if not response.content:
-            return []
-        data = response.json()
+            return None if scalar else []
+        data = json.loads(response.content, parse_float=Decimal)
+        if scalar:
+            return data
         return data if isinstance(data, list) else [data]
 
     def select(self, table: str, **params: str) -> list[dict]:
@@ -257,5 +287,4 @@ class SupabaseDataClient:
         """Call a database function once so all of its writes share a transaction."""
         if not name.startswith("fb_") or not name.replace("_", "").isalnum():
             raise ValueError("Invalid database operation.")
-        result = self.request("POST", f"rpc/{name}", payload=payload)
-        return result[0] if result else None
+        return self.request("POST", f"rpc/{name}", payload=payload, scalar=True)

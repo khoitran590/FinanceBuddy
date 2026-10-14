@@ -1,3 +1,4 @@
+from decimal import Decimal
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
@@ -152,7 +153,8 @@ def test_cloud_append_uses_one_atomic_rpc_and_returns_authoritative_undo_rows():
     client.rpc.return_value = {"inserted": 1, "matched": 1, "inserted_rows": [rows[1].model_dump(mode="json")]}
     result = SupabaseTransactionRepository(client, "owner").append_statement(rows)
     client.rpc.assert_called_once()
-    assert client.rpc.call_args.args[0] == "fb_append_statement"
+    assert client.rpc.call_args.args[0] == "fb_execute_operation"
+    assert client.rpc.call_args.args[1]["p_kind"] == "append"
     assert result["inserted_rows"] == [rows[1]]
     assert not client.select.called
 
@@ -186,7 +188,7 @@ def test_both_direction_columns_nonzero_reject_the_entire_file():
 def test_locale_profiles_and_wrong_number_format_rejection():
     raw = b"Date;Description;Amount\n01/02/2026;Shop;-1.234,56\n"
     rows = parse(raw.decode(), date_order="day_first", number_format="decimal_comma")
-    assert rows[0].date == date(2026, 2, 1) and rows[0].amount == -1234.56
+    assert rows[0].date == date(2026, 2, 1) and rows[0].amount == Decimal("-1234.56")
     rows, metrics = BankStatementParser.parse(raw, "Checking")
     assert not rows and not metrics.is_valid
     date_raw = b"Date,Description,Amount\n01/02/2026,Coffee,-4.50\n"
@@ -233,7 +235,7 @@ def test_pdf_worker_propagates_direction_date_and_number_profile():
     rows, metrics = BankStatementParser.parse_file(output.getvalue(), "statement.pdf", "Card", "Credit Card",
         sign_convention="outflow_positive", date_order="day_first", number_format="decimal_comma", expected_total=-1234.56)
     assert metrics.is_valid, metrics.errors
-    assert rows[0].amount == -1234.56 and rows[0].date == date(2026, 2, 1)
+    assert rows[0].amount == Decimal("-1234.56") and rows[0].date == date(2026, 2, 1)
 
 
 def test_pdf_worker_does_not_import_streamlit_main_module(monkeypatch):

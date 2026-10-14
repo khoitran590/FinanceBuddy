@@ -9,10 +9,10 @@ def allocations_match(transaction: Transaction) -> bool:
     return bool(allocations) and all(
         item.amount != 0 and (item.amount > 0) == (transaction.amount > 0)
         for item in allocations
-    ) and abs(
+    ) and (
         sum((Decimal(str(item.amount)) for item in allocations), Decimal(0))
         - Decimal(str(transaction.amount))
-    ) <= Decimal('0.005')
+    ) == 0
 
 
 def project_transactions(transactions: list[Transaction]) -> list[Transaction]:

@@ -1,3 +1,5 @@
+from decimal import Decimal
+from src.domain.money import money, require_usd
 import calendar
 import re
 from collections import Counter, defaultdict
@@ -133,7 +135,7 @@ class AnalyticsService:
         inflow = sum(transaction.amount for transaction in transactions if transaction.amount > 0)
         outflow = sum(abs(transaction.amount) for transaction in transactions if transaction.amount < 0)
         net_savings = inflow - outflow
-        savings_rate = (net_savings / inflow * 100.0) if inflow > 0 else 0.0
+        savings_rate = (net_savings / inflow * 100) if inflow > 0 else Decimal(0)
 
         return {
             "inflow": inflow,
@@ -296,7 +298,7 @@ class AnalyticsService:
         categories: List[str],
         transaction_types: List[str],
         search: str = "",
-        minimum_amount: float = 0.0,
+        minimum_amount: float = Decimal(0),
     ) -> List[Transaction]:
         search_lower = search.strip().lower()
         results = []
@@ -322,10 +324,10 @@ class AnalyticsService:
     @staticmethod
     def cumulative_cash_flow(transactions: List[Transaction]) -> List[Dict[str, Any]]:
         """Return daily cumulative net flow relative to the selected period's start."""
-        daily: Dict[date, float] = defaultdict(float)
+        daily: Dict[date, float] = defaultdict(Decimal)
         for transaction in transactions:
             daily[transaction.date] += transaction.amount
-        cumulative = 0.0
+        cumulative = Decimal(0)
         points = []
         for transaction_date, amount in sorted(daily.items()):
             cumulative += amount
@@ -340,7 +342,7 @@ class AnalyticsService:
 
     @staticmethod
     def monthly_breakdown(transactions: List[Transaction]) -> List[Dict[str, Any]]:
-        months = defaultdict(lambda: {"inflow": 0.0, "outflow": 0.0})
+        months = defaultdict(lambda: {"inflow": Decimal(0), "outflow": Decimal(0)})
         for transaction in transactions:
             month = transaction.date.strftime("%Y-%m")
             if transaction.amount > 0:
@@ -361,7 +363,7 @@ class AnalyticsService:
                 **item,
                 "net": item["inflow"] - item["outflow"],
                 "savings_rate": (
-                    (item["inflow"] - item["outflow"]) / item["inflow"] * 100.0
+                    (item["inflow"] - item["outflow"]) / item["inflow"] * 100
                     if item["inflow"] > 0
                     else None
                 ),
@@ -391,7 +393,7 @@ class AnalyticsService:
 
     @staticmethod
     def category_expenses(transactions: List[Transaction]) -> Dict[str, float]:
-        breakdown = defaultdict(float)
+        breakdown = defaultdict(Decimal)
         for transaction in transactions:
             if transaction.amount < 0:
                 breakdown[transaction.category] += abs(transaction.amount)
@@ -401,7 +403,7 @@ class AnalyticsService:
     def category_summary(transactions: List[Transaction]) -> List[Dict[str, Any]]:
         """Return category totals with share, count, and average spend."""
         grouped: Dict[str, Dict[str, float]] = defaultdict(
-            lambda: {"amount": 0.0, "transactions": 0}
+            lambda: {"amount": Decimal(0), "transactions": 0}
         )
         for transaction in transactions:
             if transaction.amount < 0:
@@ -414,11 +416,11 @@ class AnalyticsService:
                 "category": category,
                 "amount": values["amount"],
                 "transactions": int(values["transactions"]),
-                "share": (values["amount"] / total * 100.0) if total else 0.0,
+                "share": (values["amount"] / total * 100) if total else Decimal(0),
                 "average": (
                     values["amount"] / values["transactions"]
                     if values["transactions"]
-                    else 0.0
+                    else Decimal(0)
                 ),
             }
             for category, values in sorted(
@@ -428,7 +430,7 @@ class AnalyticsService:
 
     @staticmethod
     def monthly_category_expenses(transactions: List[Transaction]) -> List[Dict[str, Any]]:
-        grouped = defaultdict(float)
+        grouped = defaultdict(Decimal)
         for transaction in transactions:
             if transaction.amount < 0:
                 grouped[(transaction.date.strftime("%Y-%m"), transaction.category)] += abs(
@@ -442,7 +444,7 @@ class AnalyticsService:
     @staticmethod
     def subcategory_summary(transactions: List[Transaction]) -> List[Dict[str, Any]]:
         """Spending by the bank's detailed category, when a bank connection supplies one."""
-        grouped: Dict[str, Dict[str, float]] = defaultdict(lambda: {"amount": 0.0, "transactions": 0})
+        grouped: Dict[str, Dict[str, float]] = defaultdict(lambda: {"amount": Decimal(0), "transactions": 0})
         for item in transactions:
             if item.amount < 0 and item.subcategory:
                 grouped[item.subcategory]["amount"] += abs(item.amount)
@@ -455,7 +457,7 @@ class AnalyticsService:
     @staticmethod
     def fixed_vs_flexible(transactions: List[Transaction]) -> Dict[str, Any]:
         """Split spending into fixed obligations and flexible, day-to-day spending."""
-        months: Dict[str, Dict[str, float]] = defaultdict(lambda: {"fixed": 0.0, "flexible": 0.0})
+        months: Dict[str, Dict[str, float]] = defaultdict(lambda: {"fixed": Decimal(0), "flexible": Decimal(0)})
         for item in transactions:
             if item.amount >= 0:
                 continue
@@ -467,7 +469,7 @@ class AnalyticsService:
         return {
             "fixed": fixed,
             "flexible": flexible,
-            "fixed_share": fixed / total * 100.0 if total else 0.0,
+            "fixed_share": fixed / total * 100 if total else Decimal(0),
             "months": [{"month": month, **values} for month, values in sorted(months.items())],
         }
 
@@ -525,9 +527,9 @@ class AnalyticsService:
             [
                 {
                     "category": category,
-                    "change": current.get(category, 0.0) - previous.get(category, 0.0),
-                    "current": current.get(category, 0.0),
-                    "previous": previous.get(category, 0.0),
+                    "change": current.get(category, Decimal(0)) - previous.get(category, Decimal(0)),
+                    "current": current.get(category, Decimal(0)),
+                    "previous": previous.get(category, Decimal(0)),
                     "current_month": labels[0],
                     "previous_month": labels[1],
                 }
@@ -542,14 +544,14 @@ class AnalyticsService:
     @staticmethod
     def merchant_summary(transactions: List[Transaction], limit: int = 10) -> List[Dict[str, Any]]:
         grouped: Dict[str, Dict[str, Any]] = {}
-        total = 0.0
+        total = Decimal(0)
         for item in transactions:
             if item.amount >= 0:
                 continue
             name = merchant_name(item)
             entry = grouped.setdefault(
                 name.lower(),
-                {"merchant": name, "amount": 0.0, "visits": 0, "categories": Counter(), "last_date": item.date},
+                {"merchant": name, "amount": Decimal(0), "visits": 0, "categories": Counter(), "last_date": item.date},
             )
             entry["amount"] += abs(item.amount)
             entry["visits"] += 1
@@ -563,7 +565,7 @@ class AnalyticsService:
                 "amount": entry["amount"],
                 "visits": entry["visits"],
                 "average": entry["amount"] / entry["visits"],
-                "share": entry["amount"] / total * 100.0 if total else 0.0,
+                "share": entry["amount"] / total * 100 if total else Decimal(0),
                 "category": entry["categories"].most_common(1)[0][0],
                 "last_date": entry["last_date"],
             }
@@ -572,7 +574,7 @@ class AnalyticsService:
 
     @staticmethod
     def payment_channel_summary(transactions: List[Transaction]) -> List[Dict[str, Any]]:
-        grouped: Dict[str, Dict[str, float]] = defaultdict(lambda: {"amount": 0.0, "transactions": 0})
+        grouped: Dict[str, Dict[str, float]] = defaultdict(lambda: {"amount": Decimal(0), "transactions": 0})
         for item in transactions:
             if item.amount < 0 and item.payment_channel:
                 label = PAYMENT_CHANNEL_LABELS.get(item.payment_channel.lower(), item.payment_channel.title())
@@ -584,14 +586,14 @@ class AnalyticsService:
                 "channel": label,
                 "amount": values["amount"],
                 "transactions": int(values["transactions"]),
-                "share": values["amount"] / total * 100.0 if total else 0.0,
+                "share": values["amount"] / total * 100 if total else Decimal(0),
             }
             for label, values in sorted(grouped.items(), key=lambda item: item[1]["amount"], reverse=True)
         ]
 
     @staticmethod
     def location_summary(transactions: List[Transaction], limit: int = 8) -> List[Dict[str, Any]]:
-        grouped: Dict[str, Dict[str, float]] = defaultdict(lambda: {"amount": 0.0, "transactions": 0})
+        grouped: Dict[str, Dict[str, float]] = defaultdict(lambda: {"amount": Decimal(0), "transactions": 0})
         for item in transactions:
             if item.amount < 0 and item.location:
                 grouped[item.location]["amount"] += abs(item.amount)
@@ -624,7 +626,7 @@ class AnalyticsService:
         day_counts = [full_weeks] * 7
         for offset in range(remainder):
             day_counts[(start.weekday() + offset) % 7] += 1
-        totals = [0.0] * 7
+        totals = [Decimal(0)] * 7
         counts = [0] * 7
         for item in transactions:
             if item.amount < 0 and start <= item.date <= end:
@@ -636,7 +638,7 @@ class AnalyticsService:
                 "total": totals[index],
                 "transactions": counts[index],
                 "days": day_counts[index],
-                "average_per_day": totals[index] / day_counts[index] if day_counts[index] else 0.0,
+                "average_per_day": totals[index] / day_counts[index] if day_counts[index] else Decimal(0),
             }
             for index in range(7)
         ]
@@ -655,7 +657,7 @@ class AnalyticsService:
             "weekend": weekend_average,
             "weekday": weekday_average,
             "difference": (
-                (weekend_average - weekday_average) / weekday_average * 100.0 if weekday_average else 0.0
+                (weekend_average - weekday_average) / weekday_average * 100 if weekday_average else Decimal(0)
             ),
         }
 
@@ -669,7 +671,7 @@ class AnalyticsService:
         day_counts = [0] * len(WEEK_OF_MONTH_BUCKETS)
         for day in _date_range(start, end):
             day_counts[min((day.day - 1) // 7, 3)] += 1
-        totals = [0.0] * len(WEEK_OF_MONTH_BUCKETS)
+        totals = [Decimal(0)] * len(WEEK_OF_MONTH_BUCKETS)
         for item in transactions:
             if item.amount < 0 and start <= item.date <= end:
                 totals[min((item.date.day - 1) // 7, 3)] += abs(item.amount)
@@ -678,8 +680,8 @@ class AnalyticsService:
             {
                 "bucket": label,
                 "total": totals[index],
-                "share": totals[index] / grand_total * 100.0 if grand_total else 0.0,
-                "average_per_day": totals[index] / day_counts[index] if day_counts[index] else 0.0,
+                "share": totals[index] / grand_total * 100 if grand_total else Decimal(0),
+                "average_per_day": totals[index] / day_counts[index] if day_counts[index] else Decimal(0),
             }
             for index, (label, _, _) in enumerate(WEEK_OF_MONTH_BUCKETS)
         ]
@@ -692,7 +694,7 @@ class AnalyticsService:
         if not transactions:
             return []
         start, end = AnalyticsService._period(transactions, start, end)
-        totals: Dict[date, float] = defaultdict(float)
+        totals: Dict[date, float] = defaultdict(Decimal)
         for item in transactions:
             if item.amount < 0:
                 totals[item.date] += abs(item.amount)
@@ -703,8 +705,8 @@ class AnalyticsService:
             points.append(
                 {
                     "date": day,
-                    "spend": totals.get(day, 0.0),
-                    "rolling_7": sum(totals.get(value, 0.0) for value in window) / len(window),
+                    "spend": totals.get(day, Decimal(0)),
+                    "rolling_7": sum(totals.get(value, Decimal(0)) for value in window) / len(window),
                 }
             )
         return points
@@ -715,7 +717,7 @@ class AnalyticsService:
     ) -> Dict[str, float]:
         daily = AnalyticsService.daily_spending(transactions, start, end)
         if not daily:
-            return {"average_daily": 0.0, "last_7_days": 0.0, "last_30_days": 0.0, "days": 0}
+            return {"average_daily": Decimal(0), "last_7_days": Decimal(0), "last_30_days": Decimal(0), "days": 0}
         spend = [point["spend"] for point in daily]
         return {
             "average_daily": sum(spend) / len(spend),
@@ -761,14 +763,14 @@ class AnalyticsService:
         """
         chains: List[List[Transaction]] = []
         for item in sorted(items, key=lambda value: abs(value.amount)):
-            if chains and abs(item.amount) <= abs(chains[-1][-1].amount) * 1.35 + 0.01:
+            if chains and abs(item.amount) <= abs(chains[-1][-1].amount) * Decimal("1.35") + Decimal("0.01"):
                 chains[-1].append(item)
             else:
                 chains.append([item])
         clusters: List[Tuple[List[Transaction], bool]] = []
         for chain in chains:
             smallest, largest = abs(chain[0].amount), abs(chain[-1].amount)
-            if largest <= smallest * MAX_RECURRING_SPREAD + 0.01:
+            if largest <= smallest * Decimal(str(MAX_RECURRING_SPREAD)) + Decimal("0.01"):
                 clusters.append((chain, False))
                 continue
             exact: Dict[float, List[Transaction]] = defaultdict(list)
@@ -786,15 +788,15 @@ class AnalyticsService:
         amounts = [round(abs(item.amount), 2) for item in cluster]
         latest = amounts[-1]
         if len(set(amounts)) > 3:
-            return 0.0, latest, None
+            return Decimal(0), latest, None
         for index in range(len(amounts) - 2, -1, -1):
             change = round(latest - amounts[index], 2)
-            if abs(change) >= 0.5 and abs(change) >= amounts[index] * 0.02:
+            if abs(change) >= 0.5 and abs(change) >= amounts[index] * Decimal("0.02"):
                 # Only a price that held for at least two charges counts as the old price.
-                if index == 0 or abs(amounts[index - 1] - amounts[index]) > amounts[index] * 0.02:
-                    return 0.0, latest, None
+                if index == 0 or abs(amounts[index - 1] - amounts[index]) > amounts[index] * Decimal("0.02"):
+                    return Decimal(0), latest, None
                 return change, amounts[index], cluster[index + 1].date
-        return 0.0, latest, None
+        return Decimal(0), latest, None
 
     @staticmethod
     def _recurring_groups(transactions: List[Transaction]) -> List[Tuple[Dict[str, Any], List[Transaction]]]:
@@ -819,7 +821,7 @@ class AnalyticsService:
                 # mostly fixed amount so habits like weekly coffee aren't mistaken for bills.
                 if cadence["per_year"] >= 24:
                     typical_amount = median(abs(item.amount) for item in cluster)
-                    steady = sum(abs(abs(item.amount) - typical_amount) <= typical_amount * 0.05 for item in cluster)
+                    steady = sum(abs(abs(item.amount) - typical_amount) <= typical_amount * Decimal("0.05") for item in cluster)
                     if len(cluster) < 3 or steady / len(cluster) < 0.5:
                         continue
                 if cadence["per_year"] <= 12 and len(months) < 2:
@@ -911,7 +913,7 @@ class AnalyticsService:
         if len(expenses) < 4:
             return []
         typical = median(abs(transaction.amount) for transaction in expenses)
-        threshold = max(typical * 3, 100.0)
+        threshold = max(typical * 3, 100)
         return sorted(
             [transaction for transaction in expenses if abs(transaction.amount) >= threshold],
             key=lambda transaction: abs(transaction.amount),
@@ -931,8 +933,8 @@ class AnalyticsService:
         recent = ([item for item in monthly if item["month"] in complete] or monthly)[-3:]
         if not recent:
             return {
-                "inflow": 0.0, "outflow": 0.0, "net": 0.0, "months": 0,
-                "recurring": 0.0, "variable": 0.0, "outflow_low": 0.0, "outflow_high": 0.0,
+                "inflow": Decimal(0), "outflow": Decimal(0), "net": Decimal(0), "months": 0,
+                "recurring": Decimal(0), "variable": Decimal(0), "outflow_low": Decimal(0), "outflow_high": Decimal(0),
             }
         inflow = sum(item["inflow"] for item in recent) / len(recent)
         groups = [
@@ -940,7 +942,7 @@ class AnalyticsService:
         ]
         recurring_ids = {item.id for _, cluster in groups for item in cluster}
         recent_months = {item["month"] for item in recent}
-        recurring_by_month: Dict[str, float] = defaultdict(float)
+        recurring_by_month: Dict[str, float] = defaultdict(Decimal)
         for item in transactions:
             if item.id in recurring_ids and _month_key(item.date) in recent_months:
                 recurring_by_month[_month_key(item.date)] += abs(item.amount)
@@ -975,12 +977,12 @@ class AnalyticsService:
         months = AnalyticsService.complete_months(transactions) or sorted(
             {_month_key(item.date) for item in transactions}
         )
-        totals: Dict[str, float] = defaultdict(float)
+        totals: Dict[str, float] = defaultdict(Decimal)
         for item in income:
             totals[_month_key(item.date)] += item.amount
-        values = [totals.get(month, 0.0) for month in months]
-        average = sum(values) / len(values) if values else 0.0
-        variation = pstdev(values) / average * 100.0 if len(values) >= 2 and average else 0.0
+        values = [totals.get(month, Decimal(0)) for month in months]
+        average = sum(values) / len(values) if values else Decimal(0)
+        variation = pstdev(values) / average * 100 if len(values) >= 2 and average else Decimal(0)
         if len(values) < 2:
             stability = "Not enough history"
         elif variation < 10:
@@ -989,7 +991,7 @@ class AnalyticsService:
             stability = "Somewhat variable"
         else:
             stability = "Variable"
-        sources: Dict[str, float] = defaultdict(float)
+        sources: Dict[str, float] = defaultdict(Decimal)
         for item in income:
             sources[merchant_name(item)] += item.amount
         return {
@@ -1001,7 +1003,7 @@ class AnalyticsService:
             "average_monthly": average,
             "variation": variation,
             "stability": stability,
-            "months": [{"month": month, "income": totals.get(month, 0.0)} for month in months],
+            "months": [{"month": month, "income": totals.get(month, Decimal(0))} for month in months],
             "sources": [
                 {"source": name, "amount": amount}
                 for name, amount in sorted(sources.items(), key=lambda item: item[1], reverse=True)[:3]
@@ -1010,7 +1012,7 @@ class AnalyticsService:
 
     @staticmethod
     def income_sources(transactions: List[Transaction]) -> Dict[str, float]:
-        sources: Dict[str, float] = defaultdict(float)
+        sources: Dict[str, float] = defaultdict(Decimal)
         for item in transactions:
             if item.amount > 0:
                 sources[item.category] += item.amount
@@ -1041,7 +1043,7 @@ class AnalyticsService:
         )
         rows = []
         for budget in budgets:
-            spent = spending.get(budget.category, 0.0)
+            spent = spending.get(budget.category, Decimal(0))
             limit = budget.monthly_limit
             projected = (
                 spent / elapsed * days
@@ -1066,12 +1068,12 @@ class AnalyticsService:
                     "spent": spent,
                     "remaining": remaining,
                     "projected": projected,
-                    "spent_share": spent / limit * 100.0 if limit else 0.0,
-                    "elapsed_share": elapsed / days * 100.0,
+                    "spent_share": spent / limit * 100 if limit else Decimal(0),
+                    "elapsed_share": elapsed / days * 100,
                     "days_elapsed": elapsed,
                     "days_in_month": days,
                     "daily_allowance": (
-                        remaining / (days - elapsed) if in_progress and remaining > 0 else 0.0
+                        remaining / (days - elapsed) if in_progress and remaining > 0 else Decimal(0)
                     ),
                     "status": status,
                 }
@@ -1090,7 +1092,7 @@ class AnalyticsService:
         cells = []
         summary = []
         for budget in budgets:
-            values = [spending.get((month, budget.category), 0.0) for month in months]
+            values = [spending.get((month, budget.category), Decimal(0)) for month in months]
             for month, spent in zip(months, values):
                 cells.append(
                     {
@@ -1098,7 +1100,7 @@ class AnalyticsService:
                         "month": month,
                         "spent": spent,
                         "limit": budget.monthly_limit,
-                        "ratio": spent / budget.monthly_limit * 100.0 if budget.monthly_limit else None,
+                        "ratio": spent / budget.monthly_limit * 100 if budget.monthly_limit else None,
                     }
                 )
             if values:
@@ -1132,7 +1134,7 @@ class AnalyticsService:
     def goal_plan(
         goal: SavingsGoal, today: date, average_monthly_savings: Optional[float]
     ) -> Dict[str, Any]:
-        remaining = max(goal.target_amount - goal.current_amount, 0.0)
+        remaining = max(goal.target_amount - goal.current_amount, Decimal(0))
         plan: Dict[str, Any] = {
             "remaining": remaining,
             "complete": remaining == 0,
@@ -1144,15 +1146,15 @@ class AnalyticsService:
         if remaining == 0:
             return plan
         if goal.target_date:
-            months_left = max((goal.target_date - today).days / 30.44, 0.0)
-            required = remaining / months_left if months_left >= 1 else remaining
+            months_left = max((goal.target_date - today).days / 30.44, Decimal(0))
+            required = remaining / Decimal(str(months_left)) if months_left >= 1 else remaining
             plan["months_left"] = months_left
             plan["required_monthly"] = required
             if average_monthly_savings is not None:
                 plan["on_track"] = average_monthly_savings >= required
         if average_monthly_savings and average_monthly_savings > 0:
             plan["projected_date"] = today + timedelta(
-                days=round(remaining / average_monthly_savings * 30.44)
+                days=round(remaining / Decimal(str(average_monthly_savings)) * Decimal("30.44"))
             )
         return plan
 
@@ -1173,22 +1175,23 @@ class AnalyticsService:
     @staticmethod
     def balance_overview(accounts: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Net worth, spendable cash, and credit utilization from connected accounts."""
-        assets = liabilities = cash = 0.0
+        assets = liabilities = cash = Decimal(0)
         cards = []
         counted = 0
         for account in accounts:
+            require_usd(account.get("iso_currency_code"))
             current = account.get("current_balance")
             if current is None:
                 continue
             counted += 1
-            current = float(current)
+            current = money(current)
             kind = str(account.get("type") or "")
             if kind in ("credit", "loan"):
                 liabilities += current
                 if kind == "credit":
                     limit = account.get("credit_limit")
-                    limit = float(limit) if limit else None
-                    utilization = current / limit * 100.0 if limit else None
+                    limit = money(limit) if limit else None
+                    utilization = current / limit * 100 if limit else None
                     cards.append(
                         {
                             "account": account.get("official_name") or account.get("name") or "Credit card",
@@ -1203,11 +1206,11 @@ class AnalyticsService:
                 assets += current
                 if kind == "depository":
                     available = account.get("available_balance")
-                    cash += float(available) if available is not None else current
+                    cash += money(available) if available is not None else current
         limited = [card for card in cards if card["limit"]]
         total_limit = sum(card["limit"] for card in limited)
         utilization = (
-            sum(card["balance"] for card in limited) / total_limit * 100.0 if total_limit else None
+            sum(card["balance"] for card in limited) / total_limit * 100 if total_limit else None
         )
         return {
             "assets": assets,
@@ -1225,6 +1228,7 @@ class AnalyticsService:
         """Daily net worth, carrying each account's last known balance forward."""
         by_date: Dict[date, List[Dict[str, Any]]] = defaultdict(list)
         for row in history:
+            require_usd(row.get("currency"))
             if row.get("current_balance") is None:
                 continue
             as_of = row["as_of"] if isinstance(row["as_of"], date) else date.fromisoformat(str(row["as_of"]))
@@ -1233,7 +1237,7 @@ class AnalyticsService:
         points = []
         for as_of in sorted(by_date):
             for row in by_date[as_of]:
-                latest[row["account_id"]] = (str(row.get("type") or ""), float(row["current_balance"]))
+                latest[row["account_id"]] = (str(row.get("type") or ""), money(row["current_balance"]))
             assets = sum(value for kind, value in latest.values() if kind not in ("credit", "loan"))
             liabilities = sum(value for kind, value in latest.values() if kind in ("credit", "loan"))
             points.append(
@@ -1286,7 +1290,7 @@ class AnalyticsService:
         growth = [
             item
             for item in AnalyticsService.category_changes(transactions)
-            if item["change"] >= 25 and item["change"] >= item["previous"] * 0.1
+            if item["change"] >= 25 and item["change"] >= item["previous"] * Decimal("0.1")
         ]
         if growth:
             item = growth[0]

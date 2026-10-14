@@ -2,7 +2,6 @@ import csv
 import io
 import hashlib
 import json
-import math
 import re
 from datetime import date, datetime
 from decimal import Decimal
@@ -11,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 from charset_normalizer import from_bytes
 
+from src.domain.money import require_usd, money
 from src.domain.models import ParseMetrics, Transaction
 from src.services.security import MAX_UPLOAD_BYTES
 from src.services.imports import normalize_text
@@ -20,6 +20,7 @@ from src.services.categorizer import auto_categorize
 COLUMN_SYNONYMS = {
     "date": ["date", "transaction date", "trans date", "posting date", "txn date"],
     "description": ["description", "memo", "payee", "merchant", "details", "narrative"],
+    "currency": ["currency", "currencycode", "isocurrencycode"],
     "amount": ["amount", "amt", "value", "total"],
     "debit": ["debit", "withdrawal", "charge", "outflow"],
     "credit": ["credit", "deposit", "inflow"],
@@ -31,7 +32,7 @@ def _normalize_header(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
-def _parse_amount(raw_value: str, number_format: str = "decimal_dot") -> float:
+def _parse_amount(raw_value: str, number_format: str = "decimal_dot") -> Decimal:
     value = raw_value.strip()
     if not value:
         raise ValueError("empty amount")
@@ -54,7 +55,9 @@ def _parse_amount(raw_value: str, number_format: str = "decimal_dot") -> float:
         raise ValueError("unsupported number format")
     if not re.fullmatch(pattern, value):
         raise ValueError("amount does not match the selected number format")
-    amount = float(Decimal(normalized))
+    if re.search(r"€|£|¥|\b(?:EUR|GBP|CAD|AUD|JPY)\b", str(raw_value), re.IGNORECASE):
+        require_usd("unsupported")
+    amount = Decimal(normalized)
     return -abs(amount) if negative else amount
 
 
@@ -153,8 +156,11 @@ class BankStatementParser:
         """Normalize rows from CSV or PDF extraction through one validation path."""
         if statement_year is not None and (not isinstance(statement_year, int) or not 1 <= statement_year <= 9999):
             return cls._rejected("Statement year must be between 1 and 9999.")
-        if expected_total is not None and not math.isfinite(expected_total):
-            return cls._rejected("Expected statement total must be finite.")
+        if expected_total is not None:
+            try:
+                expected = money(expected_total)
+            except ValueError:
+                return cls._rejected("Expected statement total must be finite and in exact USD cents.")
         raw_rows = [
             ["" if cell is None else str(cell).replace("\n", " ").strip() for cell in row]
             for row in raw_rows
@@ -227,6 +233,7 @@ class BankStatementParser:
         references = {}
         conflicting_reference = False
         conflicting_direction = False
+        unsupported_currency = False
 
         for source_row, row in enumerate(data_rows, start=1):
             row_number = source_row + header_index + 1
@@ -234,6 +241,16 @@ class BankStatementParser:
                 if any(index >= len(row) for index in indexes.values()):
                     raise ValueError("row has fewer columns than the header")
 
+                if "currency" in indexes:
+                    try:
+                        require_usd(row[indexes["currency"]].strip())
+                    except ValueError:
+                        unsupported_currency = True
+                        raise
+                money_columns = [indexes[key] for key in ('amount', 'debit', 'credit') if key in indexes]
+                if any(re.search(r'€|£|¥|\b(?:EUR|GBP|CAD|AUD|JPY)\b', row[index], re.I) for index in money_columns):
+                    unsupported_currency = True
+                    require_usd('unsupported')
                 raw_date = row[indexes["date"]]
                 if statement_year is None and period_start and period_end and re.fullmatch(r"\d{1,2}[/-]\d{1,2}", raw_date):
                     candidates = []
@@ -256,8 +273,8 @@ class BankStatementParser:
                 if has_direction_columns:
                     if not row[indexes["debit"]].strip() and not row[indexes["credit"]].strip():
                         raise ValueError("missing Debit and Credit amounts")
-                    debit = _parse_amount(row[indexes["debit"]], number_format) if row[indexes["debit"]].strip() else 0.0
-                    credit = _parse_amount(row[indexes["credit"]], number_format) if row[indexes["credit"]].strip() else 0.0
+                    debit = _parse_amount(row[indexes["debit"]], number_format) if row[indexes["debit"]].strip() else Decimal(0)
+                    credit = _parse_amount(row[indexes["credit"]], number_format) if row[indexes["credit"]].strip() else Decimal(0)
                     if debit and credit:
                         conflicting_direction = True
                         raise ValueError("both Debit and Credit are populated for one transaction")
@@ -279,6 +296,8 @@ class BankStatementParser:
                         date=parsed_date,
                         description=description,
                         amount=amount,
+                        category_origin="builtin",
+                        builtin_category=auto_categorize(description),
                         category=auto_categorize(description),
                         account_name=account_name.strip() or "Primary Checking",
                         account_type=account_type,
@@ -294,8 +313,8 @@ class BankStatementParser:
 
         valid_rows = len(valid_transactions)
         accuracy_rate = valid_rows / total_rows
-        is_valid = accuracy_rate >= 0.80 and not conflicting_reference and not conflicting_direction
-        if expected_total is not None and abs(sum((Decimal(str(item.amount)) for item in valid_transactions), Decimal(0)) - Decimal(str(expected_total))) > Decimal("0.005"):
+        is_valid = accuracy_rate >= 0.80 and not conflicting_reference and not conflicting_direction and not unsupported_currency
+        if expected_total is not None and sum((item.amount for item in valid_transactions), Decimal(0)) != expected:
             is_valid = False
             errors.insert(0, "Parsed money in minus money out does not match the expected statement total.")
         if accuracy_rate < 0.80:

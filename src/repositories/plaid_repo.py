@@ -7,33 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 
-@dataclass(frozen=True)
-class PlaidItem:
-    item_id: str
-    access_token: str
-    institution_name: str
-    cursor: Optional[str]
-    status: str
-    last_synced_at: Optional[str]
-    error_message: Optional[str]
-    sync_generation: int = 0
-    needs_reconciliation: bool = False
-
-
-def account_balances(account: dict) -> dict:
-    """Flatten Plaid's nested balances into the stored account columns."""
-    balances = account.get("balances") or {}
-
-    def number(key: str) -> Optional[float]:
-        value = balances.get(key)
-        return float(value) if value is not None else None
-
-    return {
-        "current_balance": number("current"),
-        "available_balance": number("available"),
-        "credit_limit": number("limit"),
-        "iso_currency_code": balances.get("iso_currency_code"),
-    }
+from src.domain.banking import PlaidItem, account_balances
 
 
 class PlaidRepository:
@@ -106,7 +80,7 @@ class PlaidRepository:
                     connection.execute(f"ALTER TABLE plaid_accounts ADD COLUMN {column} {kind}")
             item_columns = {row[1] for row in connection.execute("PRAGMA table_info(plaid_items)")}
             for column, kind in (("sync_generation", "INTEGER NOT NULL DEFAULT 0"),
-                                 ("needs_reconciliation", "INTEGER NOT NULL DEFAULT 0")):
+                                 ("needs_reconciliation", "INTEGER NOT NULL DEFAULT 0"), ("disconnect_remove_transactions", "INTEGER NOT NULL DEFAULT 0")):
                 if column not in item_columns:
                     connection.execute(f"ALTER TABLE plaid_items ADD COLUMN {column} {kind}")
 
@@ -201,6 +175,7 @@ class PlaidRepository:
                 error_message=row["error_message"],
                 sync_generation=row["sync_generation"],
                 needs_reconciliation=bool(row["needs_reconciliation"]),
+                disconnect_remove_transactions=bool(row["disconnect_remove_transactions"]),
             )
             for row in rows
         ]
@@ -218,12 +193,12 @@ class PlaidRepository:
         with self._get_connection() as connection:
             return [dict(row) for row in connection.execute(query, params).fetchall()]
 
-    def get_balance_history(self) -> list[dict]:
+    def get_balance_history(self, since=None) -> list[dict]:
         with self._get_connection() as connection:
             return [
                 dict(row)
                 for row in connection.execute(
-                    "SELECT * FROM account_balances ORDER BY as_of, account_id"
+                    "SELECT * FROM account_balances WHERE as_of>=? ORDER BY as_of, account_id", ((since.isoformat() if since else "0001-01-01"),)
                 ).fetchall()
             ]
 
@@ -248,3 +223,28 @@ class PlaidRepository:
     def delete_item(self, item_id: str) -> None:
         with self._get_connection() as connection:
             connection.execute("DELETE FROM plaid_items WHERE item_id = ?", (item_id,))
+
+    def begin_disconnect(self, item_id, remove_transactions):
+        with self._get_connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            item = connection.execute('SELECT * FROM plaid_items WHERE item_id=?', (item_id,)).fetchone()
+            if not item:
+                return False
+            if item['status']=='disconnecting' and bool(item['disconnect_remove_transactions'])!=remove_transactions:
+                raise ValueError('Disconnect intent already recorded.')
+            connection.execute("UPDATE plaid_items SET status='disconnecting',disconnect_remove_transactions=?,sync_generation=sync_generation+1 WHERE item_id=?", (remove_transactions,item_id))
+            return True
+
+    def finish_disconnect(self, item_id):
+        with self._get_connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            item = connection.execute('SELECT * FROM plaid_items WHERE item_id=?', (item_id,)).fetchone()
+            if not item:
+                return 0
+            if item['status']!='disconnecting':
+                raise ValueError('Disconnect must be started first.')
+            count = 0
+            if item['disconnect_remove_transactions']:
+                count = connection.execute('DELETE FROM transactions WHERE plaid_item_id=?', (item_id,)).rowcount
+            connection.execute('DELETE FROM plaid_items WHERE item_id=?', (item_id,))
+            return count

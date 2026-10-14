@@ -31,7 +31,16 @@ try {
         ('00000000-0000-0000-0000-000000000001','nested-split-1-split-2',current_date,'Store (split 1) (split 2)',-40,'Card'),
         ('00000000-0000-0000-0000-000000000001','nested-split-2',current_date,'Store (split 2)',-40,'Card');`);
     }
+    if (file === '202610130003_money_accounts_and_provenance.sql') {
+      await db.exec(`insert into public.transactions(user_id,id,date,description,amount,account_name) values
+        ('00000000-0000-0000-0000-000000000001','rounding-fixture',current_date,'Rounding fixture',-1.005,'Rounding');`);
+    }
     await db.exec(readFileSync(`${root}/supabase/migrations/${file}`, 'utf8'));
+    if (file === '202610130003_money_accounts_and_provenance.sql') {
+      await db.exec(readFileSync(`${root}/scripts/verify_money_migration.sql`, 'utf8'));
+      await db.exec(`do $$ begin if(select amount from public.transactions where id='rounding-fixture')<>-1.01 then raise exception 'Money rounding policy failed'; end if; end $$;`);
+      console.log('Passed money row counts, exact values and total reconciliation.');
+    }
   }
   await db.exec(`do $$ begin
     if (select amount from public.transactions where id='legacy')<>-100
@@ -45,9 +54,33 @@ try {
   console.log('Passed all migrations and legacy split recovery.');
   for (const file of ['verify_supabase_isolation.sql', 'verify_atomic_operations.sql', 'verify_atomic_plaid_sync.sql',
                        'verify_literal_category_rule.sql', 'verify_private_plaid_tokens.sql',
-                       'verify_source_splits_and_reconciliation.sql', 'verify_statement_imports.sql']) {
+                       'verify_source_splits_and_reconciliation.sql', 'verify_statement_imports.sql', 'verify_data_architecture.sql']) {
     await db.exec(readFileSync(`${root}/scripts/${file}`, 'utf8'));
     console.log(`Passed ${file}`);
+  }
+  if (process.argv.includes('--benchmark')) {
+    await db.exec(`begin; set local role authenticated;
+      select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-000000000001',true);
+      insert into public.accounts(user_id,id,name,account_type) values
+        ('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-00000000b001','Synthetic','Checking');
+      insert into public.transactions(user_id,id,date,description,amount,category,account_name,account_type,account_id)
+        select '00000000-0000-0000-0000-000000000001','synthetic:'||lpad(n::text,6,'0'),date '2020-01-01'+(n%2500),
+          'Synthetic purchase',-100.01,'Shopping','Synthetic','Checking','00000000-0000-0000-0000-00000000b001'
+        from generate_series(1,50000) n;`);
+    const filters = {accounts:['00000000-0000-0000-0000-00000000b001']};
+    let start = performance.now();
+    const page = (await db.query('select public.fb_query_transactions($1::jsonb,200,null) result',[JSON.stringify(filters)])).rows[0].result;
+    const pageMs = performance.now()-start;
+    start = performance.now();
+    const summary = (await db.query('select public.fb_transaction_summary($1::jsonb) result',[JSON.stringify(filters)])).rows[0].result;
+    const summaryMs = performance.now()-start;
+    start = performance.now();
+    const full = (await db.query("select coalesce(jsonb_agg(record),'[]'::jsonb) result from public.fb_filtered_transactions($1::jsonb)",[JSON.stringify(filters)])).rows[0].result;
+    const fullMs = performance.now()-start;
+    console.log(JSON.stringify({syntheticRows:50000, pageRows:page.rows.length, count:page.count,
+      pageBytes:Buffer.byteLength(JSON.stringify(page)), fullBytes:Buffer.byteLength(JSON.stringify(full)),
+      pageMs:Math.round(pageMs), fullMs:Math.round(fullMs), summaryMs:Math.round(summaryMs), outflow:summary.outflow}));
+    await db.exec('rollback');
   }
 } catch (error) {
   console.error('Database verification failed:', error.message);

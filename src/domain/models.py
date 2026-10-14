@@ -1,8 +1,11 @@
 from datetime import date
+from decimal import Decimal
 from typing import List, Optional
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Literal
+from src.domain.money import Money
 
 
 class TransactionAllocation(BaseModel):
@@ -11,12 +14,12 @@ class TransactionAllocation(BaseModel):
     model_config = ConfigDict(validate_assignment=True, allow_inf_nan=False)
 
     id: UUID = Field(default_factory=uuid4)
-    amount: float
+    amount: Money
     category: str = Field(min_length=1, max_length=128)
 
     @field_validator("amount")
     @classmethod
-    def nonzero_amount(cls, value: float) -> float:
+    def nonzero_amount(cls, value: Decimal) -> Decimal:
         if value == 0:
             raise ValueError("Allocation amount must be nonzero.")
         return value
@@ -40,16 +43,26 @@ class Transaction(BaseModel):
     id: str = Field(min_length=1, max_length=256)
     date: date
     description: str = Field(min_length=1, max_length=2048)
-    amount: float
+    amount: Money
+    currency: Literal["USD"] = "USD"
+    account_id: Optional[UUID] = None
+    category_origin: Literal["legacy", "manual", "rule", "provider", "builtin"] = "legacy"
+    builtin_category: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    provider_category: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    category_override: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    category_rule: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    category_rule_version: Optional[int] = Field(default=None, ge=1)
+    pending_transaction_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    revision: int = Field(default=1, ge=1)
     category: str = Field(default="Uncategorized", min_length=1, max_length=128)
     account_name: str = Field(min_length=1, max_length=256)
     account_type: str = Field(default="Checking", min_length=1, max_length=64)
     # Optional provider detail. Bank connections supply these; statement imports
     # leave them empty, so analytics must treat every one of them as optional.
-    merchant_name: Optional[str] = Field(default=None, max_length=256)
-    subcategory: Optional[str] = Field(default=None, max_length=128)
+    merchant_name: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    subcategory: Optional[str] = Field(default=None, min_length=1, max_length=128)
     payment_channel: Optional[str] = Field(default=None, max_length=32)
-    location: Optional[str] = Field(default=None, max_length=256)
+    location: Optional[str] = Field(default=None, min_length=1, max_length=256)
     pending: bool = False
     plaid_item_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
     plaid_account_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
@@ -60,7 +73,7 @@ class Transaction(BaseModel):
     statement_match_bank: bool = False
     # Read projection only. Never written into a backup or source record.
     source_transaction_id: Optional[str] = Field(default=None, exclude=True)
-    source_amount: Optional[float] = Field(default=None, exclude=True)
+    source_amount: Optional[Money] = Field(default=None, exclude=True)
     split_needs_review: bool = Field(default=False, exclude=True)
 
 
@@ -68,7 +81,7 @@ class Budget(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
 
     category: str = Field(min_length=1, max_length=128)
-    monthly_limit: float = Field(ge=0)
+    monthly_limit: Money = Field(ge=0)
 
 
 class SavingsGoal(BaseModel):
@@ -76,14 +89,15 @@ class SavingsGoal(BaseModel):
 
     id: Optional[int] = None
     name: str = Field(min_length=1, max_length=256)
-    target_amount: float = Field(gt=0)
-    current_amount: float = Field(default=0.0, ge=0)
+    target_amount: Money = Field(gt=0)
+    current_amount: Money = Field(default=Decimal("0.00"), ge=0)
     target_date: Optional[date] = None
 
 
 class CategoryRule(BaseModel):
     keyword: str = Field(min_length=1, max_length=256)
     category: str = Field(min_length=1, max_length=128)
+    version: int = Field(default=1, ge=1)
 
 
 class ParseMetrics(BaseModel):

@@ -35,18 +35,20 @@ def test_replacements_and_split_use_single_atomic_rpc():
     client.rpc.return_value = 1
     repo = SupabaseTransactionRepository(client, 'alice')
     assert repo.replace_account('Checking', [sample_transaction()]) == 1
-    assert client.rpc.call_args.args[0] == 'fb_replace_transactions'
-    assert client.rpc.call_args.args[1]['p_rows'][0]['user_id'] == 'alice'
+    assert client.rpc.call_args.args[0] == 'fb_execute_operation'
+    assert client.rpc.call_args.args[1]['p_kind'] == 'replace_account'
+    assert client.rpc.call_args.args[1]['p_payload']['rows'][0]['amount'] == '-4.50'
     client.reset_mock()
     with pytest.raises(ValueError):
         repo.replace_account('Checking', [sample_transaction(account='Other')])
     client.assert_not_called()
     repo.replace_all([sample_transaction()])
-    assert client.rpc.call_args.args[1]['p_account'] is None
+    assert client.rpc.call_args.args[1]['p_kind'] == 'replace_all'
     client.reset_mock()
     repo.split_transaction('a', 'Food', 2.0, 'Dining', 2.5)
     client.rpc.assert_called_once()
-    assert client.rpc.call_args.args[0] == 'fb_split_transaction'
+    assert client.rpc.call_args.args[0] == 'fb_execute_operation'
+    assert client.rpc.call_args.args[1]['p_kind'] == 'split'
 
 
 def test_restore_and_plaid_accounts_never_issue_partial_client_writes():
@@ -57,7 +59,8 @@ def test_restore_and_plaid_accounts_never_issue_partial_client_writes():
                          'budgets': [], 'goals': [], 'category_rules': []}).encode()
     assert repo.restore_backup(backup)['transactions'] == 1
     client.rpc.assert_called_once()
-    assert client.rpc.call_args.args[0] == 'fb_restore_backup'
+    assert client.rpc.call_args.args[0] == 'fb_execute_operation'
+    assert client.rpc.call_args.args[1]['p_kind'] == 'restore'
     client.reset_mock()
     SupabasePlaidRepository(client, 'alice').save_accounts('bank-1', [{'account_id': 'acct-1', 'name': 'Checking'}])
     client.rpc.assert_called_once()
@@ -81,7 +84,11 @@ def test_plaid_repository_uses_private_token_rpc():
     repo = SupabasePlaidRepository(client, 'alice')
     repo.save_item('bank-1', 'encrypted-token', 'Bank')
     assert client.rpc.call_args.args[0] == 'fb_save_plaid_item'
-    assert repo.get_items()[0].access_token == 'encrypted-token'
+    client.reset_mock()
+    assert repo.get_items()[0].access_token == ''
+    client.rpc.assert_not_called()
+    assert repo.get_item('bank-1').access_token == 'encrypted-token'
+    assert client.select.call_args.kwargs['item_id'] == 'eq.bank-1'
     assert client.rpc.call_args.args == ('fb_plaid_token', {'p_item_id': 'bank-1'})
 
 
@@ -93,8 +100,9 @@ def test_plaid_sync_is_one_rpc_with_expected_cursor():
     )
     assert result == {'upserted': 1, 'removed': 0}
     client.rpc.assert_called_once()
-    assert client.rpc.call_args.args[0] == 'fb_apply_plaid_sync'
-    assert client.rpc.call_args.args[1]['p_expected_cursor'] == 'previous'
+    assert client.rpc.call_args.args[0] == 'fb_execute_operation'
+    assert client.rpc.call_args.args[1]['p_kind'] == 'sync'
+    assert client.rpc.call_args.args[1]['p_payload']['p_expected_cursor'] == 'previous'
 
 
 def test_optional_transaction_detail_is_sent_only_when_present():
@@ -118,7 +126,7 @@ def test_plaid_accounts_rpc_carries_balances():
         'balances': {'current': 12.5, 'available': None, 'limit': 100, 'iso_currency_code': 'USD'},
     }])
     row = client.rpc.call_args.args[1]['p_rows'][0]
-    assert (row['current_balance'], row['available_balance'], row['credit_limit']) == (12.5, None, 100.0)
+    assert (row['current_balance'], row['available_balance'], row['credit_limit']) == ('12.50', None, '100.00')
 
 
 def test_insights_migration_protects_balance_history_with_rls():

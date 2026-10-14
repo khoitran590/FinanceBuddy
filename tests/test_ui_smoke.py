@@ -278,7 +278,7 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
         # Serves the in-memory rows (which keep bank-connection detail) and mirrors
         # category edits into them, while SQLite still records every write.
         def get_all(self):
-            return sorted(rows, key=lambda item: (item.date, item.id), reverse=True)
+            return super().get_all()
 
         def get_all_saved(self):
             return TransactionRepository.get_all(self)
@@ -299,13 +299,14 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
                 {'account_id': 'k', 'type': 'credit', 'name': 'Card', 'current_balance': 500.0, 'credit_limit': 2000.0},
             ]
 
-        def get_balance_history(self):
+        def get_balance_history(self, since=None):
             return [
                 {'account_id': 'c', 'as_of': '2026-09-01', 'type': 'depository', 'current_balance': 3500.0},
                 {'account_id': 'c', 'as_of': '2026-09-10', 'type': 'depository', 'current_balance': 4000.0},
             ]
 
     repo = MemoryRepo(tmp_path / 'insights.db')
+    repo.insert_many(rows)
     repo.set_setting('onboarding_complete', 'true')
     repo.upsert_budget(Budget(category='Dining', monthly_limit=30))
     repo.save_goal(SavingsGoal(name='Emergency fund', target_amount=10000, current_amount=1000, target_date=date(2027, 9, 1)))
@@ -319,17 +320,28 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     app.session_state['supabase_session'] = {'access_token': 'test', 'refresh_token': 'test', 'expires_at': time.time() + 3600}
     app.run()
     assert not app.exception
-    assert [tab.label for tab in app.tabs] == ['Summary', 'Trends', 'Habits', 'Recurring & income', 'Balances']
+    assert app.segmented_control(key='overview_view').options == ['Summary', 'Trends', 'Habits', 'Recurring & income', 'Balances']
+    app.selectbox(key='dashboard_date_preset').set_value('All time').run()
     metrics = {metric.label: metric for metric in app.metric}
     assert [metric.label for metric in app.metric][:3] == ['Spending', 'Money in', 'Net cash flow']
     assert any(expander.label == 'More spending details' for expander in app.expander)
     assert any(expander.label == 'Filters' for expander in app.expander)
     assert any(button.label == 'View all transactions' for button in app.button)
+    metrics = {metric.label: metric for metric in app.metric}
     assert metrics['Spending'].value == '$11,155.44'
     assert metrics['Moved between accounts'].value == '$3,600.00'
+    assert 'Net worth' not in metrics  # Unselected views are not computed.
+    app.segmented_control(key='overview_view').set_value('Balances').run()
+    assert not app.exception
+    metrics = {metric.label: metric for metric in app.metric}
     assert metrics['Net worth'].value == '$3,500.00'
     assert metrics['Credit utilization'].value == '25%'
-    assert any('Netflix went up from $15.49 to $17.99' in item.value for item in app.markdown)
+    app.segmented_control(key='overview_view').set_value('Habits').run()
+    assert not app.exception
+    app.segmented_control(key='overview_view').set_value('Recurring & income').run()
+    assert not app.exception
+    assert any('Netflix went up from $15.49 to $17.99' in item.value for item in app.warning)
+    app.segmented_control(key='overview_view').set_value('Summary').run()
 
     # A main-chart selection must coexist with the deeper category explorer.
     import streamlit as st
@@ -376,6 +388,8 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     for key, style in (('chart_style_cash_flow', 'Net'), ('chart_style_cash_flow', 'Lines'),
                        ('chart_style_categories', 'Map'), ('chart_style_categories', 'Bars'),
                        ('chart_style_fixed_flexible', 'Side by side'), ('chart_style_category_trend', 'Lines')):
+        if key in ('chart_style_fixed_flexible', 'chart_style_category_trend'):
+            app.segmented_control(key='overview_view').set_value('Trends').run()
         app.segmented_control(key=key).set_value(style).run()
         assert not app.exception
     assert repo.get_setting('chart_preferences') is not None
@@ -398,19 +412,19 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     assert not app.exception
     next(box for box in app.selectbox if box.label == 'Category').set_value('Entertainment')
     from src.services.supabase import SupabaseError
-    original_update = repo.update_category
+    original_update = repo.correct_category
 
     def fail_save(*args, **kwargs):
         raise SupabaseError('private server error details')
 
-    monkeypatch.setattr(repo, 'update_category', fail_save)
+    monkeypatch.setattr(repo, 'correct_category', fail_save)
     next(button for button in app.button if button.label == 'Save category').click().run()
     assert not app.exception
     assert any("Couldn't confirm the category save" in item.value for item in app.error)
     assert not any('private server error details' in item.value for item in app.error)
     assert next(box for box in app.selectbox if box.label == 'Category').value == 'Entertainment'
     assert next(item for item in repo.get_all() if item.id == 'food4').category == 'Dining'
-    monkeypatch.setattr(repo, 'update_category', original_update)
+    monkeypatch.setattr(repo, 'correct_category', original_update)
     next(button for button in app.button if button.label == 'Save category').click().run()
     assert not app.exception
     assert next(item for item in repo.get_all() if item.id == 'food4').category == 'Entertainment'
@@ -440,13 +454,13 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     assert not app.exception
     assert any(metric.label == 'Spending' for metric in app.metric)
 
-    original_get_all = repo.get_all
-    monkeypatch.setattr(repo, 'get_all', fail_save)
+    original_get_all = repo.get_catalog
+    monkeypatch.setattr(repo, 'get_catalog', fail_save)
     app.run()
     assert not app.exception
     assert any("Couldn't load your transactions" in item.value for item in app.error)
     assert not any('private server error details' in item.value for item in app.error)
-    monkeypatch.setattr(repo, 'get_all', original_get_all)
+    monkeypatch.setattr(repo, 'get_catalog', original_get_all)
     app.button(key='retry_transactions').click().run()
     assert not app.exception
     assert any(metric.label == 'Spending' for metric in app.metric)
@@ -476,3 +490,61 @@ def test_mobile_history_page_recovers_from_stale_label(monkeypatch):
     components.render_transaction_table([])
     assert state.mobile_history_page == 1
     assert not captured  # No page selector is needed for a single page.
+
+
+def test_navigation_and_transaction_pages_use_catalog_and_explicit_reads(monkeypatch):
+    import time
+    from datetime import date
+    from uuid import UUID
+    from src.domain.models import Transaction
+    import src.repositories.supabase_repo as cloud_repos
+    from src.services.supabase import SupabaseAuth, SupabaseConfig
+    from src.services.plaid_service import PlaidConfig
+
+    class ReadRepo:
+        pages = 0
+        exports = 0
+        account_id = '00000000-0000-0000-0000-000000000010'
+        def get_catalog(self):
+            return {'count': 50000, 'display_count': 50000, 'min_date': '2020-01-01', 'max_date': '2026-10-01',
+                    'needs_review': 0, 'categories': ['Dining'],
+                    'accounts': [{'id': self.account_id, 'name': 'Checking', 'account_type': 'Checking',
+                                  'transactions': 50000, 'first_date': '2020-01-01', 'latest_date': '2026-10-01', 'connected': False}]}
+        def get_setting(self, key, default=None):
+            return 'true' if key == 'onboarding_complete' else default
+        def get_category_rules(self):
+            return []
+        def get_all(self):
+            raise AssertionError('Navigation must not load all transactions')
+        def get_filtered(self, filters=None):
+            raise AssertionError('This page must not load an unbounded history')
+        def get_page(self, filters=None, *, limit=200, after=None):
+            self.pages += 1
+            assert limit == 200
+            rows = [Transaction(id=f'row:{index}', date=date(2026,10,1), description=f'Store {index}', amount='-1.00',
+                                category='Dining', account_name='Checking', account_id=UUID(self.account_id)) for index in range(200)]
+            return {'rows': rows, 'count': 50000, 'next_cursor': {'date': '2026-10-01', 'id': rows[-1].id}}
+        def export_backup(self):
+            self.exports += 1
+            return '{}'
+
+    repo = ReadRepo()
+    monkeypatch.setenv('FINANCEBUDDY_ENV', 'development')
+    monkeypatch.setattr(SupabaseConfig, 'from_sources', classmethod(lambda cls, secrets: SupabaseConfig('https://test.supabase.co', 'test')))
+    monkeypatch.setattr(SupabaseAuth, 'get_user', lambda self, token: {'id': 'alice', 'email': 'alice@example.com', 'email_confirmed_at': '2026-09-01'})
+    monkeypatch.setattr(cloud_repos, 'SupabaseTransactionRepository', lambda client, user_id: repo)
+    monkeypatch.setattr(PlaidConfig, 'from_sources', classmethod(lambda cls, secrets: PlaidConfig('', '')))
+    app = AppTest.from_file(Path(__file__).parents[1] / 'app.py', default_timeout=30)
+    app.session_state['supabase_session'] = {'access_token': 'test', 'refresh_token': 'test', 'expires_at': time.time() + 3600}
+    app.session_state['session_owner'] = 'alice'
+    app.session_state['nav_page'] = 'Accounts'
+    app.session_state['accounts_view'] = 'Saved accounts'
+    app.run()
+    assert not app.exception and repo.pages == 0
+    app.radio(key='nav_page').set_value('Settings').run()
+    assert not app.exception and repo.exports == 0
+    next(button for button in app.button if button.label == 'Prepare full JSON backup').click().run()
+    assert not app.exception and repo.exports == 1
+    app.radio(key='nav_page').set_value('Transactions').run()
+    assert not app.exception and repo.pages == 1
+    assert len(app.dataframe[0].value) == 200

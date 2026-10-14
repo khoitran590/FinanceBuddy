@@ -5,7 +5,10 @@ import html
 import json
 import time
 import uuid
-from datetime import date
+from datetime import date, timedelta
+from decimal import Decimal
+from src.domain.money import money
+from src.services.data_service import DataService
 
 import pandas as pd
 import streamlit as st
@@ -361,15 +364,14 @@ bind_session_owner(st.session_state, user_id)
 st.session_state.last_activity_at = time.time()
 
 data_client = SupabaseDataClient(supabase_config, session["access_token"])
+data_client.pending_operation_ids = st.session_state.setdefault("pending_operation_ids", {})
 repo = SupabaseTransactionRepository(data_client, user_id)
+data_service = DataService(repo)
 plaid_repo = SupabasePlaidRepository(data_client, user_id)
 
 
 def apply_custom_rules(transactions):
-    rules = repo.get_category_rules()
-    for transaction in transactions:
-        transaction.category = categorize_with_custom_rules(transaction.description, rules)
-    return transactions
+    return data_service.categorize(transactions)
 
 
 def parse_statement(upload, account_name: str, account_type: str, **options):
@@ -665,7 +667,7 @@ def load_balances() -> tuple[list[dict], list[dict]]:
     except SupabaseError:
         return [], []
     try:
-        history = plaid_repo.get_balance_history()
+        history = plaid_repo.get_balance_history(since=date.today() - timedelta(days=366))
     except SupabaseError:
         history = []
     return accounts, history
@@ -1308,6 +1310,7 @@ def render_overview_balances(accounts: list[dict], history: list[dict], all_tran
             ["Balance", "Limit"],
             column_config={"Utilization (%)": st.column_config.NumberColumn(format="%.0f%%")},
         )
+    st.caption("History uses recorded USD balances, including retained snapshots from disconnected accounts. It carries each account’s last known balance forward.")
     trend = AnalyticsService.net_worth_history(history)
     if len(trend) >= 2:
         st.plotly_chart(make_net_worth_chart(trend), width="stretch")
@@ -1330,9 +1333,11 @@ def render_card_payment_fix(all_transactions) -> None:
         "Credit Card Payments stops them from being counted as spending on top of the card purchases."
     )
     if st.button("Move them to Credit Card Payments", key="fix_card_payments"):
-        for item in candidates:
-            repo.update_category(item.id, "Credit Card Payments")
-        st.rerun()
+        try:
+            repo.correct_categories([item.id for item in candidates], "Credit Card Payments")
+            st.rerun()
+        except (ValueError, SupabaseError):
+            st.error("Couldn't confirm the category changes. Retry to recover the saved result.")
 
 
 def render_overview(transactions, view: dict):
@@ -1367,25 +1372,24 @@ def render_overview(transactions, view: dict):
     # range, so they use all dates that match the other filters.
     history = counted(view["history_transactions"])
 
-    categories = AnalyticsService.category_summary(analysis)
-    balance_accounts, balance_history = load_balances()
-    has_balances = any(account.get("current_balance") is not None for account in balance_accounts)
-    labels = ["Summary", "Trends", "Habits", "Recurring & income"] + (["Balances"] if has_balances else [])
-    tabs = st.tabs(labels)
-    with tabs[0], st.container(key="overview_summary"):
-        render_overview_summary(
-            analysis, categories, history, view["start_date"], view["end_date"],
-            remaining, view["all_transactions"],
-        )
-    with tabs[1]:
+    categories = view["summary"]["categories"]
+    labels = ["Summary", "Trends", "Habits", "Recurring & income", "Balances"]
+    selected = view_switcher("Overview view", labels, "overview_view")
+    if selected == "Summary":
+        with st.container(key="overview_summary"):
+            render_overview_summary(analysis, categories, history, view["start_date"], view["end_date"], remaining, view["all_transactions"])
+    elif selected == "Trends":
         render_overview_trends(analysis, view["start_date"], view["end_date"])
-    with tabs[2]:
+    elif selected == "Habits":
         render_overview_habits(analysis, view["start_date"], view["end_date"])
-    with tabs[3]:
+    elif selected == "Recurring & income":
         render_overview_recurring(history)
-    if has_balances:
-        with tabs[4]:
+    else:
+        balance_accounts, balance_history = load_balances()
+        if balance_accounts:
             render_overview_balances(balance_accounts, balance_history, view["all_transactions"])
+        else:
+            st.info("Connect a bank to see USD balances and net worth history.")
 
 
 def _dismiss_transaction_editor() -> None:
@@ -1435,21 +1439,12 @@ def render_transaction_editor(transactions) -> None:
             st.error("Enter a merchant name or phrase, or uncheck the option to update matching saved transactions.")
         else:
             try:
-                repo.update_category(selected_id, new_category)
-            except SupabaseError:
-                st.error("Couldn't confirm the category save. Your choices are still here; try Save category again.")
-            else:
-                try:
-                    if rule_keyword.strip():
-                        repo.upsert_category_rule(CategoryRule(keyword=rule_keyword.strip(), category=new_category))
-                        if apply_similar:
-                            repo.apply_category_rule(rule_keyword.strip(), new_category)
-                except SupabaseError:
-                    st.warning("The category was saved, but the merchant rule could not be completed. Your choices are still here; try Save category again to finish, or Cancel to close.")
-                else:
-                    st.toast("Category saved." if not apply_similar else "Category saved and matching transactions updated.")
-                    st.session_state.transaction_editor_open = False
-                    st.rerun()
+                data_service.correct_category(selected_id, new_category, rule_keyword, apply_similar)
+                st.toast("Category saved." if not apply_similar else "Category saved and matching transactions updated.")
+                st.session_state.transaction_editor_open = False
+                st.rerun()
+            except (ValueError, SupabaseError):
+                st.error("Couldn't confirm the category save. Your choices are still here; retry to recover its saved result.")
 
     if st.button("Cancel", width="stretch"):
         st.session_state.transaction_editor_open = False
@@ -1462,7 +1457,15 @@ def _show_all_transactions() -> None:
 
 def render_transactions(transactions):
     if not transactions:
-        st.info("No transactions match the current filters.")
+        view = st.session_state.get('tx_view', 'All')
+        if view in ('Pending', 'Needs a category'):
+            st.success('Nothing is pending among transactions matching your filters.' if view == 'Pending' else 'All transactions matching your filters have a category.')
+            st.button('View all transactions', key='tx_empty_all', on_click=_show_all_transactions)
+        else:
+            st.info("No transactions match the current filters.")
+        if len(st.session_state.get("transaction_cursors", [None])) > 1 and st.button("Back to first page"):
+            st.session_state.transaction_cursors = [None]
+            st.rerun()
         st.button("Reset filters", key="transactions_empty_reset", on_click=reset_dashboard_filters)
         return
 
@@ -1480,17 +1483,21 @@ def render_transactions(transactions):
     view_col, export_col = st.container(key="tx_toolbar").columns([3, 1], vertical_alignment="center")
     with view_col:
         view = view_switcher(
-            "Show", list(views), "tx_view", format_func=lambda name: f"{name} ({len(views[name]):,})"
+            "Show", list(views), "tx_view", format_func=lambda name: name
         )
-    export_col.download_button(
-        "Export CSV",
-        transactions_to_csv(transactions),
-        file_name="financebuddy-transactions.csv",
-        mime="text/csv",
-        icon=":material/download:",
-        width="stretch",
-        help="Download every transaction the filters above include.",
-    )
+    if export_col.button("Prepare CSV export", icon=":material/download:", width="stretch"):
+        st.session_state.prepared_csv = transactions_to_csv(repo.get_filtered(st.session_state.transaction_filters))
+        st.session_state.prepared_csv_query = st.session_state.transaction_query
+    if st.session_state.get("prepared_csv_query") == st.session_state.get("transaction_query") and st.session_state.get("prepared_csv"):
+        st.download_button("Download CSV", st.session_state.prepared_csv, file_name="financebuddy-transactions.csv", mime="text/csv")
+    before, after, status = st.columns([1, 1, 3])
+    if before.button("Previous page", disabled=len(st.session_state.transaction_cursors) == 1):
+        st.session_state.transaction_cursors.pop()
+        st.rerun()
+    if after.button("Next page", disabled=st.session_state.transaction_next_cursor is None):
+        st.session_state.transaction_cursors.append(st.session_state.transaction_next_cursor)
+        st.rerun()
+    status.caption(f"Page {len(st.session_state.transaction_cursors)} · up to 200 transactions per page. Duplicate suggestions use this page.")
     shown = views[view]
     if not shown:
         st.success(
@@ -1552,12 +1559,12 @@ def render_transactions(transactions):
                 amount_one = st.number_input(
                     "First amount",
                     min_value=0.01,
-                    max_value=max(float(abs(split_item.amount) - 0.01), 0.01),
+                    max_value=max(float(abs(split_item.amount) - Decimal("0.01")), 0.01),
                     value=float(round(abs(split_item.amount) / 2, 2)),
                     step=0.01,
                 )
                 category_two = st.selectbox("Second category", CATEGORIES, key="split_cat_2")
-                amount_two = round(abs(split_item.amount) - amount_one, 2)
+                amount_two = abs(split_item.amount) - money(amount_one)
                 st.caption(f"Second amount: {format_currency(amount_two)}")
                 split_submitted = st.form_submit_button(
                     "Split transaction",
@@ -1571,7 +1578,7 @@ def render_transactions(transactions):
                     st.success("Transaction split successfully.")
                     st.rerun()
                 except SupabaseError:
-                    st.error("The split could not be saved. The original transaction is unchanged; refresh and try again.")
+                    st.error("The split response could not be confirmed. Retry to recover its saved result.")
         else:
             st.caption("No expenses are available to split.")
 
@@ -1686,7 +1693,7 @@ def render_goals(transactions) -> None:
     goals = repo.get_goals()
     today = date.today()
     average_savings = AnalyticsService.average_monthly_savings(transactions)
-    required_total = 0.0
+    required_total = Decimal(0)
     for goal in goals:
         label = goal.name
         if goal.target_date:
@@ -1766,7 +1773,7 @@ def render_goals(transactions) -> None:
                 "Update progress",
                 help="Save the latest amount accumulated toward this goal.",
             ):
-                repo.save_goal(goal.model_copy(update={"current_amount": new_current}))
+                repo.save_goal(goal.model_copy(update={"current_amount": money(new_current)}))
                 st.rerun()
             confirm_goal = st.checkbox("I understand this removes the selected goal")
             if st.button(
@@ -1903,10 +1910,7 @@ def render_bank_connections() -> None:
         st.error(f"Plaid setup is incomplete: {error}")
         return
 
-    client_user_id = repo.get_setting("plaid_client_user_id")
-    if not client_user_id:
-        client_user_id = str(uuid.uuid4())
-        repo.set_setting("plaid_client_user_id", client_user_id)
+    client_user_id = user_id
 
     items = plaid_repo.get_items()
     if items:
@@ -1919,7 +1923,10 @@ def render_bank_connections() -> None:
                 heading.caption(f"{account_count} account(s) · Last sync: {last_sync}")
                 if item.needs_reconciliation:
                     st.info("Bank history needs to be reconciled after a restore or account replacement. Sync transactions to refresh the full available history.")
-                if item.status == "error":
+                if item.status == "disconnecting":
+                    status.warning("Disconnect pending")
+                    st.info("Finish this disconnect to confirm bank access has been revoked. The saved removal choice will be used.")
+                elif item.status == "error":
                     status.error("Needs attention")
                     st.warning("Reconnect this institution to continue syncing.")
                 else:
@@ -1929,6 +1936,7 @@ def render_bank_connections() -> None:
                 if sync_col.button(
                     "Sync transactions",
                     key=f"sync_{item.item_id}",
+                    disabled=item.status == "disconnecting",
                     type="primary",
                     width="stretch",
                     help="Fetch transactions added, changed, or removed since the last successful sync.",
@@ -1955,6 +1963,7 @@ def render_bank_connections() -> None:
                 if repair_col.button(
                     "Update connection",
                     key=f"repair_{item.item_id}",
+                    disabled=item.status == "disconnecting",
                     width="stretch",
                     help="Reopen Plaid to repair expired credentials or institution access.",
                 ):
@@ -1971,6 +1980,8 @@ def render_bank_connections() -> None:
                     remove_transactions = st.checkbox(
                         "Also remove imported transactions from these connected accounts",
                         key=f"remove_tx_{item.item_id}",
+                        value=item.disconnect_remove_transactions,
+                        disabled=item.status == "disconnecting",
                     )
                     confirmed = st.checkbox(
                         "I understand this revokes FinanceBuddy's Plaid access",
@@ -1983,7 +1994,7 @@ def render_bank_connections() -> None:
                         help="Disconnect this bank and remove its saved connection. Delete its transactions only if you select that option above.",
                     ):
                         try:
-                            deleted = service.remove_item(item.item_id, remove_transactions)
+                            deleted = service.remove_item(item.item_id, item.disconnect_remove_transactions if item.status == "disconnecting" else remove_transactions)
                             st.session_state.plaid_notice = (
                                 f"Disconnected {item.institution_name}. Removed {deleted} transaction(s)."
                             )
@@ -2066,7 +2077,16 @@ def render_import_statement() -> None:
         on_change=sync_import_account_name,
         help="Checking and credit-card statements use different sign conventions and dashboard metrics.",
     )
+    saved_accounts = catalog["accounts"]
+    saved_lookup = {row["id"]: row for row in saved_accounts}
+    destination = st.selectbox("Saved account (optional)", [None] + list(saved_lookup),
+                               format_func=lambda identifier: "Create or match by name" if identifier is None else f'{saved_lookup[identifier]["name"]} · {saved_lookup[identifier].get("institution_name") or saved_lookup[identifier]["account_type"]} · {identifier[:8]}')
     account_name = st.text_input("Account name", key="import_account_name")
+    if destination:
+        account_name, account_type = saved_lookup[destination]["name"], saved_lookup[destination]["account_type"]
+        st.caption(f"Import destination: {account_name} · {account_type}. USD amounts only.")
+    else:
+        st.caption("USD amounts only. Select a saved account when account names overlap.")
     st.markdown("#### 2. Add a statement")
     upload = st.file_uploader(
         "CSV, TXT, or text-based PDF",
@@ -2077,6 +2097,7 @@ def render_import_statement() -> None:
     if upload:
         options = statement_format_options(account_type, "statement_import")
         parsed, metrics = parse_statement(upload, account_name.strip(), account_type, **options)
+        parsed = data_service.bind_statement_account(parsed, destination)
         if not metrics.is_valid:
             st.error("This statement could not be imported safely.")
             for error in metrics.errors:
@@ -2093,7 +2114,7 @@ def render_import_statement() -> None:
             try:
                 import_plan = repo.preview_statement_import(parsed, keep_matching=keep_matching)
                 duplicates = import_plan["matched"]
-            except ValueError as error:
+            except (ValueError, SupabaseError) as error:
                 conflict = str(error)
                 duplicates = 0
                 st.error(conflict)
@@ -2139,10 +2160,10 @@ def render_import_statement() -> None:
                 "I reviewed the account, statement type, period, and preview"
             )
             if mode == "Replace this account":
-                if repo.is_connected_account(account_name.strip()):
+                if repo.is_connected_account(account_name.strip(), destination):
                     st.info("This account is connected to a bank. Use Append to reconcile a statement with its saved transactions, or disconnect the bank before replacing its history.")
                     return
-                existing_count = sum(item.account_name == account_name.strip() for item in repo.get_all())
+                existing_count = sum(row["transactions"] for row in catalog["accounts"] if (row["id"] == destination if destination else row["name"] == account_name.strip()))
                 st.warning(f"This replaces {existing_count} saved transaction(s) for “{account_name}” with {len(parsed)} parsed row(s). Replacement cannot be undone. If this account is connected to a bank, its next sync will reconcile the full available bank history.")
                 st.download_button(
                     "Download backup before replacing",
@@ -2159,14 +2180,14 @@ def render_import_statement() -> None:
                 try:
                     st.session_state.import_save_pending = True
                     if mode == "Append new transactions":
-                        result = repo.append_statement(parsed, keep_matching=keep_matching)
+                        result = data_service.import_statement(parsed, keep_matching=keep_matching)
                         inserted = result["inserted"]
-                        st.session_state.pop("undo_import_rows", None)
+                        st.session_state.pop("undo_import_batch_id", None)
                         if result["inserted_rows"]:
-                            st.session_state.undo_import_rows = result["inserted_rows"]
+                            st.session_state.undo_import_batch_id = result["batch_id"]
                     else:
                         inserted = repo.replace_account(account_name.strip(), parsed)
-                        st.session_state.pop("undo_import_rows", None)
+                        st.session_state.pop("undo_import_batch_id", None)
                     st.session_state.import_save_pending = False
                     st.session_state.pop("import_undo_notice", None)
                     st.session_state.import_receipt = {
@@ -2175,42 +2196,61 @@ def render_import_statement() -> None:
                     st.rerun()
                 except (ValueError, SupabaseError):
                     st.error("The statement save could not be confirmed. Review the preview and retry; the same file will not create extra copies.")
-    if st.session_state.get("undo_import_rows"):
+    if st.session_state.get("undo_import_batch_id"):
         if st.button(
             "Undo last import",
             disabled=bool(st.session_state.get("import_save_pending")),
             help="Remove only the new rows from the latest appended statement, if none have changed since import.",
         ):
             try:
-                removed = repo.undo_append(st.session_state.undo_import_rows)
-                st.session_state.pop("undo_import_rows", None)
+                removed = data_service.undo_import(st.session_state.undo_import_batch_id)
+                st.session_state.pop("undo_import_batch_id", None)
                 st.session_state.pop("import_receipt", None)
                 st.session_state.import_undo_notice = f"Removed {removed} imported transaction(s)."
                 st.rerun()
             except (ValueError, SupabaseError):
-                st.error("Some imported transactions changed. Nothing was removed; review your history before retrying.")
+                st.error("This import changed or its response could not be confirmed. Refresh and review the receipt before retrying.")
+
+    with st.expander("Recent import receipts"):
+        batches = repo.get_import_batches()
+        available = [row for row in batches if row['inserted'] and not row['undone']]
+        if available:
+            receipt_by_id = {row['id']: row for row in available}
+            selected_batch = st.selectbox('Import to undo', list(receipt_by_id), format_func=lambda identifier: f"{receipt_by_id[identifier]['created_at']} · {receipt_by_id[identifier]['inserted']} new transactions")
+            if st.button('Undo selected import'):
+                try:
+                    count = data_service.undo_import(selected_batch)
+                    st.session_state.import_undo_notice = f'Removed {count} imported transaction(s).'
+                    st.rerun()
+                except (ValueError, SupabaseError):
+                    st.error('This import has changed or its response could not be confirmed. Refresh and review its transactions before retrying.')
+        else:
+            st.caption('No imports are available to undo.')
 
 
-def render_backup_restore(all_transactions) -> None:
+def render_backup_restore(catalog) -> None:
     st.header("Download or restore your data")
-    st.caption("Downloaded backups are unencrypted and contain financial records. Store them privately. Bank connections and settings are not included.")
+    st.caption("Downloaded backups are unencrypted and contain financial records. Store them privately. USD transactions, account metadata, settings, and balance history are included. Bank access credentials are excluded.")
     if st.session_state.get("restore_receipt"):
         st.success(st.session_state.restore_receipt)
-    st.download_button(
-        "Download full JSON backup",
-        repo.export_backup(),
-        file_name="financebuddy-backup.json",
-        mime="application/json",
-        help="Download transactions, budgets, goals, and category rules in one portable FinanceBuddy backup.",
-    )
+    if st.button("Prepare full JSON backup"):
+        try:
+            st.session_state.prepared_backup = repo.export_backup()
+            st.session_state.prepared_backup_at = time.strftime('%Y-%m-%d %H:%M:%S')
+        except (ValueError, SupabaseError):
+            st.error("Backup preparation failed or the snapshot exceeds restore limits (10 MB, 50,000 records per collection). Your data is still saved.")
+    if st.session_state.get("prepared_backup"):
+        st.caption(f"Snapshot prepared at {st.session_state.prepared_backup_at}. Prepare again to include later changes.")
+        st.download_button("Download full JSON backup", st.session_state.prepared_backup,
+                           file_name="financebuddy-backup.json", mime="application/json")
     restore = st.file_uploader("Restore a FinanceBuddy JSON backup", type=["json"])
     if restore:
         try:
             preview = read_backup(restore.getvalue())
-            st.warning("Restoring replaces the four collections below for your account. Bank connections and settings stay in place. Connected banks will need a full sync to reconcile restored history with the bank's current records.")
+            st.warning("Restoring replaces the collections below. Version 3 also restores settings and balance history. Bank connections stay in place. Connected banks will need a full sync to reconcile restored history with the bank's current records.")
             st.dataframe(
                 pd.DataFrame([
-                    {"Collection": "Transactions", "Saved now": len({item.source_transaction_id or item.id for item in all_transactions}), "In backup": len(preview["transactions"])},
+                    {"Collection": "Transactions", "Saved now": catalog["count"], "In backup": len(preview["transactions"])},
                     {"Collection": "Budgets", "Saved now": len(repo.get_budgets()), "In backup": len(preview["budgets"])},
                     {"Collection": "Savings goals", "Saved now": len(repo.get_goals()), "In backup": len(preview["goals"])},
                     {"Collection": "Category rules", "Saved now": len(repo.get_category_rules()), "In backup": len(preview["category_rules"])},
@@ -2218,13 +2258,15 @@ def render_backup_restore(all_transactions) -> None:
                 hide_index=True,
                 width="stretch",
             )
-            confirm_restore = st.checkbox("I reviewed the counts and want to replace these four collections")
+            if preview['version'] == 3:
+                st.caption(f"Also restores {len(preview['accounts'])} account records, {len(preview['settings'])} settings, and {len(preview['balance_snapshots'])} USD balance snapshots.")
+            confirm_restore = st.checkbox("I reviewed the counts and want to restore this backup")
             if st.button(
                 "Restore backup",
                 disabled=not confirm_restore,
-                help="Replace transactions, budgets, savings goals, and category rules. Bank connections and settings are kept.",
+                help="Replace the portable collections in this backup. Version 3 includes settings and balance history; bank connections remain active.",
             ):
-                result = repo.restore_backup(restore.getvalue())
+                result = data_service.restore(restore.getvalue())
                 st.session_state.restore_receipt = (
                     f"Restore complete: {result['transactions']} transactions, "
                     f"{result['budgets']} budgets, {result['goals']} goals, and "
@@ -2235,38 +2277,26 @@ def render_backup_restore(all_transactions) -> None:
             st.error("The backup could not be restored. Check its format and review your saved data before retrying.")
 
 
-def render_saved_accounts(all_transactions) -> None:
+def render_saved_accounts(catalog) -> None:
     st.header("Saved accounts")
-    accounts = sorted({item.account_name for item in all_transactions})
-    if accounts:
-        account_rows = []
-        for account in accounts:
-            items = [item for item in all_transactions if item.account_name == account]
-            account_rows.append(
-                {
-                    "Account": account,
-                    "Type": ", ".join(sorted({item.account_type for item in items})),
-                    "Transactions": len(items),
-                    "First date": min(item.date for item in items),
-                    "Latest date": max(item.date for item in items),
-                }
-            )
-        st.dataframe(pd.DataFrame(account_rows), width="stretch", hide_index=True)
-        remove_account = st.selectbox("Account to remove", accounts)
-        typed_name = st.text_input(
-            f"Type {remove_account} to confirm permanent removal",
-            key="delete_account_confirmation",
-        )
-        if st.button(
-            "Remove account",
-            disabled=typed_name != remove_account,
-            help="Delete saved transactions for this account. If its bank connection stays active, the next sync will restore the bank's available history.",
-        ):
-            deleted = repo.delete_account(remove_account)
-            st.success(f"Removed {deleted} transaction(s) from {remove_account}.")
-            st.rerun()
-    else:
+    accounts = {row["id"]: row for row in catalog["accounts"]}
+    if not accounts:
         st.info("No saved accounts yet.")
+        return
+    st.dataframe(pd.DataFrame([{"Account": row['name'], "Type": row['account_type'], "Transactions": row['transactions'],
+                                "First date": row['first_date'], "Latest date": row['latest_date'], "Institution": row.get('institution_name') or "Statement", "ID": identifier[:8]} for identifier,row in accounts.items()]),
+                 width="stretch", hide_index=True)
+    selected_id = st.selectbox("Account to remove", list(accounts), format_func=lambda identifier: f"{accounts[identifier]['name']} · {accounts[identifier].get('institution_name') or accounts[identifier]['account_type']} · {identifier[:8]}")
+    selected = accounts[selected_id]
+    typed_name = st.text_input(f"Type {selected['name']} to confirm permanent removal", key="delete_account_confirmation")
+    if st.button("Remove account", disabled=typed_name != selected['name'],
+                 help="Delete this account's saved transactions. An active connection will reconcile its bank history on the next sync."):
+        try:
+            deleted = repo.delete_account(selected_id)
+            st.success(f"Removed {deleted} transaction(s) from {selected['name']}.")
+            st.rerun()
+        except (ValueError, SupabaseError):
+            st.error("The account removal response could not be confirmed. Retry to recover its saved result.")
 
 
 def render_category_rules() -> None:
@@ -2274,7 +2304,7 @@ def render_category_rules() -> None:
     rules = repo.get_category_rules()
     if rules:
         st.dataframe(
-            pd.DataFrame([rule.model_dump() for rule in rules]).rename(
+            pd.DataFrame([rule.model_dump(exclude={"version"}) for rule in rules]).rename(
                 columns={"keyword": "Keyword", "category": "Category"}
             ),
             width="stretch",
@@ -2291,7 +2321,7 @@ def render_category_rules() -> None:
         st.info("Rules saved from category corrections will appear here.")
 
 
-def render_accounts(all_transactions) -> None:
+def render_accounts(catalog) -> None:
     render_page_header("Accounts", "Connect a bank, import a statement, or review saved accounts.")
     view = view_switcher(
         "Accounts view", ["Bank connections", "Import statement", "Saved accounts"], "accounts_view"
@@ -2301,14 +2331,14 @@ def render_accounts(all_transactions) -> None:
     elif view == "Import statement":
         render_import_statement()
     else:
-        render_saved_accounts(all_transactions)
+        render_saved_accounts(catalog)
 
 
-def render_settings(all_transactions) -> None:
+def render_settings(catalog) -> None:
     render_page_header("Settings", "Back up or restore your data, and review category rules.")
     view = view_switcher("Settings view", ["Backup & restore", "Category rules"], "settings_view")
     if view == "Backup & restore":
-        render_backup_restore(all_transactions)
+        render_backup_restore(catalog)
     else:
         render_category_rules()
 
@@ -2345,15 +2375,16 @@ def _selection_label(noun: str, selected: list[str], options: list[str]) -> str:
     return f"{len(selected)} of {len(options)} {noun}"
 
 
-def render_filter_bar(all_transactions) -> dict:
+def render_filter_bar(catalog) -> dict:
     """The compact filter bar shared by Overview and Transactions."""
-    min_date = min(item.date for item in all_transactions)
-    max_date = max(item.date for item in all_transactions)
-    account_options = sorted({item.account_name for item in all_transactions})
-    category_options = sorted({item.category for item in all_transactions})
+    min_date = date.fromisoformat(catalog["min_date"])
+    max_date = date.fromisoformat(catalog["max_date"])
+    account_labels = {row["id"]: (row["name"] if sum(other["name"] == row["name"] for other in catalog["accounts"]) == 1 else f'{row["name"]} · {row.get("institution_name") or row["account_type"]} · {row["id"][:8]}') for row in catalog["accounts"]}
+    account_options = sorted(account_labels.values())
+    category_options = catalog["categories"]
 
     if st.session_state.get("dashboard_date_preset") not in DATE_PRESETS:
-        st.session_state.dashboard_date_preset = "All time"
+        st.session_state.dashboard_date_preset = "Last 3 months"
     stored_dates = st.session_state.get("dashboard_dates")
     # Keep deliberate empty ranges; repair malformed or reversed dates only.
     if (
@@ -2362,7 +2393,7 @@ def render_filter_bar(all_transactions) -> dict:
         or any(type(value) is not date for value in stored_dates)
         or stored_dates[0] > stored_dates[1]
     ):
-        st.session_state.dashboard_dates = (min_date, max_date)
+        st.session_state.dashboard_dates = AnalyticsService.preset_range(st.session_state.dashboard_date_preset, min_date, max_date)
     st.session_state.setdefault("dashboard_type", "Both")
     st.session_state.setdefault("dashboard_minimum_amount", 0.0)
     st.session_state.setdefault("dashboard_include_transfers", False)
@@ -2466,11 +2497,23 @@ def render_filter_bar(all_transactions) -> dict:
                 st.caption("Filters apply to Overview and Transactions. Budgets in Plan always use all spending.")
 
             start_date, end_date = st.session_state.dashboard_dates
-            selected_types = TRANSACTION_TYPES[transaction_type]
-            filter_arguments = (selected_accounts, selected_categories, selected_types, search, minimum_amount)
-            filtered = AnalyticsService.filter_transactions(
-                all_transactions, start_date, end_date, *filter_arguments
-            )
+            query_filters = {"start": start_date.isoformat(), "end": end_date.isoformat(),
+                             "accounts": [identifier for identifier, label in account_labels.items() if label in selected_accounts],
+                             "categories": selected_categories, "type": transaction_type,
+                             "search": search.strip(), "minimum": str(money(minimum_amount))}
+            if overview_filters:
+                filtered = repo.get_filtered(query_filters)
+                filtered_count = len(filtered)
+            else:
+                query_filters["view"] = st.session_state.get("tx_view", "All")
+                query_key = json.dumps(query_filters, sort_keys=True)
+                if st.session_state.get("transaction_query") != query_key:
+                    st.session_state.transaction_query = query_key
+                    st.session_state.transaction_cursors = [None]
+                page_data = repo.get_page(query_filters, after=st.session_state.transaction_cursors[-1])
+                filtered, filtered_count = page_data["rows"], page_data["count"]
+                st.session_state.transaction_next_cursor = page_data["next_cursor"]
+                st.session_state.transaction_filters = query_filters
 
             chips = []
             if (start_date, end_date) != (min_date, max_date):
@@ -2500,7 +2543,7 @@ def render_filter_bar(all_transactions) -> dict:
                 else "Transfers & card payments not counted"
             )
             count_col, chips_col = st.columns([1.5, 2.5], vertical_alignment="center")
-            count_col.caption(f"Showing {len(filtered):,} of {len(all_transactions):,} saved transactions")
+            count_col.caption(f"Showing {filtered_count:,} of {catalog["display_count"]:,} saved transactions")
             chips_col.markdown(
                 '<div class="fb-chips">'
                 + "".join(f'<span class="fb-chip">{html.escape(chip)}</span>' for chip in chips + [transfer_chip])
@@ -2508,21 +2551,19 @@ def render_filter_bar(all_transactions) -> dict:
                 unsafe_allow_html=True,
             )
     if not overview_filters:
-        st.caption(f"Showing {len(filtered):,} of {len(all_transactions):,} saved transactions")
+        st.caption(f"Showing {filtered_count:,} of {catalog["display_count"]:,} saved transactions")
     previous_range = AnalyticsService.previous_period(start_date, end_date)
+    history_start = max(min_date, max_date - timedelta(days=366))
+    history_filters = {**query_filters, "start": history_start.isoformat(), "end": max_date.isoformat()}
+    history = repo.get_filtered(history_filters) if overview_filters and st.session_state.get("overview_view", "Summary") in ("Summary", "Recurring & income", "Balances") else []
+    if overview_filters:
+        st.caption("Recurring charges, income cadence, and forecasts use up to 12 months of matching history.")
     return {
-        "filtered": filtered,
-        "start_date": start_date,
-        "end_date": end_date,
+        "filtered": filtered, "start_date": start_date, "end_date": end_date,
         "previous_range": previous_range,
-        "previous_transactions": AnalyticsService.filter_transactions(
-            all_transactions, *previous_range, *filter_arguments
-        ),
-        "include_transfers": include_transfers,
-        "all_transactions": all_transactions,
-        "history_transactions": AnalyticsService.filter_transactions(
-            all_transactions, min_date, max_date, *filter_arguments
-        ),
+        "previous_transactions": repo.get_filtered({**query_filters, "start": previous_range[0].isoformat(), "end": previous_range[1].isoformat()}) if overview_filters else [],
+        "include_transfers": include_transfers, "all_transactions": history, "history_transactions": history,
+        "summary": repo.get_summary({**query_filters, "include_transfers": include_transfers}) if overview_filters else None,
     }
 
 
@@ -2533,13 +2574,13 @@ PAGE_INTROS = {
 }
 
 try:
-    all_transactions = repo.get_all()
+    catalog = repo.get_catalog()
 except SupabaseError:
     st.error("Couldn't load your transactions. Check your connection and try again.")
     if st.button("Try again", key="retry_transactions"):
         st.rerun()
     st.stop()
-needs_review = sum(1 for item in all_transactions if item.category == "Uncategorized")
+needs_review = catalog["needs_review"]
 user_metadata = user.get("user_metadata") or {}
 account_label = str(
     user_metadata.get("full_name")
@@ -2616,19 +2657,26 @@ if show_onboarding:
 
 if page in ("Overview", "Transactions"):
     render_page_header(page, PAGE_INTROS[page])
-    if not all_transactions:
+    if not catalog["count"]:
         render_start_actions()
     else:
-        overview_view = render_filter_bar(all_transactions)
-        if page == "Overview":
-            render_overview(overview_view["filtered"], overview_view)
-        else:
-            render_transactions(overview_view["filtered"])
+        try:
+            overview_view = render_filter_bar(catalog)
+            if page == "Overview":
+                render_overview(overview_view["filtered"], overview_view)
+            else:
+                render_transactions(overview_view["filtered"])
+        except SupabaseError:
+            st.error("Couldn't load the selected transactions. Check your connection and try again.")
+            if st.button("Try again", key="retry_filtered_transactions"):
+                st.rerun()
+
 elif page == "Plan":
-    render_plan(all_transactions)
+    plan_end = date.fromisoformat(catalog["max_date"]) if catalog["max_date"] else date.today()
+    render_plan(repo.get_filtered({"start": (plan_end - timedelta(days=366)).isoformat(), "end": plan_end.isoformat()}))
 elif page == "Compare":
     render_compare()
 elif page == "Accounts":
-    render_accounts(all_transactions)
+    render_accounts(catalog)
 else:
-    render_settings(all_transactions)
+    render_settings(catalog)

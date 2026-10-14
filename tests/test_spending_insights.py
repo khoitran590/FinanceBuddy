@@ -1,3 +1,4 @@
+from decimal import Decimal
 from datetime import date, timedelta
 
 import pytest
@@ -125,10 +126,10 @@ def test_recurring_detects_price_increase_and_variable_bills():
     recurring = {item["merchant"]: item for item in AnalyticsService.recurring_expenses(netflix + electric)}
 
     assert recurring["Netflix"]["price_change"] == 2.5
-    assert recurring["Netflix"]["previous_amount"] == 15.49
+    assert recurring["Netflix"]["previous_amount"] == Decimal("15.49")
     assert recurring["Netflix"]["price_changed_on"] == date(2026, 5, 5)
     assert recurring["Netflix"]["next_date"] == date(2026, 8, 5)
-    assert recurring["Netflix"]["annual_cost"] == pytest.approx(17.99 * 12)
+    assert recurring["Netflix"]["annual_cost"] == Decimal("215.88")
     # A rising electric bill stays one series, but a varying bill has no single "price".
     assert recurring["Con Edison"]["frequency"] == 7
     assert recurring["Con Edison"]["price_change"] == 0.0
@@ -145,7 +146,7 @@ def test_recurring_ignores_habits_and_finds_fixed_membership_among_purchases():
 
     recurring = AnalyticsService.recurring_expenses(coffee + amazon + prime)
 
-    assert [(item["merchant"], item["amount"]) for item in recurring] == [("Amazon", 14.99)]
+    assert [(item["merchant"], item["amount"]) for item in recurring] == [("Amazon", Decimal("14.99"))]
 
 
 def test_stopped_subscription_is_marked_inactive():
@@ -272,7 +273,7 @@ def test_goal_plan_reports_required_monthly_savings_and_projection():
     plan = AnalyticsService.goal_plan(goal, date(2026, 9, 1), average_monthly_savings=400.0)
 
     assert plan["remaining"] == 2000.0
-    assert plan["required_monthly"] == pytest.approx(2000.0 / (122 / 30.44))
+    assert float(plan["required_monthly"]) == pytest.approx(2000.0 / (122 / 30.44))
     assert plan["on_track"] is False
     assert plan["projected_date"] == date(2026, 9, 1) + timedelta(days=round(5 * 30.44))
     assert AnalyticsService.goal_plan(
@@ -288,7 +289,7 @@ def test_average_monthly_savings_uses_complete_months_without_transfers():
         + [tx("end", date(2026, 2, 28), -0.01)]
     )
 
-    assert AnalyticsService.average_monthly_savings(transactions) == pytest.approx(1999.995)
+    assert float(AnalyticsService.average_monthly_savings(transactions)) == pytest.approx(1999.995)
 
 
 def test_balance_overview_net_worth_utilization_and_history():

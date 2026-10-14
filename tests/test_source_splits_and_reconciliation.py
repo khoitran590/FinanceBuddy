@@ -279,5 +279,7 @@ def test_supabase_reads_canonical_records_but_projects_allocations_for_ui(tmp_pa
     repo = SupabaseTransactionRepository(client, "alice")
     assert len(repo.get_all()) == 2
     assert repo.get_existing_ids() == {"plaid:purchase"}
+    client.rpc.return_value = json.loads(local.export_backup())
     assert json.loads(repo.export_backup())["transactions"][0]["id"] == "plaid:purchase"
+    assert client.rpc.call_args.args[0] == "fb_export_backup"
     assert "allocations:transaction_allocations" in client.select.call_args_list[0].kwargs["select"]

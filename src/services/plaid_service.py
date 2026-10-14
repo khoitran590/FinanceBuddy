@@ -9,8 +9,10 @@ from datetime import date, datetime, timezone
 from typing import Any, Mapping, Optional
 
 from src.domain.models import Transaction
-from src.repositories.plaid_repo import PlaidItem, PlaidRepository
-from src.repositories.transaction_repo import TransactionRepository
+from src.domain.banking import PlaidItem
+from src.domain.ports import BankStore, TransactionStore
+from src.domain.money import money, require_usd
+from src.services.categorization import categorize
 from src.services.categorizer import auto_categorize
 
 
@@ -113,8 +115,8 @@ class PlaidService:
     def __init__(
         self,
         config: PlaidConfig,
-        plaid_repo: PlaidRepository,
-        transaction_repo: TransactionRepository,
+        plaid_repo: BankStore,
+        transaction_repo: TransactionStore,
         client: Any = None,
     ) -> None:
         config.validate()
@@ -197,6 +199,8 @@ class PlaidService:
         if not item:
             raise ValueError("Connected institution was not found.")
         access_token = self.cipher.decrypt(item.access_token)
+        if item.status == "disconnecting":
+            raise ValueError("Finish disconnecting this bank before syncing it.")
         starting_cursor = item.cursor
         cursor = starting_cursor
         added: list[dict] = []
@@ -243,7 +247,8 @@ class PlaidService:
         account_lookup = {
             account["account_id"]: account for account in self.plaid_repo.get_accounts(item_id)
         }
-        upserts = [self._to_transaction(value, account_lookup) for value in added + modified]
+        rules = self.transaction_repo.get_category_rules()
+        upserts = [categorize(self._to_transaction(value, account_lookup), rules) for value in added + modified]
         upserts = list({value.id: value.model_copy(update={"plaid_item_id": item_id})
                         for value in upserts}.values())
         removed_ids = [f"plaid:{value['transaction_id']}" for value in removed]
@@ -282,18 +287,18 @@ class PlaidService:
         item = self.plaid_repo.get_item(item_id)
         if not item:
             return 0
-        account_names = [
-            self._account_name(value) for value in self.plaid_repo.get_accounts(item_id)
-        ]
-        self.client.item_remove(
-            ItemRemoveRequest(access_token=self.cipher.decrypt(item.access_token))
-        )
-        deleted = 0
-        if remove_transactions:
-            for account_name in account_names:
-                deleted += self.transaction_repo.delete_account(account_name)
-        self.plaid_repo.delete_item(item_id)
-        return deleted
+        # Persist intent before contacting the provider. A failed or uncertain
+        # revocation leaves the encrypted credential available for a safe retry.
+        if not self.plaid_repo.begin_disconnect(item_id, remove_transactions):
+            return 0
+        try:
+            self.client.item_remove(
+                ItemRemoveRequest(access_token=self.cipher.decrypt(item.access_token))
+            )
+        except Exception as error:
+            if self._error_code(error) != "ITEM_NOT_FOUND":
+                raise
+        return self.plaid_repo.finish_disconnect(item_id)
 
     def update_link_token(self, item_id: str, client_user_id: str) -> str:
         item = self.plaid_repo.get_item(item_id)
@@ -322,7 +327,7 @@ class PlaidService:
     @staticmethod
     def _account_name(account: dict) -> str:
         label = account.get("official_name") or account.get("name") or "Connected account"
-        return f"{label} ••••{account['mask']}" if account.get("mask") else label
+        return (f"{label} ••••{account['mask']}" if account.get("mask") else label)[:256]
 
     @classmethod
     def _to_transaction(cls, value: dict, accounts: dict[str, dict]) -> Transaction:
@@ -344,7 +349,12 @@ class PlaidService:
             id=f"plaid:{value['transaction_id']}",
             date=transaction_date,
             description=description,
-            amount=-float(value.get("amount", 0.0)),
+            amount=-money(value.get("amount", 0)),
+            currency=require_usd(value.get("iso_currency_code") or account.get("iso_currency_code"), value.get("unofficial_currency_code")),
+            category_origin="provider" if cls._map_category(value) else "builtin",
+            provider_category=cls._map_category(value),
+            builtin_category=auto_categorize(description),
+            pending_transaction_id=(f"plaid:{value['pending_transaction_id']}" if value.get("pending_transaction_id") else None),
             category=category,
             account_name=cls._account_name(account),
             account_type=account_type,

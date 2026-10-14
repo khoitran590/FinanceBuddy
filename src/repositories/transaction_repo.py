@@ -1,11 +1,18 @@
 import json
 import math
+import hashlib
+from uuid import uuid4, uuid5, NAMESPACE_URL
+from datetime import datetime, timezone
 import sqlite3
+from decimal import Decimal
+from src.domain.money import money, rounded_money
 from datetime import date
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 from src.services.security import read_backup
+from src.services.backups import serialize_backup
+from src.services.categorization import categorize
 
 from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction, TransactionAllocation, StatementImportRow
 from src.services.imports import plan_statement_import, normalize_text
@@ -22,6 +29,7 @@ class TransactionRepository:
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
+        sqlite3.register_adapter(Decimal, str)
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
         connection.create_function("fb_import_normalize", 1, normalize_text, deterministic=True)
@@ -108,6 +116,45 @@ class TransactionRepository:
                     ON transactions(fb_import_normalize(account_name),fb_import_normalize(account_type),statement_reference)
                     WHERE statement_reference IS NOT NULL;
             """)
+            for column, kind in (
+                ('account_id', 'TEXT'), ('currency', "TEXT NOT NULL DEFAULT 'USD'"),
+                ('category_origin', "TEXT NOT NULL DEFAULT 'legacy'"), ('provider_category', 'TEXT'),
+                ('builtin_category', 'TEXT'), ('category_override', 'TEXT'), ('category_rule', 'TEXT'), ('category_rule_version', 'INTEGER'),
+                ('pending_transaction_id', 'TEXT'), ('revision', 'INTEGER NOT NULL DEFAULT 1'),
+                ('merchant_name', 'TEXT'), ('subcategory', 'TEXT'), ('payment_channel', 'TEXT'),
+                ('location', 'TEXT'), ('pending', 'INTEGER NOT NULL DEFAULT 0'),
+            ):
+                if column not in columns:
+                    connection.execute(f'ALTER TABLE transactions ADD COLUMN {column} {kind}')
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS data_operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,result TEXT NOT NULL,created_at TEXT NOT NULL,undone INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS revision_counter(value INTEGER NOT NULL);
+                INSERT INTO revision_counter SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM revision_counter);
+                CREATE TRIGGER IF NOT EXISTS transaction_revision_insert AFTER INSERT ON transactions BEGIN
+                    UPDATE revision_counter SET value=value+1;
+                    UPDATE transactions SET revision=(SELECT value FROM revision_counter) WHERE id=new.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS transaction_revision_update AFTER UPDATE ON transactions BEGIN
+                    UPDATE revision_counter SET value=value+1;
+                    UPDATE transactions SET revision=(SELECT value FROM revision_counter) WHERE id=new.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS import_row_revision_insert AFTER INSERT ON statement_import_rows BEGIN
+                    UPDATE transactions SET revision=revision WHERE id=new.transaction_id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS import_row_revision_update AFTER UPDATE ON statement_import_rows WHEN new.transaction_id<>old.transaction_id BEGIN
+                    UPDATE transactions SET revision=revision WHERE id=new.transaction_id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS allocation_revision_update AFTER UPDATE ON transaction_allocations BEGIN
+                    UPDATE transactions SET revision=revision WHERE id=new.transaction_id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS allocation_revision_insert AFTER INSERT ON transaction_allocations BEGIN
+                    UPDATE transactions SET revision=revision WHERE id=new.transaction_id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS allocation_revision_delete AFTER DELETE ON transaction_allocations BEGIN
+                    UPDATE transactions SET revision=revision WHERE id=old.transaction_id;
+                END;
+            """)
             self._recover_legacy_splits(connection)
 
     @staticmethod
@@ -180,6 +227,7 @@ class TransactionRepository:
             return 0
 
         with self._get_connection() as connection:
+            before = {row[0] for row in connection.execute("SELECT id FROM transactions")}
             cursor = connection.executemany(
                 """
                 INSERT OR IGNORE INTO transactions
@@ -188,7 +236,9 @@ class TransactionRepository:
                 """,
                 payload,
             )
-            return cursor.rowcount
+            count = cursor.rowcount
+            self._persist_metadata(connection, [item for item in transactions if item.id not in before])
+            return count
 
     def get_import_rows(self, file_id=None):
         with self._get_connection() as connection:
@@ -202,7 +252,7 @@ class TransactionRepository:
         return plan_statement_import(transactions, self.get_canonical_all(), self.get_import_rows(),
                                      keep_matching=keep_matching)
 
-    def is_connected_account(self, account_name):
+    def is_connected_account(self, account_name, account_id=None):
         with self._get_connection() as connection:
             if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='plaid_items'").fetchone():
                 return False
@@ -212,10 +262,19 @@ class TransactionRepository:
                     fb_import_normalize(coalesce(nullif(a.official_name,''),a.name) || CASE WHEN a.mask IS NULL OR a.mask='' THEN '' ELSE ' ••••'||a.mask END)=fb_import_normalize(?))
                 LIMIT 1""", (account_name, account_name)).fetchone())
 
-    def append_statement(self, transactions, *, keep_matching=False):
+    def append_statement(self, transactions, *, keep_matching=False, operation_id=None):
         items = list(transactions)
+        identifier = str(operation_id or uuid4())
+        fingerprint = hashlib.sha256(json.dumps([keep_matching, [item.model_dump(mode="json") for item in items]], sort_keys=True).encode()).hexdigest()
         with self._get_connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            receipt = connection.execute("SELECT * FROM data_operations WHERE id=?", (identifier,)).fetchone()
+            if receipt:
+                if receipt['fingerprint'] != fingerprint:
+                    raise ValueError('Operation ID reused with different intent.')
+                result = json.loads(receipt['result'])
+                result['inserted_rows'] = [Transaction.model_validate(row) for row in result['inserted_rows']]
+                return result
             # Read the planning snapshot and commit its exact inserted IDs under
             # one writer lock, so concurrent imports cannot create extra copies.
             existing = [Transaction(**dict(row)) for row in connection.execute("SELECT * FROM transactions")]
@@ -235,9 +294,15 @@ class TransactionRepository:
             for identifier, file_id, row in plan["provenance_added"]:
                 connection.execute("UPDATE transactions SET statement_file_id=?,statement_row=?,statement_match_bank=1 WHERE id=?",
                                    (file_id, row, identifier))
-            connection.executemany("INSERT OR REPLACE INTO statement_import_rows VALUES (?,?,?)", [
+            connection.executemany("INSERT INTO statement_import_rows VALUES (?,?,?) ON CONFLICT(file_id,row_number) DO UPDATE SET transaction_id=excluded.transaction_id WHERE statement_import_rows.transaction_id<>excluded.transaction_id", [
                 (row["file_id"],row["row_number"],row["transaction_id"]) for row in plan["mappings"]
             ])
+            self._persist_metadata(connection, plan['inserted_rows'])
+            plan['inserted_rows'] = [Transaction.model_validate(dict(connection.execute('SELECT * FROM transactions WHERE id=?', (item.id,)).fetchone())) for item in plan['inserted_rows']]
+            plan['batch_id'] = identifier
+            receipt = {**plan, 'inserted_rows': [item.model_dump(mode='json') for item in plan['inserted_rows']]}
+            connection.execute('INSERT INTO data_operations(id,kind,fingerprint,result,created_at) VALUES (?,?,?,?,?)',
+                               (identifier, 'append', fingerprint, json.dumps(receipt), datetime.now(timezone.utc).isoformat()))
             return plan
 
     def undo_append(self, transactions):
@@ -250,7 +315,7 @@ class TransactionRepository:
                 if actual is None or split:
                     raise ValueError("Imported transactions changed; cannot undo.")
                 saved = Transaction(**dict(actual))
-                if saved.model_dump(mode="json") != item.model_dump(mode="json"):
+                if saved.model_dump(mode="json", exclude={"revision"}) != item.model_dump(mode="json", exclude={"revision"}):
                     raise ValueError("Imported transactions changed; cannot undo.")
             connection.executemany("DELETE FROM transactions WHERE id=?", [(item.id,) for item in items])
         return len(items)
@@ -358,8 +423,8 @@ class TransactionRepository:
             return
         with self._get_connection() as connection:
             connection.execute(
-                "UPDATE transactions SET category = ? WHERE id = ?",
-                (category, transaction_id),
+                "UPDATE transactions SET category=?,category_override=?,category_origin='manual' WHERE id=?",
+                (category, category, transaction_id),
             )
 
     def apply_category_rule(self, keyword: str, category: str) -> int:
@@ -375,6 +440,7 @@ class TransactionRepository:
         self, transaction_id: str, first_category: str, first_amount: float,
         second_category: str, second_amount: float,
     ) -> None:
+        first_amount, second_amount = money(first_amount), money(second_amount)
         if not all(math.isfinite(value) and value > 0 for value in (first_amount, second_amount)):
             raise ValueError("Split amounts must be positive and finite.")
         with self._get_connection() as connection:
@@ -382,7 +448,7 @@ class TransactionRepository:
             row = connection.execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
             if row is None:
                 raise ValueError("Transaction no longer exists.")
-            if abs(first_amount + second_amount - abs(row["amount"])) > 0.005:
+            if first_amount + second_amount != abs(money(row["amount"])):
                 raise ValueError("Split amounts must equal the original transaction amount.")
             sign = -1 if row["amount"] < 0 else 1
             allocations = [TransactionAllocation(category=category, amount=sign * amount)
@@ -487,6 +553,9 @@ class TransactionRepository:
             connection.execute("DELETE FROM category_rules WHERE keyword = ?", (keyword,))
 
     def delete_account(self, account_name: str) -> int:
+        selected = next((row for row in self.get_catalog()['accounts'] if row['id']==account_name), None)
+        if selected:
+            account_name = selected['name']
         with self._get_connection() as connection:
             self._invalidate_sync(connection, account_name)
             cursor = connection.execute(
@@ -522,7 +591,7 @@ class TransactionRepository:
             ],
             "statement_import_rows": self.get_import_rows(),
         }
-        return json.dumps(payload, indent=2)
+        return serialize_backup(payload)
 
     def restore_backup(self, raw_json: bytes) -> dict:
         data = read_backup(raw_json)
@@ -568,6 +637,7 @@ class TransactionRepository:
             connection.executemany("INSERT INTO statement_import_rows VALUES (?,?,?)", [
                 (row.file_id,row.row_number,row.transaction_id) for row in import_rows
             ])
+            self._persist_metadata(connection, transactions)
             self._invalidate_sync(connection)
             connection.executemany(
                 "INSERT INTO budgets (category, monthly_limit) VALUES (?, ?)",
@@ -655,7 +725,7 @@ class TransactionRepository:
         with self._get_connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             state = connection.execute("SELECT * FROM plaid_items WHERE item_id=?", (item_id,)).fetchone()
-            if (state is None or state["cursor"] != expected_cursor
+            if (state is None or state["status"]=="disconnecting" or state["cursor"] != expected_cursor
                     or state["sync_generation"] != expected_generation):
                 raise ValueError("Bank cursor changed; retry sync.")
             if bool(state["needs_reconciliation"]) != reconcile:
@@ -669,26 +739,39 @@ class TransactionRepository:
                         AND fb_import_normalize(description)=? AND fb_import_normalize(account_name)=? AND fb_import_normalize(account_type)=?
                         ORDER BY id LIMIT 1""", (item.date.isoformat(),item.amount,normalize_text(item.description),
                                               normalize_text(item.account_name),normalize_text(item.account_type))).fetchone()
+                previous = connection.execute('SELECT * FROM transactions WHERE id=?', (item.id,)).fetchone()
+                if previous is None and item.pending_transaction_id:
+                    imported = connection.execute('SELECT * FROM transactions WHERE id=? AND plaid_item_id=? AND pending=1', (item.pending_transaction_id,item_id)).fetchone() or imported
+                annotation = previous or imported
+                if annotation:
+                    item = item.model_copy(update={'category_override': annotation['category_override'],
+                                                  'account_id': annotation['account_id'] or item.account_id})
+                    if annotation['category_origin']=='legacy' and annotation['category']!='Uncategorized':
+                        item = item.model_copy(update={'category': annotation['category'], 'category_origin': 'legacy'})
+                    else:
+                        item = categorize(item, [CategoryRule(**dict(rule)) for rule in connection.execute('SELECT * FROM category_rules ORDER BY keyword')])
+                else:
+                    item = categorize(item, [CategoryRule(**dict(rule)) for rule in connection.execute('SELECT * FROM category_rules ORDER BY keyword')])
                 connection.execute("""INSERT INTO transactions
                     (id,date,description,amount,category,account_name,account_type,plaid_item_id,plaid_account_id)
                     VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
                     date=excluded.date,description=excluded.description,amount=excluded.amount,
-                    category=CASE WHEN transactions.category='Uncategorized' THEN excluded.category ELSE transactions.category END,
+                    category=excluded.category,
                     account_name=excluded.account_name,account_type=excluded.account_type,
                     plaid_item_id=excluded.plaid_item_id,plaid_account_id=excluded.plaid_account_id""",
                     (item.id,item.date.isoformat(),item.description,item.amount,item.category,
                      item.account_name,item.account_type,item_id,item.plaid_account_id))
+                self._persist_metadata(connection, [item])
                 if imported:
                     connection.execute("UPDATE transactions SET statement_file_id=NULL,statement_row=NULL,statement_reference=NULL WHERE id=?", (imported["id"],))
                     connection.execute("""UPDATE transactions SET
-                        category=CASE WHEN ?='Uncategorized' THEN category ELSE ? END,
                         statement_file_id=?,statement_row=?,statement_reference=?,statement_match_bank=1 WHERE id=?""",
-                        (imported["category"],imported["category"],imported["statement_file_id"],imported["statement_row"],
+                        (imported["statement_file_id"],imported["statement_row"],
                          imported["statement_reference"],item.id))
                     connection.execute("UPDATE transaction_allocations SET transaction_id=? WHERE transaction_id=?", (item.id,imported["id"]))
                     connection.execute("UPDATE statement_import_rows SET transaction_id=? WHERE transaction_id=?", (item.id,imported["id"]))
                     connection.execute("DELETE FROM transactions WHERE id=?", (imported["id"],))
-                    reconciled += 1
+                    reconciled += not imported["id"].startswith("plaid:")
             removed = 0
             for identifier in set(removed_ids):
                 removed += connection.execute("DELETE FROM transactions WHERE id=? AND plaid_item_id=?",
@@ -725,3 +808,127 @@ class TransactionRepository:
                     raise ValueError("Bank history must be matched before restore; sync connections and retry.")
             result.append(item)
         return result
+
+    @staticmethod
+    def _persist_metadata(connection, items):
+        fields = ('account_id','currency','category_origin','provider_category','category_override',
+                  'category_rule','category_rule_version','pending_transaction_id','builtin_category',
+                  'merchant_name','subcategory','payment_channel','location','pending')
+        for item in items:
+            values = item.model_dump(mode='json')
+            connection.execute('UPDATE transactions SET '+','.join(field+'=?' for field in fields)+' WHERE id=?',
+                               [values[field] for field in fields] + [item.id])
+
+    def correct_category(self, transaction_id, category, keyword='', apply_similar=False):
+        if apply_similar and not keyword.strip():
+            raise ValueError('Enter a merchant phrase.')
+        with self._get_connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            if transaction_id.startswith('allocation:'):
+                cursor = connection.execute('UPDATE transaction_allocations SET category=? WHERE id=?', (category, transaction_id[11:]))
+            else:
+                cursor = connection.execute("UPDATE transactions SET category=?,category_override=?,category_origin='manual' WHERE id=?", (category,category,transaction_id))
+            if cursor.rowcount != 1:
+                raise ValueError('Transaction not found.')
+            count = 0
+            if keyword.strip():
+                connection.execute('INSERT INTO category_rules(keyword,category) VALUES(?,?) ON CONFLICT(keyword) DO UPDATE SET category=excluded.category', (keyword.strip().lower(),category))
+                if apply_similar:
+                    count = connection.execute("UPDATE transactions SET category=?,category_override=NULL,category_origin='rule',category_rule=?,category_rule_version=1 WHERE instr(lower(description),?)>0", (category,keyword.strip().lower(),keyword.strip().lower())).rowcount
+                    connection.execute('UPDATE transaction_allocations SET category=? WHERE transaction_id IN(SELECT id FROM transactions WHERE instr(lower(description),?)>0)', (category,keyword.strip().lower()))
+            return {'updated': count}
+
+    def get_import_batches(self):
+        with self._get_connection() as connection:
+            rows = connection.execute("SELECT * FROM data_operations WHERE kind='append' ORDER BY created_at DESC LIMIT 20").fetchall()
+        return [{'id': row['id'], 'created_at': row['created_at'], 'undone': bool(row['undone']),
+                 'inserted': json.loads(row['result'])['inserted'], 'matched': json.loads(row['result'])['matched']} for row in rows]
+
+    def undo_import_batch(self, batch_id):
+        with self._get_connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute("SELECT * FROM data_operations WHERE id=? AND kind='append'", (batch_id,)).fetchone()
+            if not row:
+                raise ValueError('Import batch not found.')
+            if row['undone']:
+                return 0
+            snapshots = json.loads(row['result'])['inserted_rows']
+            for snapshot in snapshots:
+                current = connection.execute('SELECT revision FROM transactions WHERE id=?', (snapshot['id'],)).fetchone()
+                if not current or current['revision'] != snapshot['revision'] or connection.execute('SELECT 1 FROM transaction_allocations WHERE transaction_id=?', (snapshot['id'],)).fetchone():
+                    raise ValueError('Imported rows have changed.')
+            connection.executemany('DELETE FROM transactions WHERE id=?', [(snapshot['id'],) for snapshot in snapshots])
+            connection.execute('UPDATE data_operations SET undone=1 WHERE id=?', (batch_id,))
+            return len(snapshots)
+
+    @staticmethod
+    def _account_identifier(item):
+        return str(item.account_id or uuid5(NAMESPACE_URL, 'financebuddy:account:'+normalize_text(item.account_name)+':'+normalize_text(item.account_type)))
+
+    def get_catalog(self):
+        canonical = self.get_canonical_all()
+        projected = project_transactions(canonical)
+        groups = {}
+        for item in canonical:
+            groups.setdefault(self._account_identifier(item), []).append(item)
+        return {'count': len(canonical), 'display_count': len(projected),
+                'min_date': min((item.date.isoformat() for item in canonical), default=None),
+                'max_date': max((item.date.isoformat() for item in canonical), default=None),
+                'needs_review': sum(item.category == 'Uncategorized' for item in projected),
+                'categories': sorted({item.category for item in projected}),
+                'accounts': [{'id': identifier, 'name': items[0].account_name, 'account_type': items[0].account_type,
+                              'plaid_item_id': items[0].plaid_item_id, 'plaid_account_id': items[0].plaid_account_id,
+                              'connected': self.is_connected_account(items[0].account_name), 'transactions': len(items),
+                              'first_date': min(item.date.isoformat() for item in items),
+                              'latest_date': max(item.date.isoformat() for item in items)} for identifier, items in groups.items()]}
+
+    def get_filtered(self, filters=None):
+        filters = filters or {}
+        # Filter dates before reading sources; allocation/category filters apply to projections.
+        with self._get_connection() as connection:
+            rows = connection.execute("SELECT * FROM transactions WHERE date>=? AND date<=? ORDER BY date DESC,id DESC",
+                                      (filters.get('start','0001-01-01'), filters.get('end','9999-12-31'))).fetchall()
+            allocations = {}
+            for allocation in connection.execute('SELECT * FROM transaction_allocations WHERE transaction_id IN(SELECT id FROM transactions WHERE date>=? AND date<=?)',
+                                                 (filters.get('start','0001-01-01'), filters.get('end','9999-12-31'))):
+                allocations.setdefault(allocation['transaction_id'], []).append(dict(allocation))
+        items = project_transactions([Transaction(**dict(row), allocations=allocations.get(row['id'], [])) for row in rows])
+        return [item for item in items if
+                ('accounts' not in filters or self._account_identifier(item) in filters['accounts']) and
+                ('categories' not in filters or item.category in filters['categories']) and
+                (filters.get('type','Both') == 'Both' or (filters['type']=='Money in' and item.amount>0) or (filters['type']=='Money out' and item.amount<0)) and
+                abs(item.amount)>=money(filters.get('minimum', 0)) and
+                filters.get('search','').lower() in (item.description+' '+(item.merchant_name or '')).lower() and
+                (filters.get('view')!='Pending' or item.pending) and
+                (filters.get('view')!='Needs a category' or item.category=='Uncategorized') and
+                (filters.get('include_transfers', True) or item.category not in ('Transfers','Credit Card Payments'))]
+
+    def get_page(self, filters=None, *, limit=200, after=None):
+        items = self.get_filtered(filters)
+        selected = [item for item in items if after is None or (item.date.isoformat(),item.id)<(after['date'],after['id'])]
+        page = selected[:limit]
+        cursor = {'date': page[-1].date.isoformat(), 'id': page[-1].id} if len(selected)>limit else None
+        return {'rows': page, 'next_cursor': cursor, 'count': len(items)}
+
+    def get_summary(self, filters=None):
+        from src.services.analytics import AnalyticsService
+        items = self.get_filtered(filters)
+        return {**AnalyticsService.calculate_summary(items), 'categories': AnalyticsService.category_summary(items),
+                'monthly': AnalyticsService.monthly_breakdown(items), 'count': len(items)}
+
+    def delete_item_transactions(self, item_id):
+        with self._get_connection() as connection:
+            return connection.execute('DELETE FROM transactions WHERE plaid_item_id=?', (item_id,)).rowcount
+
+    def correct_categories(self, transaction_ids, category):
+        with self._get_connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            count = 0
+            for identifier in set(transaction_ids):
+                if identifier.startswith('allocation:'):
+                    count += connection.execute('UPDATE transaction_allocations SET category=? WHERE id=?', (category,identifier[11:])).rowcount
+                else:
+                    count += connection.execute("UPDATE transactions SET category=?,category_override=?,category_origin='manual' WHERE id=?", (category,category,identifier)).rowcount
+            if count != len(set(transaction_ids)):
+                raise ValueError('Some transactions changed.')
+            return count

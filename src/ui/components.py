@@ -311,7 +311,7 @@ def transaction_frame(transactions: Iterable[Transaction]) -> pd.DataFrame:
         [
             {
                 "Date": transaction.date,
-                "Amount": transaction.amount,
+                "Amount": float(transaction.amount),
                 "Category": transaction.category,
                 "Description": transaction.description,
                 "Account": transaction.account_name,
@@ -439,7 +439,7 @@ def transactions_to_csv(transactions: Iterable[Transaction]) -> bytes:
 
 
 def render_progress(label: str, current: float, target: float) -> None:
-    ratio = min(max(current / target if target else 0.0, 0.0), 1.0)
+    ratio = min(max(float(current / target) if target else 0.0, 0.0), 1.0)
     st.markdown(
         f'<div class="fb-progress-label"><strong>{html.escape(label)}</strong>'
         f"<span>{format_currency(current)} of {format_currency(target)}</span></div>",

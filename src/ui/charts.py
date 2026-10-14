@@ -345,7 +345,7 @@ def make_comparison_delta_chart(comparisons: List[Dict[str, Any]]):
     rows = [
         {
             "category": category,
-            "change": current.get(category, 0.0) - previous.get(category, 0.0),
+            "change": float(current.get(category, 0)) - float(previous.get(category, 0)),
             "direction": (
                 "Higher spending"
                 if current.get(category, 0.0) > previous.get(category, 0.0)

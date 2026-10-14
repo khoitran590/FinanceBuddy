@@ -171,7 +171,7 @@ keeps a source already re-created by an earlier sync authoritative. Incomplete o
 edited pairs are retained for manual review. It associates old bank transactions
 with provider accounts only when the current account label matches uniquely.
 
-New JSON backups use version 2 and contain canonical transactions, allocations, and
+New JSON backups use version 3 (see the rollout section below) and contain canonical transactions, allocations, and
 provider item/account IDs. Version 1 backups still import, recovering complete split
 pairs. Settings, credentials, and bank connections remain excluded.
 
@@ -307,8 +307,38 @@ for a pilot but do not provide always-on availability or managed backup recovery
 
 The importer accepts CSV and text-based PDF statements. It detects common delimiters and encodings, extracts PDF tables or date-description-amount text rows, maps common bank header names, supports signed `Amount` or `Debit`/`Credit` columns, and refuses to commit an import when fewer than 80% of data rows are valid. Image-only/scanned PDFs are not supported yet because they require OCR.
 
-Choose `Checking` or `Credit Card` and the file's sign/format conventions before importing. Explicit Debit/Credit columns determine direction; descriptions do not. The preview reports the period, parsed/skipped rows, and save action for each displayed row. Append matches saved occurrences while preserving legitimate repeated purchases. Undo removes only newly inserted unchanged rows. Replacement is limited to an unconnected named account and is not undoable; download a backup first.
+Choose `Checking` or `Credit Card` and the file's sign/format conventions before importing. Explicit Debit/Credit columns determine direction; descriptions do not. The preview reports the period, parsed/skipped rows, and save action for each displayed row. Append matches saved occurrences while preserving legitimate repeated purchases. Undo removes only newly inserted unchanged rows. Replacement is limited to an unconnected owned account and is not undoable; download a backup first.
 
 The dashboard includes expanded categories, accessible cash-flow and category charts, a category share table, and an optional monthly category heatmap. Comparison statements are sorted automatically by their detected transaction dates.
 
 Transaction IDs for new statement rows come from file/row identity. Content matching is separate from identity, so re-imports stay idempotent without collapsing repeated purchases.
+
+
+## Money, account identity, recovery, and bounded queries
+
+The remaining architecture findings are implemented by migrations
+`202610130003_money_accounts_and_provenance.sql`,
+`202610130004_recoverable_operations_and_backups.sql`, and
+`202610130005_transaction_queries.sql`, applied in that order after the previous
+October 13 migrations while writes are stopped.
+
+FinanceBuddy now enforces USD and exact cents, stores stable owned account IDs and
+category provenance, transfers pending transaction annotations to posted records,
+and records durable results for logical writes. Recent import receipts can be
+recovered after a session ends; undo rejects edited, newly claimed, or restored
+rows. Disconnect persists its removal choice and supports recovery after a failed
+provider/database response.
+
+Version 3 exports a consistent snapshot of transactions/allocations, import
+mappings, accounts, budgets, goals, rules, settings, and retained USD balance
+history. It excludes credentials and enforces the same limits as restore. Older
+portable formats remain readable. Transaction pages use server filters and keyset
+pagination; exports are prepared explicitly, Overview renders the selected view,
+and recurring/Plan analysis uses a bounded history window. Choosing All time still
+loads the requested detailed history. Repository Protocols and application services
+keep processing policy outside Streamlit.
+
+**Follow [the migration rollout guide](docs/DATA_MIGRATION_ROLLOUT.md)** for money
+preflight/reconciliation, complete database backup and rollback requirements,
+matching/provenance policy, local benchmark results, and deployment verification.
+No live Supabase migration is performed by these source changes.

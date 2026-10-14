@@ -2,11 +2,15 @@
 
 Reviewed October 13, 2026.
 
-Implementation follow-up: findings 1–4 are addressed by the two
-`20261013` migrations and the matching app changes. See the README sections
-“Source transactions, splits, and restore” and “Statement identity and format
-choices” for rollout, matching policy, and legacy-data handling. The findings below
-record the architecture at audit time.
+Implementation follow-up: findings 1–10 are implemented across the five
+`20261013` migrations and matching domain, service, repository, and UI changes.
+The original findings below describe the architecture at audit time. See
+[the rollout and verification guide](DATA_MIGRATION_ROLLOUT.md) for exact-money
+conversion, account identity, category provenance, durable receipts, backup
+contracts, query boundaries, known legacy assumptions, and the required migration
+sequence. Verification is local; the live Supabase project has not been changed.
+The optional worker/cache work in the implementation order remains conditional
+on product requirements or measured need and was not introduced.
 
 ## Assessment
 
