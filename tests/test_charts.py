@@ -1,4 +1,7 @@
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
+
+import pytest
 
 from src.ui.charts import make_category_donut_chart, make_profit_loss_line_chart
 
@@ -13,18 +16,47 @@ def test_donut_chart_has_center_total_and_interactive_slice_details():
     assert "%{percent}" in figure.data[0].hovertemplate
 
 
-def test_profit_loss_chart_connects_sign_changes_at_zero():
+@pytest.mark.parametrize("number", [float, Decimal])
+@pytest.mark.parametrize("direction", [1, -1])
+def test_profit_loss_chart_connects_sign_changes_at_zero(number, direction):
     figure = make_profit_loss_line_chart(
         [
-            {"date": date(2026, 1, 1), "pnl": 100.0, "daily_change": 100.0},
-            {"date": date(2026, 1, 2), "pnl": -50.0, "daily_change": -150.0},
+            {"date": date(2026, 1, 1), "pnl": number("100.00") * direction,
+             "daily_change": number("100.00") * direction},
+            {"date": date(2026, 1, 2), "pnl": number("-50.00") * direction,
+             "daily_change": number("-150.00") * direction},
         ]
     )
 
     assert [trace.name for trace in figure.data] == ["Gain", "Loss"]
     assert 0.0 in list(figure.data[0].y)
     assert 0.0 in list(figure.data[1].y)
+    assert figure.data[0].x[1] == datetime(2026, 1, 1, 16)
+    assert figure.data[1].x[1] == datetime(2026, 1, 1, 16)
     assert figure.layout.shapes[0].y0 == 0
+
+
+def test_profit_loss_chart_renders_exact_money_analytics_without_changing_amounts():
+    from src.domain.models import Transaction
+    from src.services.analytics import AnalyticsService
+
+    transactions = [
+        Transaction(id="first", date=date(2026, 1, 1), description="Refund", amount="0.10", account_name="Checking"),
+        Transaction(id="second", date=date(2026, 1, 4), description="Purchase", amount="-0.30", account_name="Checking"),
+        Transaction(id="third", date=date(2026, 1, 9), description="Refund", amount="0.50", account_name="Checking"),
+    ]
+    points = AnalyticsService.cumulative_cash_flow(transactions)
+    original = [point.copy() for point in points]
+
+    figure = make_profit_loss_line_chart(points)
+
+    assert [point["pnl"] for point in points] == [Decimal("0.10"), Decimal("-0.20"), Decimal("0.30")]
+    assert points == original
+    for trace in figure.data:
+        assert [day for day, amount in zip(trace.x, trace.y) if amount == 0] == [
+            datetime(2026, 1, 2), datetime(2026, 1, 6),
+        ]
+    assert figure.to_json()
 
 
 def test_new_charts_render_with_data_and_when_empty():

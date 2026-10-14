@@ -164,7 +164,9 @@ def make_profit_loss_line_chart(cumulative_data: List[Dict[str, Any]]):
             current_date = pd.Timestamp(current["date"])
             expanded.append(
                 {
-                    "date": previous_date + (current_date - previous_date) * fraction,
+                    # Timedelta accepts a float scale; only the chart's date
+                    # interpolation is approximate, while money stays Decimal.
+                    "date": previous_date + (current_date - previous_date) * float(fraction),
                     "pnl": 0.0,
                     "daily_change": current["daily_change"],
                 }
