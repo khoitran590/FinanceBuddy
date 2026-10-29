@@ -183,6 +183,37 @@ class SupabaseTransactionRepository:
         self._catalog = None
         return int(result)
 
+    def triage_category(self, transaction_ids, category, keyword):
+        result = self.operations.execute("triage", {"ids": sorted(set(transaction_ids)), "category": category,
+                                                  "keyword": keyword.strip().lower()})
+        self._catalog = None
+        return int(result)
+
+    def merge_duplicate(self, keep_id, remove_id):
+        result = self.operations.execute("merge_duplicate", {"keep_id": keep_id, "remove_id": remove_id})
+        self._catalog = None
+        return int(result)
+
+    def clear_sample(self, account_names, budgets=(), goals=(), rule_keywords=()):
+        result = self.operations.execute("clear_sample", {
+            "account_names": sorted(account_names), "budgets": list(budgets), "goals": list(goals),
+            "rule_keywords": sorted(rule_keywords)})
+        self._catalog = None
+        return int(result)
+
+    def annotate(self, transaction_id, notes, tags):
+        self.operations.execute("annotate", {"id": transaction_id, "notes": notes or "", "tags": sorted(set(tags))})
+
+    def add_manual_transaction(self, transaction: Transaction, notes="", tags=()):
+        row = {key: value for key, value in transaction.model_dump(mode="json").items()
+               if key in ("id", "date", "description", "amount", "category", "account_id", "account_name", "account_type")}
+        self.operations.execute("manual_add", {"row": row, "notes": notes or "", "tags": sorted(set(tags))})
+        self._catalog = None
+
+    def delete_manual_transaction(self, transaction_id):
+        self.operations.execute("manual_delete", {"id": transaction_id})
+        self._catalog = None
+
     def apply_category_rule(self, keyword: str, category: str) -> int:
         return int(self.client.rpc("fb_apply_category_rule", {
             "p_keyword": keyword.strip(), "p_category": category,

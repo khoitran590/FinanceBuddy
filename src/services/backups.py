@@ -31,6 +31,12 @@ class BalanceSnapshot(BaseModel):
     currency: Literal['USD'] = 'USD'
 
 
+class BackupAnnotation(BaseModel):
+    transaction_id: str = Field(min_length=1, max_length=256)
+    notes: str | None = Field(default=None, min_length=1, max_length=2000)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+
+
 class BackupSetting(BaseModel):
     key: str = Field(min_length=1, max_length=256)
     value: str = Field(max_length=16_384)
@@ -69,6 +75,11 @@ def validate_backup(raw: bytes) -> dict:
             raise ValueError('Backup transactions must reference distinct owned accounts.')
         if any(row['account_id'] not in accounts for row in result['balance_snapshots']):
             raise ValueError('Backup balance history refers to an unknown account.')
+        if data['version'] == 4:
+            identifiers = {item.id for item in transactions}
+            annotations = [BackupAnnotation.model_validate(row) for row in data['transaction_annotations']]
+            if any(row.transaction_id not in identifiers for row in annotations):
+                raise ValueError('Backup notes refer to an unknown transaction.')
     if not legacy:
         # Preserve the portable snapshot shape and decimal strings, so expanding
         # model defaults cannot make a valid exported file exceed server limits.

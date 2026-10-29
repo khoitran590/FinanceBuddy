@@ -72,6 +72,9 @@ class Transaction(BaseModel):
     statement_reference: Optional[str] = Field(default=None, min_length=1, max_length=256)
     statement_match_bank: bool = False
     # Read projection only. Never written into a backup or source record.
+    # Notes and tags are stored as annotations beside the transaction.
+    notes: Optional[str] = Field(default=None, max_length=2000, exclude=True)
+    tags: List[str] = Field(default_factory=list, max_length=20, exclude=True)
     source_transaction_id: Optional[str] = Field(default=None, exclude=True)
     source_amount: Optional[Money] = Field(default=None, exclude=True)
     split_needs_review: bool = Field(default=False, exclude=True)
@@ -107,3 +110,5 @@ class ParseMetrics(BaseModel):
     accuracy_rate: float
     errors: List[str] = Field(default_factory=list)
     is_valid: bool
+    # True when Debit/Credit columns, not a sign convention, set each direction.
+    direction_columns: bool = False

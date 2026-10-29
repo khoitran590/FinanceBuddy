@@ -16,7 +16,7 @@ FINANCIAL_COLORS = {
     "higher_spending": "#D9701E",
     "lower_spending": "#2F6FCB",
 }
-STATEMENT_COLORS = ["#2F6FCB", "#2E9C95", "#9B7BD8"]
+STATEMENT_COLORS = ["#2F6FCB", "#2E9C95", "#9B7BD8", "#E08A3C", "#C9A227", "#8A8F98"]
 CATEGORY_COLORS = [
     "#2F6FCB",
     "#E08A3C",
@@ -340,7 +340,7 @@ def make_comparison_category_chart(comparisons: List[Dict[str, Any]]):
 
 def make_comparison_delta_chart(comparisons: List[Dict[str, Any]]):
     if len(comparisons) < 2:
-        return _style_figure(px.bar(title="Upload at least two statements for category changes"))
+        return _style_figure(px.bar(title="Choose at least two periods for category changes"))
     previous = comparisons[-2]["categories"]
     current = comparisons[-1]["categories"]
     categories = sorted(set(previous) | set(current))
@@ -800,4 +800,23 @@ def make_category_trend_lines(monthly_category_data: List[Dict[str, Any]], top_n
         legend={"orientation": "h", "y": -0.18},
     )
     figure.update_yaxes(tickprefix="$", separatethousands=True, rangemode="tozero")
+    return _style_figure(figure)
+
+
+def make_cash_flow_timeline(events: List[Dict[str, Any]]):
+    """Expected paydays and bills as bars, with the running balance as a step line."""
+    if not events:
+        return _style_figure(go.Figure().update_layout(title="No bills or paydays expected"))
+    frame = pd.DataFrame(events).assign(amount=lambda data: data["amount"].astype(float),
+                                        running=lambda data: data["running"].astype(float))
+    figure = go.Figure()
+    for kind, color in (("Payday", FINANCIAL_COLORS["income"]), ("Bill", FINANCIAL_COLORS["expense"])):
+        rows = frame[frame["kind"] == kind]
+        if not rows.empty:
+            figure.add_bar(x=rows["date"], y=rows["amount"], name=kind, marker_color=color,
+                           customdata=rows["label"], hovertemplate="%{customdata}<br>%{x|%b %-d}: $%{y:,.2f}<extra></extra>")
+    figure.add_scatter(x=frame["date"], y=frame["running"], name="Running balance", mode="lines+markers",
+                       line={"shape": "hv", "color": NEUTRAL_LINE, "width": 2},
+                       hovertemplate="%{x|%b %-d}: $%{y:,.2f}<extra></extra>")
+    figure.update_layout(title="Next 30 days", barmode="relative", yaxis_title="Amount ($)", xaxis_title="")
     return _style_figure(figure)

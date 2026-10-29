@@ -101,7 +101,7 @@ begin
  insert into public.app_settings(user_id,key,value) values(uid,'__arch_setting','true');
  perform public.fb_execute_operation(clean_batch,'append',jsonb_build_object('rows',jsonb_build_array(source||jsonb_build_object('id','statement:clean','description','Clean','account_id',acct_b,'statement_reference',null,'statement_file_id',repeat('d',64)))));
  snapshot:=public.fb_export_backup();
- if snapshot->>'version'<>'3' or not exists(select 1 from jsonb_array_elements(snapshot->'settings') where value->>'key'='__arch_setting')
+ if snapshot->>'version'<>'4' or not exists(select 1 from jsonb_array_elements(snapshot->'settings') where value->>'key'='__arch_setting')
   or jsonb_array_length(snapshot->'balance_snapshots')<2 or snapshot::text like '%encrypted-a%' then raise exception 'Snapshot incomplete or leaked credential'; end if;
  perform public.fb_execute_operation(gen_random_uuid(),'restore',jsonb_build_object('backup',snapshot));
  if not exists(select 1 from public.transactions where user_id=uid and id='plaid:arch-posted' and account_id=acct_a and category_override='Entertainment')

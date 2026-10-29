@@ -29,13 +29,15 @@ def read_backup(raw: bytes) -> dict:
         data = json.loads(raw.decode("utf-8"))
     except (ValueError, RecursionError) as error:
         raise ValueError("Backup must be valid UTF-8 JSON.") from error
-    if not isinstance(data, dict) or data.get("version") not in (1, 2, 3):
+    if not isinstance(data, dict) or data.get("version") not in (1, 2, 3, 4):
         raise ValueError("Unsupported FinanceBuddy backup version.")
     keys = ["transactions", "budgets", "goals", "category_rules"]
     if "statement_import_rows" in data:
         keys.append("statement_import_rows")
-    if data.get("version") == 3:
+    if data.get("version") in (3, 4):
         keys.extend(["accounts", "settings", "balance_snapshots"])
+    if data.get("version") == 4:
+        keys.append("transaction_annotations")
     for key in keys:
         rows = data.get(key)
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):

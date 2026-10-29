@@ -273,3 +273,15 @@ def test_legacy_backup_nonfinite_money_fails_with_a_safe_validation_error():
     data['transactions'][0]['amount'] = 'Infinity'
     with pytest.raises(ValueError, match='USD'):
         validate_backup(json.dumps(data).encode())
+
+
+def test_backup_v4_annotations_must_reference_saved_transactions():
+    data=backup();data['version']=4
+    data['transaction_annotations']=[{'transaction_id':data['transactions'][0]['id'],'notes':'Trip','tags':['travel']}]
+    assert validate_backup(serialize_backup(data).encode())['transaction_annotations'][0]['tags']==['travel']
+    data['transaction_annotations'][0]['transaction_id']='missing'
+    with pytest.raises(ValueError,match='unknown transaction'):
+        validate_backup(json.dumps(data).encode())
+    del data['transaction_annotations']
+    with pytest.raises(ValueError,match='transaction_annotations'):
+        validate_backup(json.dumps(data).encode())

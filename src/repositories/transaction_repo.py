@@ -19,6 +19,14 @@ from src.services.imports import plan_statement_import, normalize_text
 from src.domain.allocations import project_transactions, recover_legacy_splits
 
 
+def normalize_tags(tags) -> list[str]:
+    """Lowercase, trimmed, distinct tags; the cloud table enforces the same limits."""
+    result = sorted({str(tag).strip().lower() for tag in tags if str(tag).strip()})
+    if len(result) > 20 or any(len(tag) > 40 for tag in result):
+        raise ValueError("Use up to 20 tags of at most 40 characters.")
+    return result
+
+
 class TransactionRepository:
     """SQLite repository with no dependency on the presentation layer."""
 
@@ -127,6 +135,9 @@ class TransactionRepository:
                 if column not in columns:
                     connection.execute(f'ALTER TABLE transactions ADD COLUMN {column} {kind}')
             connection.executescript("""
+                CREATE TABLE IF NOT EXISTS transaction_annotations(
+                    transaction_id TEXT PRIMARY KEY REFERENCES transactions(id) ON DELETE CASCADE,
+                    notes TEXT, tags TEXT NOT NULL DEFAULT '[]');
                 CREATE TABLE IF NOT EXISTS data_operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,
                     fingerprint TEXT NOT NULL,result TEXT NOT NULL,created_at TEXT NOT NULL,undone INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS revision_counter(value INTEGER NOT NULL);
@@ -189,12 +200,18 @@ class TransactionRepository:
         with self._get_connection() as connection:
             rows = connection.execute("SELECT * FROM transactions ORDER BY date DESC, id DESC").fetchall()
             allocations = connection.execute("SELECT * FROM transaction_allocations ORDER BY id").fetchall()
+            notes = self._annotations(connection)
         by_id = {}
         for allocation in allocations:
             by_id.setdefault(allocation["transaction_id"], []).append({
                 "id": allocation["id"], "amount": allocation["amount"], "category": allocation["category"],
             })
-        return [Transaction(**dict(row), allocations=by_id.get(row["id"], [])) for row in rows]
+        return [Transaction(**dict(row), allocations=by_id.get(row["id"], []), **notes.get(row["id"], {})) for row in rows]
+
+    @staticmethod
+    def _annotations(connection) -> dict:
+        return {row["transaction_id"]: {"notes": row["notes"], "tags": json.loads(row["tags"])}
+                for row in connection.execute("SELECT * FROM transaction_annotations")}
 
     def get_all(self) -> List[Transaction]:
         return project_transactions(self.get_canonical_all())
@@ -590,6 +607,10 @@ class TransactionRepository:
                 item.model_dump(mode="json") for item in self.get_category_rules()
             ],
             "statement_import_rows": self.get_import_rows(),
+            "transaction_annotations": [
+                {"transaction_id": item.id, "notes": item.notes, "tags": item.tags}
+                for item in self.get_canonical_all() if item.notes or item.tags
+            ],
         }
         return serialize_backup(payload)
 
@@ -638,6 +659,10 @@ class TransactionRepository:
                 (row.file_id,row.row_number,row.transaction_id) for row in import_rows
             ])
             self._persist_metadata(connection, transactions)
+            connection.executemany("INSERT INTO transaction_annotations VALUES (?,?,?)", [
+                (row["transaction_id"], row.get("notes"), json.dumps(normalize_tags(row.get("tags", []))))
+                for row in data.get("transaction_annotations", [])
+            ])
             self._invalidate_sync(connection)
             connection.executemany(
                 "INSERT INTO budgets (category, monthly_limit) VALUES (?, ?)",
@@ -769,6 +794,7 @@ class TransactionRepository:
                         (imported["statement_file_id"],imported["statement_row"],
                          imported["statement_reference"],item.id))
                     connection.execute("UPDATE transaction_allocations SET transaction_id=? WHERE transaction_id=?", (item.id,imported["id"]))
+                    connection.execute("UPDATE OR IGNORE transaction_annotations SET transaction_id=? WHERE transaction_id=?", (item.id,imported["id"]))
                     connection.execute("UPDATE statement_import_rows SET transaction_id=? WHERE transaction_id=?", (item.id,imported["id"]))
                     connection.execute("DELETE FROM transactions WHERE id=?", (imported["id"],))
                     reconciled += not imported["id"].startswith("plaid:")
@@ -892,7 +918,8 @@ class TransactionRepository:
             for allocation in connection.execute('SELECT * FROM transaction_allocations WHERE transaction_id IN(SELECT id FROM transactions WHERE date>=? AND date<=?)',
                                                  (filters.get('start','0001-01-01'), filters.get('end','9999-12-31'))):
                 allocations.setdefault(allocation['transaction_id'], []).append(dict(allocation))
-        items = project_transactions([Transaction(**dict(row), allocations=allocations.get(row['id'], [])) for row in rows])
+            notes = self._annotations(connection)
+        items = project_transactions([Transaction(**dict(row), allocations=allocations.get(row['id'], []), **notes.get(row['id'], {})) for row in rows])
         return [item for item in items if
                 ('accounts' not in filters or self._account_identifier(item) in filters['accounts']) and
                 ('categories' not in filters or item.category in filters['categories']) and
@@ -901,7 +928,8 @@ class TransactionRepository:
                 filters.get('search','').lower() in (item.description+' '+(item.merchant_name or '')).lower() and
                 (filters.get('view')!='Pending' or item.pending) and
                 (filters.get('view')!='Needs a category' or item.category=='Uncategorized') and
-                (filters.get('include_transfers', True) or item.category not in ('Transfers','Credit Card Payments'))]
+                (filters.get('include_transfers', True) or item.category not in ('Transfers','Credit Card Payments')) and
+                ('tags' not in filters or bool(set(filters['tags']) & set(item.tags)))]
 
     def get_page(self, filters=None, *, limit=200, after=None):
         items = self.get_filtered(filters)
@@ -932,3 +960,99 @@ class TransactionRepository:
             if count != len(set(transaction_ids)):
                 raise ValueError('Some transactions changed.')
             return count
+
+    def triage_category(self, transaction_ids, category, keyword):
+        """Mirror of the cloud 'triage' operation: rule-based where the rule applies."""
+        keyword = keyword.strip().lower()
+        if not keyword or not category:
+            raise ValueError('Enter a merchant phrase and category.')
+        identifiers = set(transaction_ids)
+        with self._get_connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            connection.execute('INSERT INTO category_rules(keyword,category) VALUES(?,?) ON CONFLICT(keyword) DO UPDATE SET category=excluded.category', (keyword, category))
+            rules = sorted(row['keyword'].lower() for row in connection.execute('SELECT keyword FROM category_rules'))
+            count = 0
+            for identifier in identifiers:
+                if identifier.startswith('allocation:'):
+                    count += connection.execute('UPDATE transaction_allocations SET category=? WHERE id=?', (category, identifier[11:])).rowcount
+                    continue
+                row = connection.execute('SELECT description FROM transactions WHERE id=?', (identifier,)).fetchone()
+                if row is None:
+                    continue
+                # Like the category policy trigger: the first matching rule wins.
+                first = next((rule for rule in rules if rule in row['description'].lower()), None)
+                if first == keyword:
+                    connection.execute("UPDATE transactions SET category=?,category_override=NULL,category_origin='rule',category_rule=?,category_rule_version=1 WHERE id=?", (category, keyword, identifier))
+                else:
+                    connection.execute("UPDATE transactions SET category=?,category_override=?,category_origin='manual',category_rule=NULL,category_rule_version=NULL WHERE id=?", (category, category, identifier))
+                count += 1
+            if count != len(identifiers):
+                raise ValueError('Some transactions changed.')
+            return count
+
+    def merge_duplicate(self, keep_id, remove_id):
+        with self._get_connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            keep = connection.execute('SELECT * FROM transactions WHERE id=?', (keep_id,)).fetchone()
+            remove = connection.execute('SELECT * FROM transactions WHERE id=?', (remove_id,)).fetchone()
+            if keep is None or remove is None or keep_id == remove_id:
+                raise ValueError('Transaction not found.')
+            if remove_id.startswith('plaid:') or remove['plaid_item_id']:
+                raise ValueError('Bank transactions cannot be removed.')
+            if (self._account_identifier(Transaction(**dict(keep))) != self._account_identifier(Transaction(**dict(remove)))
+                    or keep['date'] != remove['date'] or money(keep['amount']) != money(remove['amount'])
+                    or normalize_text(keep['description']) != normalize_text(remove['description'])):
+                raise ValueError('Transactions are not duplicates.')
+            if connection.execute('SELECT 1 FROM transaction_allocations WHERE transaction_id=?', (remove_id,)).fetchone():
+                raise ValueError('Split transactions cannot be removed.')
+            connection.execute('UPDATE statement_import_rows SET transaction_id=? WHERE transaction_id=?', (keep_id, remove_id))
+            connection.execute('DELETE FROM transactions WHERE id=?', (remove_id,))
+            return 1
+
+    def clear_sample(self, account_names, budgets=(), goals=(), rule_keywords=()):
+        with self._get_connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            names = list(account_names)
+            count = connection.execute(f"DELETE FROM transactions WHERE plaid_item_id IS NULL AND account_name IN ({','.join('?' * len(names))})", names).rowcount if names else 0
+            for budget in budgets:
+                row = connection.execute('SELECT monthly_limit FROM budgets WHERE category=?', (budget['category'],)).fetchone()
+                if row and money(row['monthly_limit']) == money(budget['monthly_limit']):
+                    connection.execute('DELETE FROM budgets WHERE category=?', (budget['category'],))
+            for goal in goals:
+                for row in connection.execute('SELECT id,target_amount FROM savings_goals WHERE name=?', (goal['name'],)).fetchall():
+                    if money(row['target_amount']) == money(goal['target_amount']):
+                        connection.execute('DELETE FROM savings_goals WHERE id=?', (row['id'],))
+            connection.executemany('DELETE FROM category_rules WHERE keyword=?', [(keyword,) for keyword in rule_keywords])
+            connection.execute("DELETE FROM app_settings WHERE key='sample_data'")
+            return count
+
+    def annotate(self, transaction_id, notes, tags):
+        notes, tags = (notes or "").strip() or None, normalize_tags(tags)
+        if notes and len(notes) > 2000:
+            raise ValueError("Notes can be at most 2,000 characters.")
+        with self._get_connection() as connection:
+            if transaction_id.startswith('allocation:'):
+                row = connection.execute('SELECT transaction_id FROM transaction_allocations WHERE id=?', (transaction_id[11:],)).fetchone()
+                transaction_id = row['transaction_id'] if row else transaction_id
+            if not connection.execute('SELECT 1 FROM transactions WHERE id=?', (transaction_id,)).fetchone():
+                raise ValueError('Transaction not found.')
+            if notes is None and not tags:
+                connection.execute('DELETE FROM transaction_annotations WHERE transaction_id=?', (transaction_id,))
+            else:
+                connection.execute('INSERT INTO transaction_annotations VALUES(?,?,?) ON CONFLICT(transaction_id) DO UPDATE SET notes=excluded.notes,tags=excluded.tags',
+                                   (transaction_id, notes, json.dumps(tags)))
+
+    def add_manual_transaction(self, transaction, notes="", tags=()):
+        if not transaction.id.startswith('manual:'):
+            raise ValueError('Invalid manual transaction.')
+        self.insert_many([transaction.model_copy(update={'category_origin': 'manual', 'category_override': transaction.category})])
+        with self._get_connection() as connection:
+            connection.execute("UPDATE transactions SET category_origin='manual',category_override=? WHERE id=?", (transaction.category, transaction.id))
+        self.annotate(transaction.id, notes, tags)
+
+    def delete_manual_transaction(self, transaction_id):
+        if not transaction_id.startswith('manual:'):
+            raise ValueError('Transaction not found.')
+        with self._get_connection() as connection:
+            if connection.execute('DELETE FROM transactions WHERE id=?', (transaction_id,)).rowcount != 1:
+                raise ValueError('Transaction not found.')

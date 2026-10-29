@@ -14,14 +14,16 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from src.domain.models import Budget, CategoryRule, SavingsGoal
+from src.domain.models import Budget, CategoryRule, SavingsGoal, Transaction
 from src.repositories.supabase_repo import (
     SupabasePlaidRepository,
     SupabaseTransactionRepository,
 )
 from src.services.analytics import AnalyticsService
-from src.services.categorizer import CATEGORIES, auto_categorize, categorize_with_custom_rules
+from src.services.categorizer import CATEGORIES, TRANSFER_CATEGORIES, auto_categorize, categorize_with_custom_rules
+from src.services.merchants import is_processor_phrase, keyword_warning, rule_keyword, uncategorized_groups
 from src.services.parser import BankStatementParser
+from src.services.sign_detection import sign_evidence
 from src.services.plaid_service import PlaidConfig, PlaidConfigurationError, PlaidService
 from src.services.production import validate_production_configuration
 from src.services.security import bind_session_owner, clear_private_session, read_backup
@@ -36,6 +38,7 @@ from src.services.supabase import (
 from src.ui.charts import (
     make_budget_history_chart,
     make_cash_flow_sankey,
+    make_cash_flow_timeline,
     make_category_bar_chart,
     make_category_donut_chart,
     make_category_heatmap,
@@ -58,8 +61,11 @@ from src.ui.charts import (
     make_weekday_chart,
 )
 from src.ui.components import (
+    active_dialog,
+    close_dialog,
     format_currency,
     inject_app_styles,
+    open_dialog,
     period_label,
     render_card_header,
     render_insights,
@@ -484,6 +490,7 @@ def reset_dashboard_filters() -> None:
         "dashboard_search",
         "dashboard_minimum_amount",
         "dashboard_include_transfers",
+        "dashboard_tag",
     ):
         st.session_state.pop(key, None)
 
@@ -578,6 +585,7 @@ def apply_date_preset(min_date: date, max_date: date) -> None:
 
 
 def navigate_to(page: str, section: str | None = None) -> None:
+    close_dialog()
     st.session_state.nav_page = page
     if section and page == "Transactions":
         st.session_state.tx_view = section
@@ -590,7 +598,7 @@ def navigate_to(page: str, section: str | None = None) -> None:
 def render_start_actions() -> None:
     st.header("Get started with your financial history")
     st.write("Choose how to add your first transactions. You can use both methods later.")
-    bank, statement = st.columns(2)
+    bank, statement, sample = st.columns(3)
     bank.button(
         "Connect a bank",
         type="primary",
@@ -604,7 +612,48 @@ def render_start_actions() -> None:
         on_click=navigate_to,
         args=("Accounts", "Import statement"),
     )
+    if sample.button("Explore with sample data", width="stretch",
+                     help="Load six months of made-up activity. Clear it in one click when you're ready."):
+        try:
+            with st.spinner("Adding sample data…"):
+                data_service.load_sample_data(date.today())
+            st.rerun()
+        except (ValueError, SupabaseError):
+            st.error("Couldn't finish loading sample data. Use Clear sample data, then try again.")
     st.caption("A bank connection syncs through Plaid. A CSV or text-based PDF is previewed before saving.")
+
+
+@st.dialog("Clear sample data", on_dismiss=close_dialog)
+def render_clear_sample_dialog() -> None:
+    st.write("This removes the sample accounts and their transactions, plus sample budgets and goals you haven't changed. "
+             "Your own accounts and transactions are not affected.")
+    rules = data_service.rules_added_since_sample()
+    remove_rules = bool(rules) and st.checkbox(
+        f"Also remove {len(rules)} category rule(s) created while exploring", value=True,
+        help="Rules apply to future imports too: " + ", ".join(rules[:10]))
+    if st.button("Clear sample data", key="clear_sample_confirm", type="primary", width="stretch"):
+        try:
+            data_service.clear_sample_data(remove_rules)
+            close_dialog()
+            st.rerun()
+        except (ValueError, SupabaseError):
+            st.error("Couldn't confirm clearing sample data. Retry to recover its saved result.")
+
+
+def render_sample_banner() -> None:
+    try:
+        loaded = bool(data_service.sample_data())
+    except SupabaseError:
+        return
+    if not loaded:
+        return
+    with st.container(border=True, key="sample_banner"):
+        text, action = st.columns([4, 1], vertical_alignment="center")
+        text.markdown("**You're exploring sample data.** Accounts ending in “· demo” are made up.")
+        action.button("Clear sample data", key="clear_sample", width="stretch",
+                      on_click=open_dialog, args=("clear_sample",))
+    if active_dialog("clear_sample"):
+        render_clear_sample_dialog()
 
 
 def render_onboarding() -> None:
@@ -888,7 +937,7 @@ def render_overview_summary(analysis, categories, history, start_date: date, end
             st.button("Review categories", key="review_uncategorized", type="tertiary",
                       on_click=navigate_to, args=("Transactions", "Needs a category"))
     else:
-        render_insights(AnalyticsService.insights(analysis, history, limit=1))
+        render_insights(AnalyticsService.insights(analysis, history, limit=1, excluded=recurring_exclusions()))
 
     with st.expander("More spending details"):
         if extra_metrics:
@@ -978,7 +1027,7 @@ def render_overview_details(analysis, categories, history, start_date: date, end
         st.caption("Import at least two comparable months of activity to see category changes.")
 
     unusual = AnalyticsService.unusual_expenses(analysis)
-    forecast = AnalyticsService.cash_flow_forecast(history)
+    forecast = AnalyticsService.cash_flow_forecast(history, recurring_exclusions())
     first, second = st.columns(2)
     with first, st.container(border=True, key="fbcard_unusual"):
         render_card_header("Unusual expenses")
@@ -1176,14 +1225,78 @@ def render_overview_habits(analysis, start_date: date, end_date: date) -> None:
         st.caption("Channel and location details come from connected banks; imported statements don't include them.")
 
 
+RECURRING_EXCLUSIONS_SETTING = "recurring_exclusions"
+CASH_BALANCE_SETTING = "manual_cash_balance"
+
+
+def recurring_exclusions() -> list[str]:
+    """Lowercased merchants the person said are not recurring bills."""
+    if "recurring_exclusion_keys" not in st.session_state:
+        try:
+            saved = data_service.get_json_setting(RECURRING_EXCLUSIONS_SETTING, [])
+        except SupabaseError:
+            saved = []
+        st.session_state.recurring_exclusion_keys = sorted({str(item) for item in saved})
+    return st.session_state.recurring_exclusion_keys
+
+
+def save_recurring_exclusions(keys: list[str]) -> None:
+    keys = sorted(set(keys))[:200]
+    try:
+        data_service.set_json_setting(RECURRING_EXCLUSIONS_SETTING, keys)
+        st.session_state.recurring_exclusion_keys = keys
+        st.rerun()
+    except (ValueError, SupabaseError):
+        st.error("Couldn't save this change. Try again.")
+
+
+def render_cash_flow_timeline(active, income, history) -> None:
+    st.header("Next 30 days")
+    today = date.today()
+    latest = max((item.date for item in history), default=None)
+    if latest and latest < today - timedelta(days=35):
+        st.caption(f"Your saved history ends {latest.strftime('%b %-d, %Y')}, so these expected dates may be out of date.")
+    saved = data_service.get_json_setting(CASH_BALANCE_SETTING, {})
+    try:
+        starting, as_of = money(saved["amount"]), date.fromisoformat(saved["as_of"])
+    except (KeyError, TypeError, ValueError):
+        starting, as_of = None, None
+    events = AnalyticsService.cash_flow_timeline(active, income, today, 30, starting)
+    if not events:
+        st.caption("No recurring bills or paydays are expected in the next 30 days.")
+    else:
+        st.plotly_chart(card_chart(make_cash_flow_timeline(events)), width="stretch")
+        _money_table(
+            pd.DataFrame(events)[["date", "label", "amount", "running"]].rename(columns={
+                "date": "Date", "label": "Expected", "amount": "Amount",
+                "running": "Balance" if starting is not None else "Change from today"}),
+            ["Amount", "Balance" if starting is not None else "Change from today"],
+            column_config={"Date": st.column_config.DateColumn(format="MMM D")},
+        )
+    with st.expander("Starting cash" + (f" · {format_currency(starting)} as of {as_of.strftime('%b %-d')}" if starting is not None else "")):
+        if as_of and as_of < today - timedelta(days=7):
+            st.warning("This balance is more than a week old. Update it for an accurate timeline.")
+        amount = st.number_input("Cash in checking today", step=50.0, key="manual_cash_amount",
+                                 value=float(starting) if starting is not None else 0.0)
+        if st.button("Save starting cash", key="manual_cash_save"):
+            try:
+                data_service.set_json_setting(CASH_BALANCE_SETTING, {"amount": str(money(amount)), "as_of": today.isoformat()})
+                st.rerun()
+            except (ValueError, SupabaseError):
+                st.error("Couldn't save the starting cash. Try again.")
+
+
 def render_overview_recurring(history) -> None:
     st.caption(
         "Uses your full history for the selected accounts and categories, because recurring "
         "charges and pay schedules only show up across several months."
     )
-    recurring = AnalyticsService.recurring_expenses(history)
+    excluded = recurring_exclusions()
+    recurring = AnalyticsService.recurring_expenses(history, excluded)
     active = [item for item in recurring if item["active"]]
     stopped = [item for item in recurring if not item["active"]]
+    income = AnalyticsService.income_summary(history)
+    render_cash_flow_timeline(active, income, history)
     st.header("Recurring charges")
     if active:
         first, second, third = st.columns(3)
@@ -1217,8 +1330,20 @@ def render_overview_recurring(history) -> None:
             },
         )
         st.caption("Detected from charges that repeat on a regular schedule at a similar amount.")
+        with st.popover("Not a recurring bill?", icon=":material/block:"):
+            merchant = st.selectbox("Charge", [item["merchant"] for item in active], key="recurring_exclude_choice")
+            if st.button("Stop treating it as recurring", key="recurring_exclude", type="primary"):
+                save_recurring_exclusions(excluded + [merchant.lower()])
     else:
         st.caption("No charges repeat on a regular schedule in this selection yet.")
+    if excluded:
+        with st.expander(f"Not treated as recurring ({len(excluded)})"):
+            for key in excluded:
+                name_col, restore_col = st.columns([4, 1], vertical_alignment="center")
+                name_col.write(key)
+                if restore_col.button("Restore", key=f"recurring_restore_{_plan_key(key)}", type="tertiary",
+                                      help=f"Treat {key} as recurring again"):
+                    save_recurring_exclusions([item for item in excluded if item != key])
     if stopped:
         with st.expander(f"Charges that seem to have stopped ({len(stopped)})"):
             for item in stopped:
@@ -1228,7 +1353,6 @@ def render_overview_recurring(history) -> None:
                 )
 
     st.header("Income")
-    income = AnalyticsService.income_summary(history)
     if not income:
         st.caption("No transactions categorized as Salary/Income in this selection.")
         return
@@ -1263,7 +1387,7 @@ def render_overview_balances(accounts: list[dict], history: list[dict], all_tran
     overview = AnalyticsService.balance_overview(accounts)
     counted = AnalyticsService.exclude_transfers(all_transactions)
     income = AnalyticsService.income_summary(counted)
-    recurring = AnalyticsService.recurring_expenses(counted)
+    recurring = AnalyticsService.recurring_expenses(counted, recurring_exclusions())
     today = date.today()
     safe = AnalyticsService.safe_to_spend(
         overview["cash_available"], recurring, income["next_pay_date"] if income else None, today
@@ -1392,23 +1516,161 @@ def render_overview(transactions, view: dict):
             st.info("Connect a bank to see USD balances and net worth history.")
 
 
-def _dismiss_transaction_editor() -> None:
-    st.session_state.transaction_editor_open = False
+def _finish_transaction_edit(message: str) -> None:
+    """Close the editor and reset table selection: saved edits can reorder rows."""
+    st.toast(message)
+    close_dialog()
+    st.session_state.pop("last_table_pick", None)
+    st.session_state.pop("rule_match_counts", None)
+    st.session_state.tx_table_version = st.session_state.get("tx_table_version", 0) + 1
+    st.rerun()
 
 
-@st.dialog("Edit a transaction", width="small", on_dismiss=_dismiss_transaction_editor)
-def render_transaction_editor(transactions) -> None:
-    transactions_by_id = {item.id: item for item in transactions}
-    selected_id = st.selectbox(
-        "Transaction",
-        options=[item.id for item in transactions],
-        format_func=lambda item_id: (
-            f"{transactions_by_id[item_id].date} · {transactions_by_id[item_id].description} · "
-            f"{format_currency(transactions_by_id[item_id].amount)}"
-        ),
-        key="category_transaction",
+def _rule_match_count(phrase: str) -> int:
+    """Saved transactions whose description or merchant contains the phrase (rules check descriptions only)."""
+    counts = st.session_state.setdefault("rule_match_counts", {})
+    if phrase not in counts:
+        counts[phrase] = repo.get_page({"search": phrase}, limit=1)["count"]
+    return counts[phrase]
+
+
+def render_category_editor(selected) -> None:
+    current_index = CATEGORIES.index(selected.category) if selected.category in CATEGORIES else 0
+    suggested = rule_keyword([selected.description], selected.merchant_name) or ""
+    with st.form(f"category_correction_{selected.id}", border=False):
+        new_category = st.selectbox("Category", CATEGORIES, index=current_index)
+        with st.expander("Categorize similar transactions"):
+            rule_keyword_text = st.text_input(
+                "Merchant name or phrase", value=suggested, max_chars=256,
+                help="Descriptions that contain this exact phrase use the selected category.",
+            )
+            if suggested:
+                matches = _rule_match_count(suggested)
+                st.caption(f'About {matches:,} saved transaction(s) contain "{suggested}".')
+                warning = keyword_warning(suggested, matches, catalog["count"])
+                if warning:
+                    st.warning(warning)
+            else:
+                st.caption("We couldn't find a reliable merchant phrase in this description. Type one to create a rule.")
+            save_rule = st.checkbox("Use this category for future imports that contain the phrase")
+            apply_similar = st.checkbox(
+                "Also update saved transactions that contain the phrase",
+                help="Replaces categories you set by hand and the categories of split parts for those transactions.",
+            )
+        submitted = st.form_submit_button(
+            "Save category",
+            type="primary",
+            width="stretch",
+            help="Save this category and any matching rule you chose above.",
+        )
+    if submitted:
+        phrase = rule_keyword_text.strip() if save_rule or apply_similar else ""
+        if (save_rule or apply_similar) and not phrase:
+            st.error("Enter a merchant name or phrase, or uncheck the rule options.")
+        elif phrase and is_processor_phrase(phrase):
+            st.error(f'"{phrase}" names a payment method, not a merchant. Enter the merchant\'s name instead.')
+        else:
+            try:
+                data_service.correct_category(selected.id, new_category, phrase, apply_similar)
+                _finish_transaction_edit("Category saved." if not apply_similar else "Category saved and matching transactions updated.")
+            except (ValueError, SupabaseError):
+                st.error("Couldn't confirm the category save. Your choices are still here; retry to recover its saved result.")
+
+
+def render_split_editor(selected) -> None:
+    # Split the source, not a projected allocation. Re-splitting replaces its
+    # category allocations and keeps the provider/import ID unchanged.
+    source_id = selected.source_transaction_id or selected.id
+    source_amount = abs(selected.source_amount if selected.source_amount is not None else selected.amount)
+    if source_amount < Decimal("0.02"):
+        st.caption("This amount is too small to split.")
+        return
+    if selected.source_transaction_id or selected.split_needs_review:
+        st.info(f"This purchase is already split. Saving replaces both parts of the {format_currency(source_amount)} purchase.")
+    category_one = st.selectbox("First category", CATEGORIES, key=f"split_cat_1_{source_id}",
+                                index=CATEGORIES.index(selected.category) if selected.category in CATEGORIES else 0)
+    # Keys are per purchase: a remembered amount must never exceed another purchase's limit.
+    amount_one = st.number_input(
+        "First amount",
+        min_value=0.01,
+        max_value=float(source_amount - Decimal("0.01")),
+        value=float(round(source_amount / 2, 2)),
+        step=0.01,
+        key=f"split_amount_{source_id}",
     )
-    selected = transactions_by_id[selected_id]
+    category_two = st.selectbox("Second category", CATEGORIES, key=f"split_cat_2_{source_id}")
+    amount_two = source_amount - money(amount_one)
+    st.caption(f"Second amount: {format_currency(amount_two)}")
+    if st.button(
+        "Split transaction", type="primary", width="stretch",
+        help="Keep the original transaction and divide its amount between two categories. Existing allocations are replaced.",
+    ):
+        try:
+            repo.split_transaction(source_id, category_one, amount_one, category_two, amount_two)
+            _finish_transaction_edit("Transaction split.")
+        except (ValueError, SupabaseError):
+            st.error("The split response could not be confirmed. Retry to recover its saved result.")
+
+
+def parse_tags(text: str) -> list[str]:
+    return sorted({tag.strip().lower() for tag in text.replace("#", " ").replace(",", " ").split() if tag.strip()})
+
+
+def render_notes_editor(selected) -> None:
+    key = selected.source_transaction_id or selected.id
+    notes = st.text_area("Notes", value=selected.notes or "", max_chars=2000, key=f"notes_{key}")
+    tags = st.text_input("Tags", value=" ".join(selected.tags), key=f"tags_{key}",
+                         placeholder="e.g. japan-trip reimbursable", help="Separate tags with spaces or commas.")
+    if selected.source_transaction_id:
+        st.caption("Notes and tags apply to the whole split purchase.")
+    if st.button("Save notes", type="primary", width="stretch"):
+        try:
+            repo.annotate(selected.id, notes, parse_tags(tags))
+            _finish_transaction_edit("Notes saved.")
+        except (ValueError, SupabaseError):
+            st.error("Couldn't confirm the save. Use up to 20 tags of at most 40 characters, then retry.")
+    if selected.id.startswith("manual:"):
+        confirm = st.checkbox("I want to delete this manual transaction", key=f"confirm_delete_{selected.id}")
+        if st.button("Delete transaction", disabled=not confirm, width="stretch"):
+            try:
+                repo.delete_manual_transaction(selected.id)
+                _finish_transaction_edit("Transaction deleted.")
+            except (ValueError, SupabaseError):
+                st.error("Couldn't confirm the deletion. Retry to recover its saved result.")
+
+
+@st.dialog("Add a transaction", on_dismiss=close_dialog)
+def render_add_transaction_dialog() -> None:
+    accounts = {f'{row["name"]} · {row["account_type"]}': row for row in catalog["accounts"] if not row.get("plaid_item_id")}
+    choices = ["Cash"] + [label for label in accounts if label != "Cash · Checking"]
+    when = st.date_input("Date", value=date.today(), key="manual_date")
+    description = st.text_input("Description", max_chars=256, key="manual_description", placeholder="e.g. Farmers market")
+    direction = st.segmented_control("Direction", ["Money out", "Money in"], default="Money out", required=True, key="manual_direction")
+    amount = st.number_input("Amount", min_value=0.01, value=10.0, step=1.0, key="manual_amount")
+    category = st.selectbox("Category", CATEGORIES, index=CATEGORIES.index("Uncategorized"), key="manual_category")
+    account = st.selectbox("Account", choices, key="manual_account",
+                           help="Bank-connected accounts aren't listed: their own copy of a purchase arrives with the next sync.")
+    notes = st.text_input("Notes (optional)", max_chars=2000, key="manual_notes")
+    tags = st.text_input("Tags (optional)", key="manual_tags", placeholder="e.g. japan-trip")
+    # One ID per entry, so retrying an uncertain save can't add a second copy.
+    identifier = st.session_state.setdefault("manual_transaction_id", f"manual:{uuid.uuid4().hex}")
+    if st.button("Save transaction", type="primary", width="stretch", disabled=not description.strip()):
+        row = accounts.get(account)
+        signed = money(amount) if direction == "Money in" else -money(amount)
+        try:
+            repo.add_manual_transaction(Transaction(
+                id=identifier, date=when, description=description.strip(), amount=signed, category=category,
+                account_id=row["id"] if row else None,
+                account_name=row["name"] if row else "Cash", account_type=row["account_type"] if row else "Checking",
+            ), notes, parse_tags(tags))
+            st.session_state.pop("manual_transaction_id", None)
+            _finish_transaction_edit("Transaction added.")
+        except (ValueError, SupabaseError):
+            st.error("Couldn't confirm the save. Your entry is still here; retry to recover its saved result.")
+
+
+@st.dialog("Edit a transaction", width="medium", on_dismiss=close_dialog)
+def render_transaction_editor(selected) -> None:
     st.write(selected.description)
     amount_class = "fb-positive" if selected.amount > 0 else "fb-negative"
     st.markdown(
@@ -1419,40 +1681,109 @@ def render_transaction_editor(transactions) -> None:
         f"{format_currency(selected.amount)}</p>",
         unsafe_allow_html=True,
     )
-    current_index = CATEGORIES.index(selected.category) if selected.category in CATEGORIES else 0
-    with st.form("category_correction", border=False):
-        new_category = st.selectbox("Category", CATEGORIES, index=current_index)
-        with st.expander("Categorize similar transactions"):
-            rule_keyword = st.text_input(
-                "Merchant name or phrase (optional)", max_chars=256,
-                help="Future imports whose description contains this phrase will use the selected category. Leave blank to change only this transaction.",
-            )
-            apply_similar = st.checkbox("Also update saved transactions matching this phrase")
-        submitted = st.form_submit_button(
-            "Save category",
-            type="primary",
-            width="stretch",
-            help="Save this category and any matching rule you entered above.",
-        )
-    if submitted:
-        if apply_similar and not rule_keyword.strip():
-            st.error("Enter a merchant name or phrase, or uncheck the option to update matching saved transactions.")
-        else:
-            try:
-                data_service.correct_category(selected_id, new_category, rule_keyword, apply_similar)
-                st.toast("Category saved." if not apply_similar else "Category saved and matching transactions updated.")
-                st.session_state.transaction_editor_open = False
-                st.rerun()
-            except (ValueError, SupabaseError):
-                st.error("Couldn't confirm the category save. Your choices are still here; retry to recover its saved result.")
-
+    source_amount = selected.source_amount if selected.source_amount is not None else selected.amount
+    tabs = ["Category & rule"]
+    if source_amount < 0 or (source_amount > 0 and selected.allocations):
+        tabs.append("Split")
+    tabs.append("Notes & tags")
+    tab = view_switcher("Edit", tabs, "transaction_editor_tab")
+    if tab == "Split":
+        render_split_editor(selected)
+    elif tab == "Notes & tags":
+        render_notes_editor(selected)
+    else:
+        render_category_editor(selected)
     if st.button("Cancel", width="stretch"):
-        st.session_state.transaction_editor_open = False
+        close_dialog()
         st.rerun()
+
+
+def render_triage_queue() -> None:
+    """Categorize uncategorized purchases one merchant at a time."""
+    groups = uncategorized_groups(repo.get_filtered(st.session_state.transaction_filters))
+    if not groups:
+        return
+    st.subheader("Sort by merchant")
+    st.caption("Choose a category once for every uncategorized purchase from a merchant.")
+    choices = [category for category in CATEGORIES if category != "Uncategorized"]
+    for group in groups:
+        key = hashlib.sha256((group["keyword"] or group["merchant"]).encode()).hexdigest()[:12]
+        with st.container(border=True, key=f"triage_{key}"):
+            st.markdown(
+                f"**{html.escape(group['merchant'])}** · {group['count']} purchase(s) · {format_currency(group['total'])}",
+            )
+            if group["count"] > 1 or group["sample"] != group["merchant"]:
+                st.caption(f"e.g. {group['sample']}")
+            category_col, action_col = st.columns([3, 1], vertical_alignment="bottom")
+            category = category_col.selectbox(
+                f"Category for {group['merchant']}", choices, index=None, placeholder="Choose a category",
+                key=f"triage_category_{key}",
+            )
+            save_rule = bool(group["keyword"]) and st.checkbox(
+                f'Also use it for future imports containing "{group["keyword"]}"', value=True,
+                key=f"triage_rule_{key}",
+            )
+            if action_col.button("Apply", key=f"triage_apply_{key}", type="primary", width="stretch", disabled=category is None):
+                try:
+                    if save_rule:
+                        repo.triage_category(group["ids"], category, group["keyword"])
+                    else:
+                        repo.correct_categories(group["ids"], category)
+                    st.toast(f"{group['count']} purchase(s) from {group['merchant']} moved to {category}.")
+                    st.session_state.tx_table_version = st.session_state.get("tx_table_version", 0) + 1
+                    st.rerun()
+                except (ValueError, SupabaseError):
+                    st.error("Couldn't confirm this change. Some purchases may have changed; retry to recover its saved result.")
 
 
 def _show_all_transactions() -> None:
     st.session_state.tx_view = "All"
+
+
+DUPLICATE_DISMISSALS_SETTING = "duplicate_dismissals"
+TRANSACTION_SOURCES = {"plaid:": "Bank", "statement:": "Statement", "manual:": "Manual"}
+
+
+def duplicate_dismissals() -> list[str]:
+    try:
+        return data_service.get_json_setting(DUPLICATE_DISMISSALS_SETTING, [])
+    except SupabaseError:
+        return []
+
+
+def _transaction_source(item) -> str:
+    return next((label for prefix, label in TRANSACTION_SOURCES.items() if item.id.startswith(prefix)), "Saved")
+
+
+def render_duplicate_group(group) -> None:
+    group_key = AnalyticsService.duplicate_group_key(group)
+    key = _plan_key(group_key)
+    with st.container(border=True, key=f"duplicate_{key}"):
+        st.markdown(f"**{html.escape(group[0].description)}** · {group[0].date.strftime('%b %-d, %Y')} · "
+                    f"{format_currency(group[0].amount)} · {html.escape(group[0].account_name)}")
+        # Keep a bank copy when there is one: the bank would re-create a removed one.
+        keep = next((item for item in group if item.id.startswith("plaid:")), group[0])
+        for index, item in enumerate(group, start=1):
+            label_col, action_col = st.columns([3, 1], vertical_alignment="center")
+            label_col.write(f"Copy {index} · {_transaction_source(item)} · {item.category}")
+            removable = item.id != keep.id and not item.id.startswith("plaid:") and not item.allocations
+            if removable and action_col.button(
+                "Remove this copy", key=f"duplicate_remove_{key}_{index}", type="tertiary", width="stretch",
+                help=f"Remove copy {index} of {item.description} and keep copy {group.index(keep) + 1}",
+            ):
+                try:
+                    repo.merge_duplicate(keep.id, item.id)
+                    st.toast("Duplicate removed.")
+                    st.session_state.tx_table_version = st.session_state.get("tx_table_version", 0) + 1
+                    st.rerun()
+                except (ValueError, SupabaseError):
+                    st.error("Couldn't confirm the removal. It may have changed; retry to recover its saved result.")
+        if st.button("Keep both", key=f"duplicate_keep_{key}", help="These are separate purchases. Stop suggesting them."):
+            try:
+                data_service.set_json_setting(DUPLICATE_DISMISSALS_SETTING, (duplicate_dismissals() + [group_key])[-300:])
+                st.rerun()
+            except (ValueError, SupabaseError):
+                st.error("Couldn't save this choice. Try again.")
 
 
 def render_transactions(transactions):
@@ -1472,7 +1803,7 @@ def render_transactions(transactions):
     if any(item.split_needs_review for item in transactions):
         st.warning("A bank update changed the amount of a split transaction. Its current total is counted once; review and split it again below.")
 
-    duplicates = AnalyticsService.duplicate_candidates(transactions)
+    duplicates = AnalyticsService.duplicate_candidates(transactions, duplicate_dismissals())
     duplicate_ids = {item.id for group in duplicates for item in group}
     views = {
         "All": transactions,
@@ -1480,7 +1811,9 @@ def render_transactions(transactions):
         "Pending": [item for item in transactions if item.pending],
         "Possible duplicates": [item for item in transactions if item.id in duplicate_ids],
     }
-    view_col, export_col = st.container(key="tx_toolbar").columns([3, 1], vertical_alignment="center")
+    view_col, add_col, export_col = st.container(key="tx_toolbar").columns([3, 1, 1], vertical_alignment="center")
+    add_col.button("Add transaction", icon=":material/add:", width="stretch", on_click=open_dialog,
+                   args=("add_transaction",), help="Record a cash purchase or an adjustment that isn't on a statement.")
     with view_col:
         view = view_switcher(
             "Show", list(views), "tx_view", format_func=lambda name: name
@@ -1499,6 +1832,8 @@ def render_transactions(transactions):
         st.rerun()
     status.caption(f"Page {len(st.session_state.transaction_cursors)} · up to 200 transactions per page. Duplicate suggestions use this page.")
     shown = views[view]
+    if view == "Needs a category" and shown:
+        render_triage_queue()
     if not shown:
         st.success(
             {
@@ -1510,90 +1845,116 @@ def render_transactions(transactions):
         st.button("View all transactions", key="tx_empty_all", on_click=_show_all_transactions)
         return
 
-    picked_row = render_transaction_table(shown, selection_key=f"transactions_table_{view}")
+    picked_row = render_transaction_table(shown, selection_key=f"transactions_table_{view}",
+                                          table_version=st.session_state.get("tx_table_version", 0))
     shown_ids = [item.id for item in shown]
     if picked_row is not None and picked_row < len(shown):
         picked_id = shown_ids[picked_row]
-        # Follow a new table click, but let the menu below change the choice afterwards.
+        # Open the editor for a new table click only, not on every rerun.
         if st.session_state.get("last_table_pick") != picked_id:
             st.session_state.last_table_pick = picked_id
-            st.session_state.category_transaction = picked_id
-            st.session_state.transaction_editor_requested = True
-    if st.session_state.get("category_transaction") not in shown_ids:
-        st.session_state.category_transaction = shown_ids[0]
+            open_dialog("transaction", id=picked_id)
     with st.container(key="tx_desktop_edit"):
-        if st.button("Edit selected transaction", icon=":material/edit:"):
-            st.session_state.transaction_editor_requested = True
-    if st.session_state.pop("transaction_editor_requested", False):
-        st.session_state.transaction_editor_open = True
-    if st.session_state.get("transaction_editor_open", False):
-        render_transaction_editor(shown)
-
-    with st.expander("Split a transaction between two categories"):
-        # Split the source, not a projected allocation. Re-splitting replaces its
-        # category allocations and keeps the provider/import ID unchanged.
-        sources = {}
-        for item in transactions:
-            source_id = item.source_transaction_id or item.id
-            amount = item.source_amount if item.source_amount is not None else item.amount
-            if amount < 0 or (amount > 0 and item.allocations):
-                sources[source_id] = item.model_copy(update={"id": source_id, "amount": amount})
-        expense_options = list(sources.values())
-        if expense_options:
-            expenses_by_id = {item.id: item for item in expense_options}
-            # Filters and provider removals can invalidate a remembered source.
-            if st.session_state.get("split_transaction") not in expenses_by_id:
-                st.session_state.pop("split_transaction", None)
-            split_id = st.selectbox(
-                "Transaction to split",
-                [item.id for item in expense_options],
-                format_func=lambda item_id: (
-                    f"{expenses_by_id[item_id].date} · {expenses_by_id[item_id].description} · "
-                    f"{format_currency(abs(expenses_by_id[item_id].amount))}"
-                ),
-                key="split_transaction",
-            )
-            split_item = expenses_by_id[split_id]
-            with st.form("split_form"):
-                category_one = st.selectbox("First category", CATEGORIES, key="split_cat_1")
-                amount_one = st.number_input(
-                    "First amount",
-                    min_value=0.01,
-                    max_value=max(float(abs(split_item.amount) - Decimal("0.01")), 0.01),
-                    value=float(round(abs(split_item.amount) / 2, 2)),
-                    step=0.01,
-                )
-                category_two = st.selectbox("Second category", CATEGORIES, key="split_cat_2")
-                amount_two = abs(split_item.amount) - money(amount_one)
-                st.caption(f"Second amount: {format_currency(amount_two)}")
-                split_submitted = st.form_submit_button(
-                    "Split transaction",
-                    help="Keep the original transaction and divide its amount between two categories. Existing allocations are replaced.",
-                )
-            if split_submitted:
-                try:
-                    repo.split_transaction(
-                        split_id, category_one, amount_one, category_two, amount_two
-                    )
-                    st.success("Transaction split successfully.")
-                    st.rerun()
-                except SupabaseError:
-                    st.error("The split response could not be confirmed. Retry to recover its saved result.")
+        target = st.session_state.get("last_table_pick")
+        st.button(
+            "Edit selected transaction", icon=":material/edit:", on_click=open_dialog, args=("transaction",),
+            kwargs={"id": target if target in shown_ids else shown_ids[0]},
+            help="Edits the row you last clicked in the table, or the first row.",
+        )
+    editing = active_dialog("transaction")
+    if editing:
+        selected = next((item for item in transactions if item.id == editing.get("id")), None)
+        if selected is None:
+            # Filters, splits or a bank update can remove the row being edited.
+            close_dialog()
+            st.toast("That transaction is no longer in this view.")
         else:
-            st.caption("No expenses are available to split.")
+            render_transaction_editor(selected)
+    elif active_dialog("add_transaction"):
+        render_add_transaction_dialog()
 
-    with st.expander(f"Potential duplicates ({len(duplicates)})"):
+    with st.expander(f"Potential duplicates ({len(duplicates)})", expanded=view == "Possible duplicates"):
         if not duplicates:
             st.caption("No exact duplicate date, amount, merchant, and account combinations found.")
-        for group in duplicates:
-            st.write(
-                f"{group[0].date} · {group[0].description} · "
-                f"{format_currency(group[0].amount)} · {len(group)} copies"
+        else:
+            st.caption(
+                "Removing an imported copy points its statement row at the copy you keep, so re-importing the file "
+                "won't bring it back. Undo is then unavailable for that import. Bank copies can only be kept."
             )
+        for group in duplicates:
+            render_duplicate_group(group)
+
+
+PLAN_SAVE_ERROR = "Couldn't confirm the save. Your choices are still here; retry to recover its saved result."
+
+
+def _plan_key(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def _plan_saved(message: str) -> None:
+    st.toast(message)
+    close_dialog()
+    st.rerun()
+
+
+def _use_suggested_limit(key: str, amount: Decimal) -> None:
+    st.session_state[key] = float(amount.to_integral_value(rounding="ROUND_CEILING"))
+
+
+@st.dialog("Budget", on_dismiss=close_dialog)
+def render_budget_dialog(budgets, transactions, category=None) -> None:
+    limits = {item.category: item.monthly_limit for item in budgets}
+    editing = category in limits
+    if editing:
+        st.markdown(f"**{html.escape(category)}**")
+    else:
+        choices = [item for item in CATEGORIES if item not in TRANSFER_CATEGORIES]
+        category = st.selectbox("Category", choices, index=choices.index(category) if category in choices else 0,
+                                key="budget_dialog_category")
+        if category in limits:
+            st.caption(f"Updates the existing {format_currency(limits[category])} budget for {category}.")
+    limit_key = f"budget_limit_{_plan_key(category)}"
+    history = AnalyticsService.category_spend_history(transactions, category)
+    if history:
+        st.caption(
+            f"{history['last_label']}: {format_currency(history['last_month'])} · "
+            f"{history['months']}-month average: {format_currency(history['average'])}"
+        )
+        st.button(f"Use the {history['months']}-month average", key="budget_use_average",
+                  on_click=_use_suggested_limit, args=(limit_key, history["average"]),
+                  disabled=not history["average"], help="Rounded up to the next whole dollar.")
+    # Seeded through state, not value=, because the suggestion button also sets it.
+    st.session_state.setdefault(limit_key, float(limits.get(category, 500)))
+    limit = st.number_input("Monthly limit", min_value=1.0, step=25.0, key=limit_key)
+    if st.button("Save budget", type="primary", width="stretch"):
+        try:
+            repo.upsert_budget(Budget(category=category, monthly_limit=limit))
+            _plan_saved("Budget saved.")
+        except (ValueError, SupabaseError):
+            st.error(PLAN_SAVE_ERROR)
+
+
+@st.dialog("Remove budget", on_dismiss=close_dialog)
+def render_remove_budget_dialog(category) -> None:
+    st.write(f"Remove the {category} budget? Transactions and categories are not affected.")
+    remove, cancel = st.columns(2)
+    if remove.button("Remove budget", type="primary", width="stretch"):
+        try:
+            repo.delete_budget(category)
+            _plan_saved("Budget removed.")
+        except SupabaseError:
+            st.error(PLAN_SAVE_ERROR)
+    if cancel.button("Cancel", width="stretch"):
+        close_dialog()
+        st.rerun()
 
 
 def render_budgets(transactions) -> None:
-    st.header("Monthly budgets")
+    title, action = st.columns([3, 1], vertical_alignment="bottom")
+    title.header("Monthly budgets")
+    action.button("New budget", icon=":material/add:", type="primary", width="stretch",
+                  on_click=open_dialog, args=("budget",))
     st.caption("Includes all accounts and categories for the selected month, regardless of dashboard filters.")
     budgets = repo.get_budgets()
     months = sorted({item.date.strftime("%Y-%m") for item in transactions})
@@ -1624,7 +1985,16 @@ def render_budgets(transactions) -> None:
                 meta = "This month hasn't started yet."
             else:
                 meta = f"Month complete · {row['spent_share']:.0f}% of budget used"
-            st.markdown(f'<p class="fb-budget-meta">{meta}</p>', unsafe_allow_html=True)
+            key = _plan_key(row["category"])
+            meta_col, edit_col, remove_col = st.container(key=f"budget_card_{key}").columns(
+                [4, 1, 1], vertical_alignment="center")
+            meta_col.markdown(f'<p class="fb-budget-meta">{meta}</p>', unsafe_allow_html=True)
+            edit_col.button("Edit", key=f"budget_edit_{key}", type="tertiary", width="stretch",
+                            help=f"Change the {row['category']} limit",
+                            on_click=open_dialog, args=("budget",), kwargs={"category": row["category"]})
+            remove_col.button("Remove", key=f"budget_remove_{key}", type="tertiary", width="stretch",
+                              help=f"Remove the {row['category']} budget",
+                              on_click=open_dialog, args=("remove_budget",), kwargs={"category": row["category"]})
             if row["status"] == "Over budget":
                 st.error(f"Over budget by {format_currency(row['spent'] - row['limit'])}")
             elif row["status"] == "Projected to go over":
@@ -1634,6 +2004,18 @@ def render_budgets(transactions) -> None:
                 )
     elif not budgets:
         st.info("Create a category budget to start tracking monthly limits.")
+
+    unbudgeted = AnalyticsService.unbudgeted_spending(budgets, transactions, selected_month) if selected_month else []
+    if unbudgeted:
+        with st.container(border=True, key="unbudgeted_spending"):
+            total = sum((row["spent"] for row in unbudgeted), Decimal(0))
+            st.markdown(f"**Unbudgeted spending: {format_currency(total)}** in {len(unbudgeted)} categor{'y' if len(unbudgeted) == 1 else 'ies'}")
+            for row in unbudgeted[:3]:
+                label_col, action_col = st.columns([4, 1], vertical_alignment="center")
+                label_col.write(f"{row['category']} · {format_currency(row['spent'])}")
+                action_col.button("Set budget", key=f"budget_add_{_plan_key(row['category'])}", type="tertiary",
+                                  width="stretch", help=f"Create a budget for {row['category']}",
+                                  on_click=open_dialog, args=("budget",), kwargs={"category": row["category"]})
 
     if budgets and selected_month and len(months) >= 2:
         history_months = [month for month in months if month <= selected_month][-6:]
@@ -1662,34 +2044,81 @@ def render_budgets(transactions) -> None:
             )
             st.plotly_chart(make_budget_history_chart(history["cells"]), width="stretch")
 
-    with st.form("budget_form"):
-        budget_category = st.selectbox("Category", CATEGORIES, key="budget_category")
-        budget_limit = st.number_input("Monthly limit", min_value=1.0, value=500.0, step=25.0)
-        budget_submit = st.form_submit_button(
-            "Save budget",
-            type="primary",
-            help="Create a new monthly category limit or update the existing limit for that category.",
-        )
-    if budget_submit:
-        repo.upsert_budget(Budget(category=budget_category, monthly_limit=budget_limit))
-        st.success("Budget saved.")
-        st.rerun()
+    if dialog := active_dialog("budget"):
+        render_budget_dialog(budgets, transactions, dialog.get("category"))
+    elif dialog := active_dialog("remove_budget"):
+        render_remove_budget_dialog(dialog["category"])
 
-    if budgets:
-        with st.expander("Remove a budget"):
-            remove_budget = st.selectbox("Budget", [item.category for item in budgets])
-            confirm_budget = st.checkbox("I understand this removes the selected budget")
-            if st.button(
-                "Remove budget",
-                disabled=not confirm_budget,
-                help="Delete this spending limit. Transactions and categories are not affected.",
-            ):
-                repo.delete_budget(remove_budget)
-                st.rerun()
+
+def _goal_by_id(goal_id):
+    # Dialog arguments are frozen for the dialog's reruns; read the saved goal again.
+    return next((item for item in repo.get_goals() if item.id == goal_id), None)
+
+
+@st.dialog("Savings goal", on_dismiss=close_dialog)
+def render_goal_dialog(goal_id=None) -> None:
+    goal = _goal_by_id(goal_id) if goal_id is not None else None
+    suffix = goal_id if goal_id is not None else "new"
+    name = st.text_input("Goal name", value=goal.name if goal else "", key=f"goal_name_{suffix}")
+    target = st.number_input("Target amount", min_value=1.0, step=100.0, key=f"goal_target_{suffix}",
+                             value=float(goal.target_amount) if goal else 1000.0)
+    current = st.number_input("Already saved", min_value=0.0, step=50.0, key=f"goal_current_{suffix}",
+                              value=float(goal.current_amount) if goal else 0.0)
+    has_date = st.checkbox("Set a target date", value=bool(goal and goal.target_date), key=f"goal_has_date_{suffix}")
+    target_date = st.date_input("Target date", value=goal.target_date if goal and goal.target_date else date.today(),
+                                disabled=not has_date, key=f"goal_date_{suffix}")
+    if st.button("Save goal", type="primary", width="stretch"):
+        if not name.strip():
+            st.error("Enter a name for the goal.")
+            return
+        try:
+            repo.save_goal(SavingsGoal(id=goal.id if goal else None, name=name.strip(), target_amount=target,
+                                       current_amount=current, target_date=target_date if has_date else None))
+            _plan_saved("Goal saved.")
+        except (ValueError, SupabaseError):
+            st.error(PLAN_SAVE_ERROR)
+
+
+@st.dialog("Add funds", on_dismiss=close_dialog)
+def render_add_funds_dialog(goal_id) -> None:
+    goal = _goal_by_id(goal_id)
+    if goal is None:
+        st.info("This goal no longer exists.")
+        return
+    st.write(f"{goal.name}: {format_currency(goal.current_amount)} of {format_currency(goal.target_amount)} saved.")
+    amount = st.number_input("Amount to add", min_value=0.01, value=50.0, step=10.0, key=f"goal_funds_amount_{goal_id}")
+    if st.button("Add funds", key="goal_add_confirm", type="primary", width="stretch"):
+        try:
+            repo.save_goal(goal.model_copy(update={"current_amount": goal.current_amount + money(amount)}))
+            _plan_saved(f"Added {format_currency(money(amount))} to {goal.name}.")
+        except (ValueError, SupabaseError):
+            st.error(PLAN_SAVE_ERROR)
+
+
+@st.dialog("Remove goal", on_dismiss=close_dialog)
+def render_remove_goal_dialog(goal_id) -> None:
+    goal = _goal_by_id(goal_id)
+    if goal is None:
+        st.info("This goal no longer exists.")
+        return
+    st.write(f"Remove {goal.name}? Transaction history is not affected.")
+    remove, cancel = st.columns(2)
+    if remove.button("Remove goal", type="primary", width="stretch"):
+        try:
+            repo.delete_goal(goal_id)
+            _plan_saved("Goal removed.")
+        except SupabaseError:
+            st.error(PLAN_SAVE_ERROR)
+    if cancel.button("Cancel", width="stretch"):
+        close_dialog()
+        st.rerun()
 
 
 def render_goals(transactions) -> None:
-    st.header("Savings goals")
+    title, action = st.columns([3, 1], vertical_alignment="bottom")
+    title.header("Savings goals")
+    action.button("New goal", icon=":material/add:", type="primary", width="stretch",
+                  on_click=open_dialog, args=("goal",))
     goals = repo.get_goals()
     today = date.today()
     average_savings = AnalyticsService.average_monthly_savings(transactions)
@@ -1717,7 +2146,15 @@ def render_goals(transactions) -> None:
                     notes.append("more than your recent average net savings")
             if plan["projected_date"]:
                 notes.append(f"projected to finish around {plan['projected_date'].strftime('%b %Y')}")
-        st.markdown(f'<p class="fb-budget-meta">{" · ".join(notes)}</p>', unsafe_allow_html=True)
+        notes_col, add_col, edit_col, remove_col = st.container(key=f"goal_card_{goal.id}").columns(
+            [3, 1, 1, 1], vertical_alignment="center")
+        notes_col.markdown(f'<p class="fb-budget-meta">{" · ".join(notes)}</p>', unsafe_allow_html=True)
+        add_col.button("Add funds", key=f"goal_add_funds_{goal.id}", type="tertiary", width="stretch",
+                       help=f"Add savings to {goal.name}", on_click=open_dialog, args=("add_funds",), kwargs={"id": goal.id})
+        edit_col.button("Edit", key=f"goal_edit_{goal.id}", type="tertiary", width="stretch",
+                        help=f"Edit {goal.name}", on_click=open_dialog, args=("goal",), kwargs={"id": goal.id})
+        remove_col.button("Remove", key=f"goal_remove_{goal.id}", type="tertiary", width="stretch",
+                          help=f"Remove {goal.name}", on_click=open_dialog, args=("remove_goal",), kwargs={"id": goal.id})
     if not goals:
         st.info("Create a goal for an emergency fund, trip, or major purchase.")
     elif average_savings is not None:
@@ -1731,58 +2168,12 @@ def render_goals(transactions) -> None:
     else:
         st.caption("Import at least one complete month of activity to compare goals with your savings pace.")
 
-    with st.form("goal_form"):
-        goal_name = st.text_input("Goal name")
-        goal_target = st.number_input("Target amount", min_value=1.0, value=1000.0, step=100.0)
-        goal_current = st.number_input("Already saved", min_value=0.0, value=0.0, step=50.0)
-        has_date = st.checkbox("Set a target date")
-        goal_date = st.date_input("Target date", value=date.today(), disabled=not has_date)
-        goal_submit = st.form_submit_button(
-            "Create goal",
-            type="primary",
-            help="Save a target amount, current progress, and optional target date.",
-        )
-    if goal_submit:
-        if not goal_name.strip():
-            st.error("Enter a name for the goal.")
-        else:
-            repo.save_goal(
-                SavingsGoal(
-                    name=goal_name.strip(),
-                    target_amount=goal_target,
-                    current_amount=goal_current,
-                    target_date=goal_date if has_date else None,
-                )
-            )
-            st.success("Goal created.")
-            st.rerun()
-
-    if goals:
-        with st.expander("Update or remove a goal"):
-            goal_id = st.selectbox(
-                "Goal", [item.id for item in goals], format_func=lambda item_id: next(item.name for item in goals if item.id == item_id)
-            )
-            goal = next(item for item in goals if item.id == goal_id)
-            new_current = st.number_input(
-                "Current saved amount",
-                min_value=0.0,
-                value=float(goal.current_amount),
-                step=50.0,
-            )
-            if st.button(
-                "Update progress",
-                help="Save the latest amount accumulated toward this goal.",
-            ):
-                repo.save_goal(goal.model_copy(update={"current_amount": money(new_current)}))
-                st.rerun()
-            confirm_goal = st.checkbox("I understand this removes the selected goal")
-            if st.button(
-                "Remove goal",
-                disabled=not confirm_goal,
-                help="Permanently remove this goal. Transaction history is not affected.",
-            ):
-                repo.delete_goal(goal_id)
-                st.rerun()
+    if dialog := active_dialog("goal"):
+        render_goal_dialog(dialog.get("id"))
+    elif dialog := active_dialog("add_funds"):
+        render_add_funds_dialog(dialog["id"])
+    elif dialog := active_dialog("remove_goal"):
+        render_remove_goal_dialog(dialog["id"])
 
 
 def render_plan(transactions) -> None:
@@ -1797,8 +2188,44 @@ def render_plan(transactions) -> None:
 def render_compare():
     render_page_header(
         "Compare",
-        "Upload two to six statements for a side-by-side look. Nothing here is saved to your history.",
+        "Line up months or quarters of saved history, or upload statements for a one-off look.",
     )
+    if view_switcher("Compare source", ["Saved history", "Uploaded files"], "compare_source") == "Saved history":
+        render_compare_saved()
+    else:
+        render_compare_uploads()
+
+
+def render_compare_saved() -> None:
+    if not catalog["count"]:
+        st.info("Import a statement or connect a bank to compare saved history.")
+        return
+    granularity = view_switcher("Period length", ["Month", "Quarter"], "compare_granularity")
+    periods = AnalyticsService.history_periods(
+        date.fromisoformat(catalog["min_date"]), date.fromisoformat(catalog["max_date"]), granularity
+    )
+    by_label = {item["label"]: item for item in periods}
+    chosen = st.multiselect(
+        "Periods to compare", list(by_label), default=list(by_label)[-2:], max_selections=6,
+        format_func=lambda label: label + (" (partial)" if by_label[label]["partial"] else ""),
+        key=f"compare_periods_{granularity}",
+        help="Partial periods are missing days at the start or end of your saved history.",
+    )
+    if len(chosen) < 2:
+        st.info("Choose two to six periods to compare.")
+        return
+    selected = sorted((by_label[label] for label in chosen), key=lambda item: item["start"])
+    # One read for the whole span, bucketed locally, instead of a query per period.
+    rows = repo.get_filtered({"start": selected[0]["start"].isoformat(), "end": selected[-1]["end"].isoformat()})
+    st.caption("Includes every saved account, regardless of Overview filters.")
+    render_comparison([
+        {"label": item["label"] + (" (partial)" if item["partial"] else ""), "start": item["start"],
+         "transactions": [row for row in rows if item["start"] <= row.date <= item["end"]]}
+        for item in selected
+    ])
+
+
+def render_compare_uploads() -> None:
     st.caption(
         "Upload up to six statements. FinanceBuddy detects each date range and sorts periods automatically. "
         "Comparison files never change saved history."
@@ -1849,7 +2276,11 @@ def render_compare():
     if len(periods) < 2:
         st.info("At least two readable statements are required for comparison.")
         return
-    periods.sort(key=lambda item: item["start"])
+    render_comparison(periods)
+
+
+def render_comparison(periods) -> None:
+    periods = sorted(periods, key=lambda item: item["start"])
     comparisons = AnalyticsService.compare_periods(periods)
     st.caption("Transfers and credit-card payments are left out of money in and out so purchases aren't counted twice.")
     rows = [
@@ -2056,6 +2487,41 @@ def render_bank_connections() -> None:
                 st.rerun()
 
 
+def _set_sign_convention(key: str, value: str) -> None:
+    st.session_state[key] = value
+
+
+SIGN_LABELS = {"outflow_negative": "Money out is negative", "outflow_positive": "Money out is positive"}
+
+
+def render_sign_check(parsed, account_type: str, sign_key: str, convention: str | None) -> None:
+    """Summarize directions so a reversed Amount column is caught before saving."""
+    evidence = sign_evidence(parsed, account_type)
+    counts = (f"{evidence['money_out']} money out ({format_currency(evidence['out_total'])}) · "
+              f"{evidence['money_in']} money in ({format_currency(evidence['in_total'])})")
+    with st.container(border=True, key="sign_check"):
+        if convention is None:
+            suggested = "outflow_positive" if evidence["looks_reversed"] else "outflow_negative"
+            st.markdown("**This file has one Amount column. How does it show money out?**")
+            st.caption(f"If money out is negative: {counts}.")
+            if evidence["confirmed"] or evidence["looks_reversed"]:
+                st.caption(f"Deposits and payments in this file suggest: {SIGN_LABELS[suggested].lower()}.")
+            for column, value in zip(st.columns(2), SIGN_LABELS):
+                column.button(SIGN_LABELS[value], key=f"choose_{value}", width="stretch",
+                              type="primary" if value == suggested else "secondary",
+                              on_click=_set_sign_convention, args=(sign_key, value))
+            return
+        st.markdown(f"**Money direction:** {counts}")
+        if evidence["looks_reversed"]:
+            st.warning("Deposits or payments read as money out, so the signs look reversed. Flip them before saving.")
+        elif evidence["confirmed"]:
+            st.caption("Deposits and payments read as money in, so the signs look right.")
+        flipped = "outflow_positive" if convention == "outflow_negative" else "outflow_negative"
+        st.button("Flip +/− signs", key="flip_signs", icon=":material/swap_vert:",
+                  on_click=_set_sign_convention, args=(sign_key, flipped),
+                  help="If you already saved this file with reversed signs, undo that import first. Re-importing with flipped signs adds new copies.")
+
+
 def render_import_statement() -> None:
     st.header("Import a statement")
     st.caption("Files are uploaded to the FinanceBuddy server for processing. Reviewed transactions are saved to your account only when you confirm. Maximum file size: 10 MB.")
@@ -2094,10 +2560,23 @@ def render_import_statement() -> None:
         key="statement_import",
         help="CSV and TXT files are read as tables. PDFs must contain selectable text; scanned images require OCR and are not supported yet.",
     )
+    sign_key = f"statement_import_sign_{account_type}"
+    provisional = None
     if upload:
         options = statement_format_options(account_type, "statement_import")
+        if options["sign_convention"] is None:
+            # Show which way the signs go before asking, instead of rejecting the file.
+            provisional, provisional_metrics = parse_statement(
+                upload, account_name.strip(), account_type, **{**options, "sign_convention": "outflow_negative"})
+            if not provisional_metrics.is_valid or provisional_metrics.direction_columns:
+                provisional = None
+    if provisional:
+        render_sign_check(provisional, account_type, sign_key, None)
+    elif upload:
         parsed, metrics = parse_statement(upload, account_name.strip(), account_type, **options)
         parsed = data_service.bind_statement_account(parsed, destination)
+        if metrics.is_valid and not metrics.direction_columns:
+            render_sign_check(parsed, account_type, sign_key, options["sign_convention"] or "outflow_negative")
         if not metrics.is_valid:
             st.error("This statement could not be imported safely.")
             for error in metrics.errors:
@@ -2213,7 +2692,8 @@ def render_import_statement() -> None:
 
     with st.expander("Recent import receipts"):
         batches = repo.get_import_batches()
-        available = [row for row in batches if row['inserted'] and not row['undone']]
+        sample_batches = set(data_service.sample_data().get("batch_ids", []))
+        available = [row for row in batches if row['inserted'] and not row['undone'] and str(row['id']) not in sample_batches]
         if available:
             receipt_by_id = {row['id']: row for row in available}
             selected_batch = st.selectbox('Import to undo', list(receipt_by_id), format_func=lambda identifier: f"{receipt_by_id[identifier]['created_at']} · {receipt_by_id[identifier]['inserted']} new transactions")
@@ -2375,6 +2855,10 @@ def _selection_label(noun: str, selected: list[str], options: list[str]) -> str:
     return f"{len(selected)} of {len(options)} {noun}"
 
 
+def _chips_html(chips: list[str]) -> str:
+    return '<div class="fb-chips">' + "".join(f'<span class="fb-chip">{html.escape(chip)}</span>' for chip in chips) + "</div>"
+
+
 def render_filter_bar(catalog) -> dict:
     """The compact filter bar shared by Overview and Transactions."""
     min_date = date.fromisoformat(catalog["min_date"])
@@ -2383,8 +2867,14 @@ def render_filter_bar(catalog) -> dict:
     account_options = sorted(account_labels.values())
     category_options = catalog["categories"]
 
-    if st.session_state.get("dashboard_date_preset") not in DATE_PRESETS:
-        st.session_state.dashboard_date_preset = "Last 3 months"
+    preset_options = DATE_PRESETS[1:-1] + ["All time", "Custom"]
+
+    def preset_format(value: str) -> str:
+        return AnalyticsService.preset_label(value, max_date, date.today())
+
+    # Labels name stale data's dates, so the browser can return an older label.
+    st.session_state.setdefault("dashboard_date_preset", "Last 3 months")
+    keep_choice("dashboard_date_preset", preset_options, preset_format)
     stored_dates = st.session_state.get("dashboard_dates")
     # Keep deliberate empty ranges; repair malformed or reversed dates only.
     if (
@@ -2404,6 +2894,7 @@ def render_filter_bar(catalog) -> dict:
             st.session_state.dashboard_type != "Both",
             bool(st.session_state.dashboard_minimum_amount),
             bool(st.session_state.dashboard_include_transfers),
+            bool(st.session_state.get("dashboard_tag", "").strip()),
         )
     )
 
@@ -2411,8 +2902,8 @@ def render_filter_bar(catalog) -> dict:
     with st.container(key="fbcard_filters"):
         if overview_filters:
             st.selectbox(
-                "Date range", DATE_PRESETS[1:-1] + ["All time", "Custom"],
-                key="dashboard_date_preset", format_func=lambda value: value,
+                "Date range", preset_options,
+                key="dashboard_date_preset", format_func=preset_format,
                 on_change=apply_date_preset, args=(min_date, max_date),
                 label_visibility="collapsed", help="Ranges count back from your most recent transaction.",
             )
@@ -2420,8 +2911,8 @@ def render_filter_bar(catalog) -> dict:
             range_col, search_col = st.container(key="filter_search_row").columns([2.6, 1], vertical_alignment="center")
             with range_col:
                 st.selectbox(
-                    "Date range", DATE_PRESETS[1:-1] + ["All time", "Custom"],
-                    key="dashboard_date_preset", format_func=lambda value: value,
+                    "Date range", preset_options,
+                    key="dashboard_date_preset", format_func=preset_format,
                     on_change=apply_date_preset, args=(min_date, max_date),
                     label_visibility="collapsed", help="Ranges count back from your most recent transaction.",
                 )
@@ -2445,6 +2936,8 @@ def render_filter_bar(catalog) -> dict:
             set(selected_categories) != set(category_options),
             bool(st.session_state.get("dashboard_search", "").strip()),
         ))
+        # Active filters stay visible while the panel is closed; filled once widgets have run.
+        active_chips_slot = st.container(key="active_filter_chips")
         filter_panel = st.expander("Filters" + (f" ({active_count} active)" if active_count else ""))
         with filter_panel:
             if overview_filters:
@@ -2452,9 +2945,7 @@ def render_filter_bar(catalog) -> dict:
                     "Merchant search", placeholder="Search merchants, e.g. Costco",
                     key="dashboard_search", icon=":material/search:",
                 )
-            accounts_col, categories_col, more_col, reset_col = st.container(key="filter_buttons").columns(
-                [1.2, 1.2, 1.2, 0.7]
-            )
+            accounts_col, categories_col, more_col = st.container(key="filter_buttons").columns(3)
             with accounts_col.popover(
                 _selection_label("accounts", selected_accounts, account_options),
                 icon=":material/account_balance:",
@@ -2486,6 +2977,7 @@ def render_filter_bar(catalog) -> dict:
                 minimum_amount = st.number_input(
                     "Minimum amount", min_value=0.0, step=10.0, key="dashboard_minimum_amount"
                 )
+                tag = st.text_input("Tag", key="dashboard_tag", placeholder="e.g. japan-trip").strip().lower()
                 include_transfers = st.toggle(
                     "Include transfers & card payments",
                     key="dashboard_include_transfers",
@@ -2501,6 +2993,8 @@ def render_filter_bar(catalog) -> dict:
                              "accounts": [identifier for identifier, label in account_labels.items() if label in selected_accounts],
                              "categories": selected_categories, "type": transaction_type,
                              "search": search.strip(), "minimum": str(money(minimum_amount))}
+            if tag:
+                query_filters["tags"] = [tag]
             if overview_filters:
                 filtered = repo.get_filtered(query_filters)
                 filtered_count = len(filtered)
@@ -2516,8 +3010,6 @@ def render_filter_bar(catalog) -> dict:
                 st.session_state.transaction_filters = query_filters
 
             chips = []
-            if (start_date, end_date) != (min_date, max_date):
-                chips.append(f"{start_date.strftime('%b %-d, %Y')} – {end_date.strftime('%b %-d, %Y')}")
             if set(selected_accounts) != set(account_options):
                 chips.append("Accounts: " + _selection_label("accounts", selected_accounts, account_options))
             if set(selected_categories) != set(category_options):
@@ -2528,28 +3020,28 @@ def render_filter_bar(catalog) -> dict:
                 chips.append(f"Merchant: {search.strip()}")
             if minimum_amount:
                 chips.append(f"At least {format_currency(minimum_amount)}")
-            reset_col.button(
-                "Reset filters",
-                key="reset_filters",
-                icon=":material/restart_alt:",
-                type="tertiary",
-                width="stretch",
-                disabled=not chips and not include_transfers and st.session_state.dashboard_date_preset == "All time",
-                on_click=reset_dashboard_filters,
-                help="Show every date, account, and category again and clear search and amount filters.",
-            )
-            transfer_chip = (
-                "Counting transfers & card payments" if include_transfers
-                else "Transfers & card payments not counted"
-            )
+            if tag:
+                chips.append(f"Tag: {tag}")
+            if include_transfers:
+                chips.append("Counting transfers & card payments")
+            date_chip = f"{start_date.strftime('%b %-d, %Y')} – {end_date.strftime('%b %-d, %Y')}"
             count_col, chips_col = st.columns([1.5, 2.5], vertical_alignment="center")
             count_col.caption(f"Showing {filtered_count:,} of {catalog["display_count"]:,} saved transactions")
-            chips_col.markdown(
-                '<div class="fb-chips">'
-                + "".join(f'<span class="fb-chip">{html.escape(chip)}</span>' for chip in chips + [transfer_chip])
-                + "</div>",
-                unsafe_allow_html=True,
-            )
+            chips_col.markdown(_chips_html([date_chip] + ([] if chips else ["Transfers & card payments not counted"])),
+                               unsafe_allow_html=True)
+        if chips:
+            with active_chips_slot:
+                chips_col, reset_col = st.columns([4, 1], vertical_alignment="center")
+                chips_col.markdown(_chips_html(chips), unsafe_allow_html=True)
+                reset_col.button(
+                    "Reset filters",
+                    key="reset_filters",
+                    icon=":material/restart_alt:",
+                    type="tertiary",
+                    width="stretch",
+                    on_click=reset_dashboard_filters,
+                    help="Show every date, account, and category again and clear search and amount filters.",
+                )
     if not overview_filters:
         st.caption(f"Showing {filtered_count:,} of {catalog["display_count"]:,} saved transactions")
     previous_range = AnalyticsService.previous_period(start_date, end_date)
@@ -2606,6 +3098,7 @@ with st.sidebar:
             key="nav_page",
             label_visibility="collapsed",
             format_func=menu_label,
+            on_change=close_dialog,
         )
     st.markdown('<p class="fb-menu-label">Add data</p>', unsafe_allow_html=True)
     menu_actions = st.container(key="menu_actions")
@@ -2654,6 +3147,7 @@ show_onboarding = (
 )
 if show_onboarding:
     render_onboarding()
+render_sample_banner()
 
 if page in ("Overview", "Transactions"):
     render_page_header(page, PAGE_INTROS[page])

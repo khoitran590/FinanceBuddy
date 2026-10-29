@@ -1,5 +1,5 @@
 from decimal import Decimal
-from src.domain.money import money, require_usd
+from src.domain.money import money, require_usd, rounded_money
 import calendar
 import re
 from collections import Counter, defaultdict
@@ -52,28 +52,35 @@ _MERCHANT_ALIASES = (
 )
 
 
+def _strip_memo_prefixes(description: str) -> str:
+    text = _SPLIT_SUFFIX.sub("", description.strip())
+    previous = None
+    while previous != text:
+        previous = text
+        text = _MERCHANT_PREFIX.sub("", text).strip()
+    return text
+
+
+def merchant_tokens(description: str) -> List[str]:
+    """Words of a bank memo without processor prefixes, store numbers or reference codes."""
+    return [
+        token for token in re.sub(r"[*#]", " ", _strip_memo_prefixes(description)).split()
+        if sum(character.isdigit() for character in token) < 3
+        and any(character.isalnum() for character in token)
+    ]
+
+
 def clean_merchant(description: str) -> str:
     """Reduce a bank memo to a stable merchant name for grouping.
 
     Store numbers, card-processor prefixes, and reference codes differ between
     charges from the same merchant, so they are removed before grouping.
     """
-    text = _SPLIT_SUFFIX.sub("", description.strip())
-    previous = None
-    while previous != text:
-        previous = text
-        text = _MERCHANT_PREFIX.sub("", text).strip()
+    text = _strip_memo_prefixes(description)
     for pattern, alias in _MERCHANT_ALIASES:
         if pattern.search(text):
             return alias
-    tokens = []
-    for token in re.sub(r"[*#]", " ", text).split():
-        if sum(character.isdigit() for character in token) >= 3:
-            continue
-        if not any(character.isalnum() for character in token):
-            continue
-        tokens.append(token)
-    return " ".join(tokens) or description.strip()
+    return " ".join(merchant_tokens(description)) or description.strip()
 
 
 def merchant_name(transaction: Transaction) -> str:
@@ -268,6 +275,21 @@ class AnalyticsService:
         start = min(max(start, min_date), max_date)
         end = min(max(end, min_date), max_date)
         return (start, end) if start <= end else (end, end)
+
+    @staticmethod
+    def preset_label(preset: str, max_date: date, today: date) -> str:
+        """Name a preset by its dates when the latest activity is not from this month."""
+        if (max_date.year, max_date.month) == (today.year, today.month):
+            return preset
+        previous = max_date.replace(day=1) - timedelta(days=1)
+        return {
+            "This month": f"Latest month ({max_date:%b %Y})",
+            "Last month": f"Month before ({previous:%b %Y})",
+            "Last 30 days": f"30 days to {max_date:%b %-d, %Y}",
+            "Last 3 months": f"3 months to {max_date:%b %Y}",
+            "Year to date": f"{max_date.year} through {max_date:%b %-d}",
+            "Last 12 months": f"12 months to {max_date:%b %Y}",
+        }.get(preset, preset)
 
     @staticmethod
     def previous_period(start: date, end: date) -> Tuple[date, date]:
@@ -799,10 +821,14 @@ class AnalyticsService:
         return Decimal(0), latest, None
 
     @staticmethod
-    def _recurring_groups(transactions: List[Transaction]) -> List[Tuple[Dict[str, Any], List[Transaction]]]:
+    def _recurring_groups(
+        transactions: List[Transaction], excluded: Iterable[str] = ()
+    ) -> List[Tuple[Dict[str, Any], List[Transaction]]]:
+        """Recurring charge groups; ``excluded`` holds lowercased merchants the person dismissed."""
+        excluded = set(excluded)
         groups: Dict[str, List[Transaction]] = defaultdict(list)
         for item in transactions:
-            if item.amount < 0:
+            if item.amount < 0 and merchant_name(item).lower() not in excluded:
                 groups[merchant_name(item).lower()].append(item)
         if not groups:
             return []
@@ -858,13 +884,13 @@ class AnalyticsService:
         return sorted(found, key=lambda pair: pair[0]["annual_cost"], reverse=True)
 
     @staticmethod
-    def recurring_expenses(transactions: List[Transaction]) -> List[Dict[str, Any]]:
+    def recurring_expenses(transactions: List[Transaction], excluded: Iterable[str] = ()) -> List[Dict[str, Any]]:
         """Find charges repeating on a regular schedule at a similar amount.
 
         Amounts may drift, so a price increase is reported instead of hiding the
         subscription.
         """
-        return [summary for summary, _ in AnalyticsService._recurring_groups(transactions)]
+        return [summary for summary, _ in AnalyticsService._recurring_groups(transactions, excluded)]
 
     @staticmethod
     def upcoming_charges(
@@ -883,6 +909,32 @@ class AnalyticsService:
                 charges.append({"merchant": item["merchant"], "amount": item["amount"], "date": due})
                 due = AnalyticsService._advance(due, cadence)
         return sorted(charges, key=lambda charge: charge["date"])
+
+    @staticmethod
+    def cash_flow_timeline(
+        recurring: List[Dict[str, Any]], income: Optional[Dict[str, Any]], start: date, days: int = 30,
+        starting_balance: Optional[Decimal] = None,
+    ) -> List[Dict[str, Any]]:
+        """Expected bills and paydays from ``start``, with a running balance.
+
+        Without a starting balance the running total is the net change from today.
+        """
+        end = start + timedelta(days=days - 1)
+        events = [{"date": charge["date"], "label": charge["merchant"], "amount": -charge["amount"], "kind": "Bill"}
+                  for charge in AnalyticsService.upcoming_charges(recurring, start, end)]
+        if income and income.get("next_pay_date") and income.get("interval_days"):
+            paydays = AnalyticsService.upcoming_charges([{
+                "merchant": "Paycheck", "amount": rounded_money(income["typical_paycheck"]), "cadence": income["cadence"],
+                "interval_days": income["interval_days"], "next_date": income["next_pay_date"],
+            }], start, end)
+            events += [{"date": item["date"], "label": "Paycheck", "amount": item["amount"], "kind": "Payday"} for item in paydays]
+        # Paydays first on a shared date, so a bill due on payday isn't shown dipping first.
+        events.sort(key=lambda event: (event["date"], event["kind"] != "Payday", event["label"]))
+        running = starting_balance if starting_balance is not None else Decimal(0)
+        for event in events:
+            running += event["amount"]
+            event["running"] = running
+        return events
 
     @staticmethod
     def price_increases(
@@ -921,7 +973,7 @@ class AnalyticsService:
         )[:5]
 
     @staticmethod
-    def cash_flow_forecast(transactions: List[Transaction]) -> Dict[str, float]:
+    def cash_flow_forecast(transactions: List[Transaction], excluded: Iterable[str] = ()) -> Dict[str, float]:
         """Estimate next month from known recurring charges plus typical variable spending.
 
         Averages use complete months when available so a partial current month
@@ -938,7 +990,7 @@ class AnalyticsService:
             }
         inflow = sum(item["inflow"] for item in recent) / len(recent)
         groups = [
-            pair for pair in AnalyticsService._recurring_groups(transactions) if pair[0]["active"]
+            pair for pair in AnalyticsService._recurring_groups(transactions, excluded) if pair[0]["active"]
         ]
         recurring_ids = {item.id for _, cluster in groups for item in cluster}
         recent_months = {item["month"] for item in recent}
@@ -998,6 +1050,7 @@ class AnalyticsService:
             "paychecks": len(income),
             "typical_paycheck": median(item.amount for item in income),
             "cadence": cadence["label"] if cadence else "Irregular",
+            "interval_days": cadence["interval_days"] if cadence else None,
             "last_pay_date": last_pay_date,
             "next_pay_date": _next_occurrence([item.date for item in income], cadence) if cadence else None,
             "average_monthly": average,
@@ -1019,6 +1072,38 @@ class AnalyticsService:
         return dict(sources)
 
     # ---------------------------------------------------------- budgets/goals
+
+    @staticmethod
+    def category_spend_history(transactions: List[Transaction], category: str) -> Optional[Dict[str, Any]]:
+        """Spending in one category over the last three complete months, as budgets count it."""
+        months = AnalyticsService.complete_months(transactions)[-3:]
+        if not months:
+            return None
+        spend = {
+            key: AnalyticsService.category_expenses(
+                [item for item in transactions if _month_key(item.date) == key]
+            ).get(category, Decimal(0))
+            for key in months
+        }
+        return {
+            "last_month": spend[months[-1]],
+            "last_label": _month_bounds(months[-1])[0].strftime("%b %Y"),
+            "average": rounded_money(sum(spend.values(), Decimal(0)) / len(months)),
+            "months": len(months),
+        }
+
+    @staticmethod
+    def unbudgeted_spending(budgets: List[Budget], transactions: List[Transaction], month: str) -> List[Dict[str, Any]]:
+        """Spending in a month outside every budgeted category, largest first."""
+        month_start, month_end = _month_bounds(month)
+        budgeted = {budget.category for budget in budgets} | set(TRANSFER_CATEGORIES)
+        spending = AnalyticsService.category_expenses(
+            [item for item in transactions if month_start <= item.date <= month_end]
+        )
+        return sorted(
+            ({"category": category, "spent": spent} for category, spent in spending.items() if category not in budgeted),
+            key=lambda row: (-row["spent"], row["category"]),
+        )
 
     @staticmethod
     def budget_status(
@@ -1272,6 +1357,7 @@ class AnalyticsService:
         transactions: List[Transaction],
         history: Optional[List[Transaction]] = None,
         limit: int = 3,
+        excluded: Iterable[str] = (),
     ) -> List[str]:
         """Short plain-language observations, most actionable first.
 
@@ -1280,7 +1366,7 @@ class AnalyticsService:
         """
         found: List[str] = []
         history = transactions if history is None else history
-        recurring = [item for item in AnalyticsService.recurring_expenses(history) if item["active"]]
+        recurring = [item for item in AnalyticsService.recurring_expenses(history, excluded) if item["active"]]
         for item in AnalyticsService.price_increases(recurring, history):
             found.append(
                 f"{item['merchant']} went up from ${item['previous_amount']:,.2f} to "
@@ -1325,6 +1411,27 @@ class AnalyticsService:
     # ------------------------------------------------------------- comparison
 
     @staticmethod
+    def history_periods(first: date, last: date, granularity: str) -> List[Dict[str, Any]]:
+        """Calendar months or quarters spanning saved history, oldest first.
+
+        A period is partial when history misses more than three days at either
+        end, matching ``complete_months``.
+        """
+        step = 3 if granularity == "Quarter" else 1
+        start = date(first.year, (first.month - 1) // step * step + 1, 1)
+        periods = []
+        while start <= last:
+            end = _add_months(start, step) - timedelta(days=1)
+            periods.append({
+                "label": f"Q{(start.month - 1) // 3 + 1} {start.year}" if step == 3 else start.strftime("%b %Y"),
+                "start": start,
+                "end": end,
+                "partial": first > start + timedelta(days=3) or last < end - timedelta(days=3),
+            })
+            start = end + timedelta(days=1)
+        return periods
+
+    @staticmethod
     def compare_periods(
         periods: List[Dict[str, Any]], include_transfers: bool = False
     ) -> List[Dict[str, Any]]:
@@ -1367,17 +1474,31 @@ class AnalyticsService:
         return comparisons
 
     @staticmethod
-    def duplicate_candidates(transactions: List[Transaction]) -> List[List[Transaction]]:
+    def duplicate_candidates(
+        transactions: List[Transaction], dismissed: Iterable[str] = ()
+    ) -> List[List[Transaction]]:
+        """Same account, date, amount and description. Split parts are one purchase, not copies.
+
+        ``dismissed`` holds ``duplicate_group_key`` values the person marked as not duplicates.
+        """
         grouped: Dict[tuple, List[Transaction]] = defaultdict(list)
         for transaction in transactions:
+            if transaction.source_transaction_id:
+                continue
             key = (
-                transaction.account_name,
+                str(transaction.account_id or transaction.account_name),
                 transaction.date,
                 round(transaction.amount, 2),
                 " ".join(transaction.description.lower().split()),
             )
             grouped[key].append(transaction)
-        return [items for items in grouped.values() if len(items) > 1]
+        dismissed = set(dismissed)
+        return [items for items in grouped.values()
+                if len(items) > 1 and AnalyticsService.duplicate_group_key(items) not in dismissed]
+
+    @staticmethod
+    def duplicate_group_key(items: List[Transaction]) -> str:
+        return "|".join(sorted(item.id for item in items))
 
     @staticmethod
     def _comparison_status(outflow_delta: float, savings_rate_delta: float) -> str:

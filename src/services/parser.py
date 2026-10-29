@@ -331,6 +331,7 @@ class BankStatementParser:
             accuracy_rate=accuracy_rate,
             errors=errors,
             is_valid=is_valid,
+            direction_columns=has_direction_columns,
         )
         return (valid_transactions if is_valid else []), metrics
 

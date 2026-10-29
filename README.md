@@ -320,7 +320,11 @@ The remaining architecture findings are implemented by migrations
 `202610130003_money_accounts_and_provenance.sql`,
 `202610130004_recoverable_operations_and_backups.sql`, and
 `202610130005_transaction_queries.sql`, applied in that order after the previous
-October 13 migrations while writes are stopped.
+October 13 migrations while writes are stopped. The October 29 features (merchant
+triage, duplicate merging, sample data, manual entries, notes and tags) add
+`202610290001_operation_extensions.sql` and
+`202610290002_annotations_and_manual_transactions.sql`; see
+`docs/DATA_MIGRATION_ROLLOUT.md`.
 
 FinanceBuddy now enforces USD and exact cents, stores stable owned account IDs and
 category provenance, transfers pending transaction annotations to posted records,

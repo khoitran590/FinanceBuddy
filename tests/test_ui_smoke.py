@@ -47,10 +47,11 @@ def test_transaction_ui_edits_allocations_and_resplits_the_source(tmp_path, monk
     app.session_state["nav_page"] = "Transactions"
     app.run(timeout=20)
     assert not app.exception
-    assert app.selectbox(key="split_transaction").value == source.id
     next(button for button in app.button if button.label == "Edit selected transaction").click().run()
     assert not app.exception
-    assert app.selectbox(key="category_transaction").value.startswith("allocation:")
+    assert app.session_state["active_dialog"]["id"].startswith("allocation:")
+    # Rule options start unchecked even though the phrase is pre-filled.
+    assert next(box for box in app.text_input if box.label == "Merchant name or phrase").value == "store"
     next(box for box in app.selectbox if box.label == "Category").set_value("Travel")
     next(button for button in app.button if button.label == "Save category").click().run()
     assert not app.exception
@@ -60,19 +61,29 @@ def test_transaction_ui_edits_allocations_and_resplits_the_source(tmp_path, monk
     app.run()
     assert not app.exception
     assert any("changed the amount of a split" in item.value for item in app.warning)
-    next(button for button in app.button if button.label == "Split transaction").click().run()
-    assert not app.exception
+
+    def split_first_row():
+        next(button for button in app.button if button.label == "Edit selected transaction").click().run()
+        app.segmented_control(key="transaction_editor_tab").set_value("Split").run()
+        assert not app.exception
+        next(button for button in app.button if button.label == "Split transaction").click().run()
+        assert not app.exception
+        assert "active_dialog" not in app.session_state
+
+    split_first_row()
     assert len(repo.get_canonical_all()) == 1
     assert len(repo.get_all()) == 2
     assert sum(item.amount for item in repo.get_all()) == -110
     assert not any(item.split_needs_review for item in repo.get_all())
+    # Re-splitting from one part replaces both parts of the source purchase.
+    split_first_row()
+    assert len(repo.get_canonical_all()) == 1 and sum(item.amount for item in repo.get_all()) == -110
     # A provider reversal can change direction; the existing split remains
     # reviewable even though the source is now an inflow.
     repo.upsert_many([source.model_copy(update={"amount": 110})])
     app.run()
     assert not app.exception
-    assert app.selectbox(key="split_transaction").value == source.id
-    next(button for button in app.button if button.label == "Split transaction").click().run()
+    split_first_row()
     assert not app.exception
     assert sum(item.amount for item in repo.get_all()) == 110
     assert not any(item.split_needs_review for item in repo.get_all())
@@ -407,9 +418,10 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     assert app.segmented_control(key='tx_view').value == 'All'
     app.button(key='mobile_edit_transactions_table_All_tv4').click().run()
     assert not app.exception
-    assert app.selectbox(key='category_transaction').value == 'tv4'
-    app.selectbox(key='category_transaction').set_value('food4').run()
+    assert app.session_state['active_dialog']['id'] == 'tv4'
+    app.button(key='mobile_edit_transactions_table_All_food4').click().run()
     assert not app.exception
+    assert app.session_state['active_dialog']['id'] == 'food4'
     next(box for box in app.selectbox if box.label == 'Category').set_value('Entertainment')
     from src.services.supabase import SupabaseError
     original_update = repo.correct_category
@@ -428,11 +440,13 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     next(button for button in app.button if button.label == 'Save category').click().run()
     assert not app.exception
     assert next(item for item in repo.get_all() if item.id == 'food4').category == 'Entertainment'
+    assert 'active_dialog' not in app.session_state
     app.button(key='mobile_edit_transactions_table_All_food4').click().run()
     assert not app.exception
-    assert app.selectbox(key='category_transaction').value == 'food4'
+    assert app.session_state['active_dialog']['id'] == 'food4'
     next(button for button in app.button if button.label == 'Cancel').click().run()
     assert not app.exception
+    assert 'active_dialog' not in app.session_state
     # Restore the category so the subsequent budget check uses the original spend.
     repo.update_category('food4', 'Dining')
 
@@ -548,3 +562,283 @@ def test_navigation_and_transaction_pages_use_catalog_and_explicit_reads(monkeyp
     app.radio(key='nav_page').set_value('Transactions').run()
     assert not app.exception and repo.pages == 1
     assert len(app.dataframe[0].value) == 200
+
+
+def _signed_in_app(monkeypatch, repo, page, **state):
+    import time
+    import src.repositories.supabase_repo as cloud_repos
+    from src.services.supabase import SupabaseAuth, SupabaseConfig
+    from src.services.plaid_service import PlaidConfig
+
+    repo.set_setting("onboarding_complete", "true")
+    monkeypatch.setenv("FINANCEBUDDY_ENV", "development")
+    monkeypatch.setattr(SupabaseConfig, "from_sources", classmethod(lambda cls, secrets: SupabaseConfig("https://test.supabase.co", "test")))
+    monkeypatch.setattr(SupabaseAuth, "get_user", lambda self, token: {"id": "alice", "email": "alice@example.com", "email_confirmed_at": "2026-09-01"})
+    monkeypatch.setattr(cloud_repos, "SupabaseTransactionRepository", lambda client, user_id: repo)
+    monkeypatch.setattr(PlaidConfig, "from_sources", classmethod(lambda cls, secrets: PlaidConfig("", "")))
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+    app.session_state["supabase_session"] = {"access_token": "test", "refresh_token": "test", "expires_at": time.time() + 3600}
+    app.session_state["session_owner"] = "alice"
+    app.session_state["nav_page"] = page
+    for key, value in state.items():
+        app.session_state[key] = value
+    return app.run(timeout=20)
+
+
+def test_triage_queue_categorizes_a_merchant_and_saves_its_rule(tmp_path, monkeypatch):
+    from datetime import date
+    from src.domain.models import CategoryRule, Transaction
+    from src.repositories.transaction_repo import TransactionRepository
+
+    repo = TransactionRepository(str(tmp_path / "triage-ui.db"))
+    repo.insert_many([
+        Transaction(id=f"bb{day}", date=date(2026, 9, day), description=f"BLUE BOTTLE COFFEE #{day}0042 OAKLAND",
+                    amount=-5, category="Uncategorized", account_name="Card")
+        for day in (1, 2, 3)
+    ] + [Transaction(id="other", date=date(2026, 9, 4), description="CORNER STORE", amount=-3,
+                     category="Uncategorized", account_name="Card")])
+    app = _signed_in_app(monkeypatch, repo, "Transactions", tx_view="Needs a category")
+    assert not app.exception
+    assert any("Sort by merchant" in item.value for item in app.subheader)
+    box = next(item for item in app.selectbox if item.label == "Category for BLUE BOTTLE COFFEE")
+    box.set_value("Dining").run()
+    key = box.key.removeprefix("triage_category_")
+    app.button(key=f"triage_apply_{key}").click().run()
+    assert not app.exception
+    saved = {item.id: item for item in repo.get_all()}
+    assert {saved[f"bb{day}"].category_origin for day in (1, 2, 3)} == {"rule"}
+    assert saved["other"].category == "Uncategorized"
+    assert CategoryRule(keyword="blue bottle coffee", category="Dining") in repo.get_category_rules()
+
+
+def test_active_filters_show_outside_the_closed_panel_and_reset(tmp_path, monkeypatch):
+    from datetime import date
+    from src.domain.models import Transaction
+    from src.repositories.transaction_repo import TransactionRepository
+
+    repo = TransactionRepository(str(tmp_path / "filters-ui.db"))
+    repo.insert_many([Transaction(id=name, date=date(2026, 9, 1), description=name, amount=-5,
+                                  category="Dining", account_name="Card") for name in ("Costco", "Cafe")])
+    app = _signed_in_app(monkeypatch, repo, "Transactions")
+    assert not app.exception
+    assert not any(button.key == "reset_filters" for button in app.button)
+    app.text_input(key="dashboard_search").set_value("costco").run()
+    assert not app.exception
+    chips = [item.value for item in app.markdown if "fb-chip" in item.value]
+    assert any("Merchant: costco" in chip for chip in chips)
+    panel = next(item for item in app.expander if item.label.startswith("Filters"))
+    assert not any("Merchant: costco" in item.value for item in panel.markdown)
+    app.button(key="reset_filters").click().run()
+    assert not app.exception
+    assert app.text_input(key="dashboard_search").value == ""
+
+
+def test_compare_saved_months_without_uploading(tmp_path, monkeypatch):
+    from datetime import date
+    from src.domain.models import Transaction
+    from src.repositories.transaction_repo import TransactionRepository
+
+    repo = TransactionRepository(str(tmp_path / "compare-ui.db"))
+    repo.insert_many([
+        Transaction(id=f"t{month}", date=date(2026, month, 15), description="Groceries", amount=-10 * month,
+                    category="Groceries", account_name="Card")
+        for month in (7, 8, 9)
+    ])
+    app = _signed_in_app(monkeypatch, repo, "Compare")
+    assert not app.exception
+    assert app.segmented_control(key="compare_source").value == "Saved history"
+    assert app.multiselect(key="compare_periods_Month").value == ["Aug 2026", "Sep 2026"]
+    table = app.dataframe[0].value
+    assert table["Period"].tolist() == ["Aug 2026", "Sep 2026 (partial)"]
+    assert table["Money out"].tolist() == [80, 90]
+    app.segmented_control(key="compare_granularity").set_value("Quarter").run()
+    assert not app.exception
+    assert any("Choose two to six" in item.value for item in app.info)
+
+
+def test_plan_dialogs_suggest_limits_add_funds_and_confirm_removal(tmp_path, monkeypatch):
+    from datetime import date
+    from decimal import Decimal
+    from src.domain.models import Budget, SavingsGoal, Transaction
+    from src.repositories.transaction_repo import TransactionRepository
+    from src.services.supabase import SupabaseError
+
+    repo = TransactionRepository(str(tmp_path / "plan-ui.db"))
+    repo.insert_many([
+        Transaction(id=f"{category}{month}", date=date(2026, month, day), description=category, amount=amount,
+                    category=category, account_name="Card")
+        for month in (7, 8, 9) for day, category, amount in ((1, "Dining", -40.25), (28, "Shopping", -60))
+    ] + [Transaction(id="end", date=date(2026, 9, 30), description="Rent", amount=-1, category="Rent", account_name="Card")])
+    repo.upsert_budget(Budget(category="Dining", monthly_limit=100))
+    goal_id = repo.save_goal(SavingsGoal(name="Trip", target_amount=1000, current_amount=100))
+    app = _signed_in_app(monkeypatch, repo, "Plan")
+    assert not app.exception
+    assert any("Unbudgeted spending: $61.00" in item.value for item in app.markdown)
+
+    # "Set budget" opens the dialog for that category with its 3-month average.
+    next(button for button in app.button if button.label == "Set budget" and "Shopping" in button.help).click().run()
+    assert app.selectbox(key="budget_dialog_category").value == "Shopping"
+    app.button(key="budget_use_average").click().run()
+    assert next(item for item in app.number_input if item.label == "Monthly limit").value == 60.0
+    next(button for button in app.button if button.label == "Save budget").click().run()
+    assert not app.exception
+    assert Budget(category="Shopping", monthly_limit=60) in repo.get_budgets()
+
+    # A failed save keeps the dialog open with a friendly message.
+    original_delete = repo.delete_budget
+    monkeypatch.setattr(repo, "delete_budget", lambda category: (_ for _ in ()).throw(SupabaseError("details")))
+    app.button(key=next(button.key for button in app.button if button.key and button.key.startswith("budget_remove_"))).click().run()
+    next(button for button in app.button if button.label == "Remove budget").click().run()
+    assert not app.exception
+    assert any("Couldn't confirm the save" in item.value for item in app.error)
+    assert app.session_state["active_dialog"]["name"] == "remove_budget"
+    monkeypatch.setattr(repo, "delete_budget", original_delete)
+    next(button for button in app.button if button.label == "Remove budget").click().run()
+    assert [item.category for item in repo.get_budgets()] == ["Shopping"]
+
+    app.segmented_control(key="plan_view").set_value("Savings goals").run()
+    # Open Edit first so its inputs hold the old saved amount.
+    app.button(key=f"goal_edit_{goal_id}").click().run()
+    assert next(item for item in app.number_input if item.label == "Already saved").value == 100.0
+    app.button(key=f"goal_add_funds_{goal_id}").click().run()
+    next(item for item in app.number_input if item.label == "Amount to add").set_value(12.34)
+    app.button(key="goal_add_confirm").click().run()
+    assert not app.exception
+    assert repo.get_goals()[0].current_amount == Decimal("112.34")
+    # Editing after adding funds starts from the saved amount, not an earlier dialog's value.
+    app.button(key=f"goal_edit_{goal_id}").click().run()
+    assert next(item for item in app.number_input if item.label == "Already saved").value == 112.34
+
+
+def test_import_asks_for_card_signs_with_evidence_and_can_flip(tmp_path, monkeypatch):
+    from io import BytesIO
+    import streamlit as st
+    from src.repositories.transaction_repo import TransactionRepository
+
+    repo = TransactionRepository(str(tmp_path / "signs-ui.db"))
+    upload = BytesIO(b"Date,Description,Amount\n2026-10-01,PAYMENT THANK YOU,-300\n2026-10-02,Grocery,80.25\n")
+    upload.name = "card.csv"
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload if kwargs.get("key") == "statement_import" else None)
+    app = _signed_in_app(monkeypatch, repo, "Accounts", accounts_view="Import statement", import_account_type="Credit Card")
+    assert not app.exception
+    # Payments read as money out under "negative", so "positive" is suggested.
+    positive = app.button(key="choose_outflow_positive")
+    assert positive.proto.type == "primary"
+    assert not any(button.label == "Save statement" for button in app.button)
+    positive.click().run()
+    assert not app.exception
+    assert app.selectbox(key="statement_import_sign_Credit Card").value == "outflow_positive"
+    assert any("signs look right" in item.value for item in app.caption)
+    assert app.dataframe[0].value["Amount"].tolist() == [300.0, -80.25]
+    app.button(key="flip_signs").click().run()
+    assert not app.exception
+    assert any("signs look reversed" in item.value for item in app.warning)
+
+
+def test_recurring_charge_can_be_dismissed_and_restored(tmp_path, monkeypatch):
+    from datetime import date
+    from src.domain.models import Transaction
+    from src.repositories.transaction_repo import TransactionRepository
+
+    repo = TransactionRepository(str(tmp_path / "recurring-ui.db"))
+    repo.insert_many([
+        Transaction(id=f"{name}{month}", date=date(2026, month, day), description=name, amount=amount,
+                    category="Health", account_name="Checking")
+        for month in (6, 7, 8, 9) for name, day, amount in (("CITY GYM", 10, -40), ("STREAMFLIX", 3, -15.49))
+    ])
+    app = _signed_in_app(monkeypatch, repo, "Overview", overview_view="Recurring & income")
+    assert not app.exception
+
+    def recurring_names():
+        table = next(frame.value for frame in app.dataframe if "Merchant" in frame.value.columns)
+        return set(table["Merchant"])
+
+    assert recurring_names() == {"CITY GYM", "STREAMFLIX"}
+    app.selectbox(key="recurring_exclude_choice").set_value("CITY GYM")
+    app.button(key="recurring_exclude").click().run()
+    assert not app.exception
+    assert repo.get_setting("recurring_exclusions") == '["city gym"]'
+    assert recurring_names() == {"STREAMFLIX"}
+    next(button for button in app.button if button.label == "Restore").click().run()
+    assert not app.exception
+    assert repo.get_setting("recurring_exclusions") == "[]"
+    assert recurring_names() == {"CITY GYM", "STREAMFLIX"}
+
+
+def test_duplicates_can_be_kept_or_removed(tmp_path, monkeypatch):
+    from datetime import date
+    from src.domain.models import Transaction
+    from src.repositories.transaction_repo import TransactionRepository
+
+    repo = TransactionRepository(str(tmp_path / "duplicates-ui.db"))
+
+    def row(identifier, description):
+        return Transaction(id=identifier, date=date(2026, 9, 1), description=description, amount=-12,
+                           category="Dining", account_name="Card")
+
+    repo.insert_many([row("statement:a", "Cafe"), row("statement:b", "Cafe"),
+                      row("plaid:c", "Bakery"), row("statement:d", "Bakery")])
+    app = _signed_in_app(monkeypatch, repo, "Transactions", tx_view="Possible duplicates")
+    assert not app.exception
+    # Only the statement copy of the bank row can be removed; the bank copy is kept.
+    bakery = [button for button in app.button if button.label == "Remove this copy" and "Bakery" in button.help]
+    assert len(bakery) == 1
+    bakery[0].click().run()
+    assert not app.exception
+    assert {item.id for item in repo.get_all()} == {"statement:a", "statement:b", "plaid:c"}
+    next(button for button in app.button if button.label == "Keep both").click().run()
+    assert not app.exception
+    assert repo.get_setting("duplicate_dismissals") == '["statement:a|statement:b"]'
+    assert any("No exact duplicate" in item.value for item in app.success)
+
+
+def test_sample_data_loads_from_first_run_and_clears(tmp_path, monkeypatch):
+    from src.repositories.transaction_repo import TransactionRepository
+
+    repo = TransactionRepository(str(tmp_path / "sample-ui.db"))
+    app = _signed_in_app(monkeypatch, repo, "Overview")
+    assert not app.exception
+    next(button for button in app.button if button.label == "Explore with sample data").click().run()
+    assert not app.exception
+    assert {row.account_name for row in repo.get_all()} == {"Sample Checking · demo", "Sample Card · demo"}
+    assert any("exploring sample data" in item.value for item in app.markdown)
+    app.button(key="clear_sample").click().run()
+    assert not app.exception
+    app.button(key="clear_sample_confirm").click().run()
+    assert not app.exception
+    assert repo.get_all() == [] and repo.get_budgets() == [] and repo.get_goals() == []
+    assert not any("exploring sample data" in item.value for item in app.markdown)
+
+
+def test_manual_transaction_notes_tags_and_tag_filter(tmp_path, monkeypatch):
+    from datetime import date
+    from src.domain.models import Transaction
+    from src.repositories.transaction_repo import TransactionRepository
+
+    repo = TransactionRepository(str(tmp_path / "manual-ui.db"))
+    repo.insert_many([Transaction(id="hotel", date=date.today(), description="Hotel", amount=-200,
+                                  category="Travel", account_name="Card")])
+    app = _signed_in_app(monkeypatch, repo, "Transactions")
+    assert not app.exception
+    next(button for button in app.button if button.label == "Add transaction").click().run()
+    app.text_input(key="manual_description").set_value("Farmers market").run()
+    app.number_input(key="manual_amount").set_value(12.5)
+    app.selectbox(key="manual_category").set_value("Groceries")
+    app.text_input(key="manual_tags").set_value("market, #weekend")
+    next(button for button in app.button if button.label == "Save transaction").click().run()
+    assert not app.exception
+    manual = next(item for item in repo.get_canonical_all() if item.id.startswith("manual:"))
+    assert (str(manual.amount), manual.account_name, manual.category_origin, manual.tags) == (
+        "-12.50", "Cash", "manual", ["market", "weekend"])
+
+    app.button(key="mobile_edit_transactions_table_All_hotel").click().run()
+    app.segmented_control(key="transaction_editor_tab").set_value("Notes & tags").run()
+    app.text_area(key="notes_hotel").set_value("Conference stay")
+    app.text_input(key="tags_hotel").set_value("work")
+    next(button for button in app.button if button.label == "Save notes").click().run()
+    assert not app.exception
+    assert next(item for item in repo.get_canonical_all() if item.id == "hotel").notes == "Conference stay"
+
+    app.text_input(key="dashboard_tag").set_value("Work").run()
+    assert not app.exception
+    assert app.dataframe[0].value["Description"].tolist() == ["Hotel"]

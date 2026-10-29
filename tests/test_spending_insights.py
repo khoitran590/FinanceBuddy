@@ -360,3 +360,15 @@ def test_provider_detail_summaries():
     channels = {row["channel"]: row for row in AnalyticsService.payment_channel_summary(transactions)}
     assert channels["Online"]["share"] == 70.0
     assert AnalyticsService.location_summary(transactions) == [{"location": "Oakland, CA", "amount": 30.0, "transactions": 1}]
+
+
+def test_preset_labels_name_dates_only_when_latest_activity_is_old():
+    assert AnalyticsService.preset_label("This month", date(2026, 10, 3), date(2026, 10, 29)) == "This month"
+    stale = date(2026, 9, 21)
+    labels = {preset: AnalyticsService.preset_label(preset, stale, date(2026, 10, 29)) for preset in
+              ("This month", "Last month", "Last 30 days", "Last 3 months", "Year to date", "All time")}
+    assert labels == {
+        "This month": "Latest month (Sep 2026)", "Last month": "Month before (Aug 2026)",
+        "Last 30 days": "30 days to Sep 21, 2026", "Last 3 months": "3 months to Sep 2026",
+        "Year to date": "2026 through Sep 21", "All time": "All time",
+    }

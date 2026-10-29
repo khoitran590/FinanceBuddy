@@ -54,7 +54,8 @@ try {
   console.log('Passed all migrations and legacy split recovery.');
   for (const file of ['verify_supabase_isolation.sql', 'verify_atomic_operations.sql', 'verify_atomic_plaid_sync.sql',
                        'verify_literal_category_rule.sql', 'verify_private_plaid_tokens.sql',
-                       'verify_source_splits_and_reconciliation.sql', 'verify_statement_imports.sql', 'verify_data_architecture.sql']) {
+                       'verify_source_splits_and_reconciliation.sql', 'verify_statement_imports.sql', 'verify_data_architecture.sql',
+                       'verify_operation_extensions.sql', 'verify_annotations.sql']) {
     await db.exec(readFileSync(`${root}/scripts/${file}`, 'utf8'));
     console.log(`Passed ${file}`);
   }

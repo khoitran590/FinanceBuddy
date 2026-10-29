@@ -157,3 +157,17 @@ def test_category_labels_meet_normal_text_contrast_for_every_palette_fill():
         for fill, label in zip(trace.marker.colors, trace.textfont.color):
             lighter, darker = sorted([luminance(fill), luminance(label)], reverse=True)
             assert (lighter + 0.05) / (darker + 0.05) >= 4.5
+
+
+def test_cash_flow_timeline_chart_separates_paydays_and_bills():
+    from datetime import date
+    from decimal import Decimal
+    from src.ui.charts import make_cash_flow_timeline
+
+    figure = make_cash_flow_timeline([
+        {"date": date(2026, 10, 1), "label": "Paycheck", "amount": Decimal("2000.00"), "kind": "Payday", "running": Decimal("2000.00")},
+        {"date": date(2026, 10, 3), "label": "Rent", "amount": Decimal("-1500.00"), "kind": "Bill", "running": Decimal("500.00")},
+    ])
+    assert [trace.name for trace in figure.data] == ["Payday", "Bill", "Running balance"]
+    assert list(figure.data[2].y) == [2000.0, 500.0]
+    assert make_cash_flow_timeline([]).layout.title.text == "No bills or paydays expected"

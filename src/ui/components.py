@@ -328,17 +328,29 @@ def _status_column(transactions: List[Transaction]) -> List[str] | None:
     return ["Pending" if transaction.pending else "Posted" for transaction in transactions]
 
 
-def _request_transaction_edit(transaction_id: str) -> None:
-    st.session_state.category_transaction = transaction_id
-    st.session_state.transaction_editor_requested = True
+def open_dialog(name: str, **context) -> None:
+    """Streamlit shows one dialog per run, so every dialog shares this one slot."""
+    st.session_state.active_dialog = {"name": name, **context}
+
+
+def close_dialog() -> None:
+    st.session_state.pop("active_dialog", None)
+
+
+def active_dialog(name: str) -> dict | None:
+    dialog = st.session_state.get("active_dialog")
+    return dialog if isinstance(dialog, dict) and dialog.get("name") == name else None
 
 
 def render_transaction_table(
-    transactions: List[Transaction], height: int = 520, selection_key: str | None = None
+    transactions: List[Transaction], height: int = 520, selection_key: str | None = None,
+    table_version: int = 0,
 ) -> int | None:
     """Show transactions as a table on wide screens and as cards on phones.
 
     With ``selection_key``, a row can be clicked and its position is returned.
+    Selections are row positions, so callers bump ``table_version`` after rows
+    change to stop an old position from pointing at a different transaction.
     """
     frame = transaction_frame(transactions)
     column_order = ["Date", "Description", "Amount", "Category", "Account", "Type"]
@@ -346,7 +358,8 @@ def render_transaction_table(
     if status:
         frame["Status"] = status
         column_order.insert(1, "Status")
-    selection = {"on_select": "rerun", "selection_mode": "single-row", "key": selection_key} if selection_key else {}
+    table_key = f"{selection_key}_v{table_version}" if table_version else selection_key
+    selection = {"on_select": "rerun", "selection_mode": "single-row", "key": table_key} if selection_key else {}
     with st.container(key="desktop_transactions"):
         event = st.dataframe(
             frame,
@@ -411,7 +424,7 @@ def render_transaction_table(
                         "Edit transaction", key=f"mobile_edit_{selection_key}_{transaction.id}",
                         icon=":material/edit:", width="stretch",
                         help=f"Edit {transaction.description} from {transaction.date.strftime('%b %-d, %Y')}",
-                        on_click=_request_transaction_edit, args=(transaction.id,),
+                        on_click=open_dialog, args=("transaction",), kwargs={"id": transaction.id},
                     )
     else:
         st.markdown(
