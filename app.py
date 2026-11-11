@@ -5,7 +5,7 @@ import html
 import json
 import time
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from src.domain.money import money
 from src.services.data_service import DataService
@@ -36,6 +36,14 @@ from src.services.supabase import (
     normalized_session,
 )
 from src.ui.charts import (
+    cash_flow_takeaway,
+    category_takeaway,
+    comparison_takeaway,
+    fixed_flexible_takeaway,
+    merchant_takeaway,
+    running_total_takeaway,
+    savings_rate_takeaway,
+    week_of_month_takeaway,
     make_budget_history_chart,
     make_cash_flow_sankey,
     make_cash_flow_timeline,
@@ -570,11 +578,40 @@ def chart_style(name: str, options: list[str]) -> str:
     )
 
 
+def month_name(key: str) -> str:
+    """'2026-11' -> 'November 2026', for anywhere a person reads a month."""
+    try:
+        return datetime.strptime(str(key)[:7], "%Y-%m").strftime("%B %Y")
+    except ValueError:
+        return str(key)
+
+
+def plain_dollars(text: str) -> str:
+    """Keep two dollar amounts in one message from being read as a math formula."""
+    return text.replace("$", "\\$")
+
+
 def card_chart(figure):
     """Drop a chart's own title when it sits under a card heading."""
     if figure.data:
         figure.update_layout(title_text="", margin={"t": 16})
     return figure
+
+
+# Charts are read, hovered, and clicked; the zoom and export toolbar only gets in the way.
+CHART_CONFIG = {"displayModeBar": False}
+
+
+def show_chart(figure, **kwargs):
+    """Draw a chart under its card heading, without Plotly's toolbar."""
+    return st.plotly_chart(card_chart(figure), width="stretch", config=CHART_CONFIG, **kwargs)
+
+
+def dark_theme() -> bool:
+    try:
+        return st.context.theme.type == "dark"
+    except Exception:
+        return False
 
 
 def apply_date_preset(min_date: date, max_date: date) -> None:
@@ -700,7 +737,7 @@ def _money_table(frame: pd.DataFrame, money_columns: list[str], **kwargs) -> Non
         width="stretch",
         hide_index=True,
         column_config={
-            **{column: st.column_config.NumberColumn(format="$%.2f") for column in money_columns},
+            **{column: st.column_config.NumberColumn(format="dollar") for column in money_columns},
             **kwargs.pop("column_config", {}),
         },
         **kwargs,
@@ -782,23 +819,23 @@ def render_spending_drilldown(transactions, category_event, month_event) -> None
             width="stretch",
             hide_index=True,
             column_config={
-                "Amount": st.column_config.NumberColumn(format="$%.2f"),
+                "Amount": st.column_config.NumberColumn(format="dollar"),
                 "Date": st.column_config.DateColumn(format="MMM D, YYYY"),
             },
         )
 
 
 SUMMARY_CHARTS = {
-    "running_total": ("Running total", "Gain or loss built up across the selected dates."),
-    "savings_rate": ("Savings rate", "Share of income kept each month."),
-    "daily": ("Daily spending", "Each day's spending with a 7-day average."),
-    "fixed_flexible": ("Fixed vs flexible", "Bills you can't easily change vs spending you can."),
-    "cash_flow": ("Where the money went", "How money in flows to each kind of spending."),
-    "category_trend": ("Category by month", "Which categories grow or shrink over time."),
-    "weekday": ("Day of the week", "Which days you tend to spend the most."),
-    "week_of_month": ("Time of month", "Early, middle, or late-month spending."),
-    "merchants": ("Top merchants", "Where your money goes most often."),
-    "income": ("Income by month", "Paychecks and other income over time."),
+    "running_total": ("Running total", "Money in minus money out, added up day by day. Above zero means you're ahead."),
+    "savings_rate": ("Savings rate", "The share of each month's income you kept. Below zero means you spent more than you earned."),
+    "daily": ("Daily spending", "Bars are single days; the line is the average of the last 7 days."),
+    "fixed_flexible": ("Fixed vs flexible", "Bills you can't easily change (purple) vs day-to-day spending you can (orange)."),
+    "cash_flow": ("Where the money went", "Follow money in, on the left, to what it paid for on the right. Thicker bands are bigger amounts."),
+    "category_trend": ("Category by month", "Each row is a category, each column a month. Stronger color means more spent."),
+    "weekday": ("Day of the week", "What you spend on a typical Monday, Tuesday, and so on."),
+    "week_of_month": ("Time of month", "Average spending per day in each part of the month."),
+    "merchants": ("Top merchants", "The places that received the most of your money."),
+    "income": ("Income by month", "Paychecks and other income added up for each month."),
 }
 DEFAULT_SUMMARY_CHARTS = ["running_total"]
 
@@ -825,30 +862,35 @@ def choose_summary_charts() -> None:
 
 
 def summary_chart_figure(key: str, analysis, history, start_date: date, end_date: date):
+    """The chart and its one-sentence takeaway (empty when there is nothing to say)."""
     if key == "running_total":
-        return make_profit_loss_line_chart(AnalyticsService.cumulative_cash_flow(analysis))
+        points = AnalyticsService.cumulative_cash_flow(analysis)
+        return make_profit_loss_line_chart(points), running_total_takeaway(points)
     if key == "savings_rate":
-        return make_savings_rate_chart(AnalyticsService.monthly_savings_rate(analysis))
+        monthly = AnalyticsService.monthly_savings_rate(analysis)
+        return make_savings_rate_chart(monthly), savings_rate_takeaway(monthly)
     if key == "daily":
-        return make_daily_spending_chart(AnalyticsService.daily_spending(analysis, start_date, end_date))
+        return make_daily_spending_chart(AnalyticsService.daily_spending(analysis, start_date, end_date)), ""
     if key == "fixed_flexible":
-        return make_fixed_flexible_chart(AnalyticsService.fixed_vs_flexible(analysis)["months"])
+        months = AnalyticsService.fixed_vs_flexible(analysis)["months"]
+        return make_fixed_flexible_chart(months), fixed_flexible_takeaway(months)
     if key == "cash_flow":
         return make_cash_flow_sankey(
-            AnalyticsService.income_sources(analysis), AnalyticsService.category_expenses(analysis)
-        )
+            AnalyticsService.income_sources(analysis), AnalyticsService.category_expenses(analysis),
+            dark=dark_theme(),
+        ), ""
     if key == "category_trend":
-        return make_category_heatmap(AnalyticsService.monthly_category_expenses(analysis))
+        return make_category_heatmap(AnalyticsService.monthly_category_expenses(analysis), dark=dark_theme()), ""
     if key == "weekday":
-        return make_weekday_chart(AnalyticsService.weekday_spending(analysis, start_date, end_date))
+        return make_weekday_chart(AnalyticsService.weekday_spending(analysis, start_date, end_date)), ""
     if key == "week_of_month":
-        return make_week_of_month_chart(
-            AnalyticsService.week_of_month_spending(analysis, start_date, end_date)
-        )
+        buckets = AnalyticsService.week_of_month_spending(analysis, start_date, end_date)
+        return make_week_of_month_chart(buckets), week_of_month_takeaway(buckets)
     if key == "merchants":
-        return make_merchant_bar_chart(AnalyticsService.merchant_summary(analysis, limit=10))
+        merchants = AnalyticsService.merchant_summary(analysis, limit=10)
+        return make_merchant_bar_chart(merchants), merchant_takeaway(merchants)
     income = AnalyticsService.income_summary(history)
-    return make_income_chart(income["months"] if income else [])
+    return make_income_chart(income["months"] if income else []), ""
 
 
 def render_summary_charts(analysis, history, start_date: date, end_date: date) -> None:
@@ -870,12 +912,9 @@ def render_summary_charts(analysis, history, start_date: date, end_date: date) -
         title, description = SUMMARY_CHARTS[key]
         with columns[index % 2]:
             with st.container(border=True, key=f"fbcard_extra_{key}"):
-                render_card_header(title, description)
-                st.plotly_chart(
-                    card_chart(summary_chart_figure(key, analysis, history, start_date, end_date)),
-                    width="stretch",
-                    key=f"summary_chart_{key}",
-                )
+                figure, takeaway = summary_chart_figure(key, analysis, history, start_date, end_date)
+                render_card_header(title, description, takeaway)
+                show_chart(figure, key=f"summary_chart_{key}")
 
 
 def render_overview_summary(analysis, categories, history, start_date: date, end_date: date, extra_metrics, all_transactions) -> None:
@@ -885,13 +924,15 @@ def render_overview_summary(analysis, categories, history, start_date: date, end
         st.markdown("## Top spending categories")
         if categories:
             top_categories = sorted(categories, key=lambda item: item["amount"], reverse=True)[:5]
-            figure = card_chart(make_category_bar_chart(top_categories))
-            figure.update_layout(height=300, margin={"l": 0, "r": 60, "t": 8, "b": 24})
-            figure.update_xaxes(title_text=None)
-            figure.update_yaxes(title_text=None, automargin=True)
-            category_event = st.plotly_chart(
-                figure, width="stretch", on_select="rerun", selection_mode="points",
-                key="summary_top_categories", config={"displayModeBar": False},
+            st.markdown(
+                f'<p class="fb-takeaway">{html.escape(category_takeaway(categories))}</p>'
+                '<p class="fb-card-sub">Each bar shows the amount and its share of all spending. '
+                "Click a bar to list its transactions.</p>",
+                unsafe_allow_html=True,
+            )
+            category_event = show_chart(
+                make_category_bar_chart(top_categories), on_select="rerun", selection_mode="points",
+                key="summary_top_categories",
             )
             selected_categories = _selected_points(category_event, "y")
             if selected_categories:
@@ -904,7 +945,7 @@ def render_overview_summary(analysis, categories, history, start_date: date, end
                     transaction_frame(sorted(selected_rows, key=lambda item: item.date, reverse=True)),
                     key="summary_category_transactions", width="stretch", hide_index=True,
                     column_config={
-                        "Amount": st.column_config.NumberColumn(format="$%.2f"),
+                        "Amount": st.column_config.NumberColumn(format="dollar"),
                         "Date": st.column_config.DateColumn(format="MMM D, YYYY"),
                     },
                 )
@@ -951,64 +992,73 @@ def render_overview_details(analysis, categories, history, start_date: date, end
     month_event = category_event = None
     left, right = st.container(key="overview_detail_charts").columns(2)
     with left, st.container(border=True, key="fbcard_cash_flow"):
-        title, picker = st.columns([1, 1], vertical_alignment="center")
+        # Heading first, style picker under it: side by side they squeeze each other in half-width cards.
+        title, picker = st.container(), st.container()
         with picker:
             style = chart_style("cash_flow", ["Columns", "Lines", "Net"])
         with title:
             if style == "Net":
-                render_card_header("Saved each month", "Below zero means more went out than came in.")
+                render_card_header(
+                    "Kept each month",
+                    "Money in minus money out. Blue bars are months you kept money; orange bars are months you overspent.",
+                    cash_flow_takeaway(monthly),
+                )
             else:
-                render_card_header("Money in vs money out", "Monthly totals.")
+                render_card_header(
+                    "Money in vs money out",
+                    "Blue is what came in each month, orange is what went out. A taller blue bar means you kept money.",
+                    cash_flow_takeaway(monthly),
+                )
         if style == "Columns":
-            month_event = st.plotly_chart(
-                card_chart(make_monthly_bar_chart(monthly)),
-                width="stretch",
-                on_select="rerun",
-                selection_mode="points",
+            month_event = show_chart(
+                make_monthly_bar_chart(monthly), on_select="rerun", selection_mode="points",
                 key="overview_month_chart",
             )
         elif style == "Lines":
-            st.plotly_chart(card_chart(make_monthly_line_chart(monthly)), width="stretch", key="overview_month_lines")
+            show_chart(make_monthly_line_chart(monthly), key="overview_month_lines")
         else:
-            month_event = st.plotly_chart(
-                card_chart(make_monthly_net_chart(monthly)),
-                width="stretch",
-                on_select="rerun",
-                selection_mode="points",
+            month_event = show_chart(
+                make_monthly_net_chart(monthly), on_select="rerun", selection_mode="points",
                 key="overview_month_net",
             )
     with right, st.container(border=True, key="fbcard_categories"):
-        title, picker = st.columns([1, 1], vertical_alignment="center")
+        # Heading first, style picker under it: side by side they squeeze each other in half-width cards.
+        title, picker = st.container(), st.container()
         with picker:
-            style = chart_style("categories", ["Donut", "Bars", "Map"])
+            style = chart_style("categories", ["Bars", "Donut", "Map"])
         with title:
             total = sum(item["amount"] for item in categories)
-            render_card_header("Where it went", f"{format_currency(total)} spent")
+            render_card_header(
+                "Where it went",
+                f"{format_currency(total)} spent, split by category. "
+                + {
+                    "Bars": "Longest bar is the biggest category.",
+                    "Donut": "Each slice is a category's share; small ones are grouped as Other.",
+                    "Map": "Each tile's size is its share of spending.",
+                }[style],
+                category_takeaway(categories),
+            )
         if style == "Donut":
-            st.plotly_chart(
-                card_chart(make_category_donut_chart({item["category"]: item["amount"] for item in categories})),
-                width="stretch",
+            show_chart(
+                make_category_donut_chart({item["category"]: item["amount"] for item in categories}),
                 key="overview_category_donut",
             )
         elif style == "Bars":
-            category_event = st.plotly_chart(
-                card_chart(make_category_bar_chart(categories)),
-                width="stretch",
-                on_select="rerun",
-                selection_mode="points",
+            category_event = show_chart(
+                make_category_bar_chart(categories), on_select="rerun", selection_mode="points",
                 key="overview_category_chart",
             )
         else:
-            st.plotly_chart(card_chart(make_category_treemap(categories)), width="stretch", key="overview_category_map")
+            show_chart(make_category_treemap(categories), key="overview_category_map")
 
     st.header("Explore spending")
-    st.caption("Click a bar in either chart, or pick a category, to see the transactions behind it.")
+    st.caption("Click a bar in either chart above, or pick a category here, to see the transactions behind it.")
     render_spending_drilldown(analysis, category_event, month_event)
 
     render_summary_charts(analysis, history, start_date, end_date)
 
     st.header("What changed")
-    changes = AnalyticsService.category_changes(analysis)
+    changes = [item for item in AnalyticsService.category_changes(analysis) if round(abs(item["change"]), 2)]
     if changes:
         st.caption(
             f"{changes[0]['current_month']} compared with {changes[0]['previous_month']}. "
@@ -1026,16 +1076,19 @@ def render_overview_details(analysis, categories, history, start_date: date, end
     else:
         st.caption("Import at least two comparable months of activity to see category changes.")
 
-    unusual = AnalyticsService.unusual_expenses(analysis)
+    unusual = AnalyticsService.unusual_expenses(analysis, history, recurring_exclusions())
     forecast = AnalyticsService.cash_flow_forecast(history, recurring_exclusions())
     first, second = st.columns(2)
     with first, st.container(border=True, key="fbcard_unusual"):
-        render_card_header("Unusual expenses")
+        render_card_header("Unusual expenses", "One-off purchases much larger than your typical one. Regular bills like rent are left out.")
         if unusual:
             for transaction in unusual:
-                st.write(f"{transaction.description} · {format_currency(abs(transaction.amount))}")
+                st.write(
+                    f"{transaction.date.strftime('%b %-d')} · {transaction.description} · "
+                    f"{format_currency(abs(transaction.amount))}".replace("$", "\\$")
+                )
         else:
-            st.caption("No unusually large expenses detected in this selection.")
+            st.caption("No unusually large one-off expenses in this selection.")
     with second, st.container(border=True, key="fbcard_forecast"):
         render_card_header("Next-month estimate")
         if forecast["months"]:
@@ -1068,26 +1121,33 @@ def render_overview_details(analysis, categories, history, start_date: date, end
             width="stretch",
             hide_index=True,
             column_config={
-                "Spend": st.column_config.NumberColumn(format="$%.2f"),
+                "Spend": st.column_config.NumberColumn(format="dollar"),
                 "Share (%)": st.column_config.NumberColumn(format="%.1f%%"),
-                "Average": st.column_config.NumberColumn(format="$%.2f"),
+                "Average": st.column_config.NumberColumn(format="dollar"),
             },
         )
 
 
 def render_overview_trends(analysis, start_date: date, end_date: date) -> None:
     with st.container(border=True, key="fbcard_savings_rate"):
-        render_card_header("Savings rate by month", "Net cash flow as bars, the share of income kept as a line.")
-        st.plotly_chart(
-            card_chart(make_savings_rate_chart(AnalyticsService.monthly_savings_rate(analysis))),
-            width="stretch",
+        savings = AnalyticsService.monthly_savings_rate(analysis)
+        render_card_header(
+            "Savings rate by month",
+            "The share of each month's income you kept. Below zero means you spent more than you earned.",
+            savings_rate_takeaway(savings),
         )
+        show_chart(make_savings_rate_chart(savings))
 
     split = AnalyticsService.fixed_vs_flexible(analysis)
     with st.container(border=True, key="fbcard_fixed_flexible"):
-        title, picker = st.columns([1, 1], vertical_alignment="center")
+        # Heading first, style picker under it: side by side they squeeze each other in half-width cards.
+        title, picker = st.container(), st.container()
         with title:
-            render_card_header("Fixed costs vs flexible spending")
+            render_card_header(
+                "Fixed costs vs flexible spending",
+                "Fixed costs (purple) are bills that are hard to change. Flexible spending (orange) is everything else.",
+                fixed_flexible_takeaway(split["months"]),
+            )
         with picker:
             style = chart_style("fixed_flexible", ["Stacked", "Side by side"])
         first, second, third = st.columns(3)
@@ -1096,13 +1156,14 @@ def render_overview_trends(analysis, start_date: date, end_date: date) -> None:
         second.metric("Flexible spending", format_currency(split["flexible"]),
                       help="Everything else: day-to-day spending you have the most control over.")
         third.metric("Fixed share", f"{split['fixed_share']:.0f}%")
-        st.plotly_chart(
-            card_chart(make_fixed_flexible_chart(split["months"], stacked=style == "Stacked")),
-            width="stretch",
-        )
+        show_chart(make_fixed_flexible_chart(split["months"], stacked=style == "Stacked"))
 
     with st.container(border=True, key="fbcard_daily"):
-        render_card_header("Daily spending", "Each day with a 7-day average.")
+        render_card_header(
+            "Daily spending",
+            "Faint bars are single days; the line is the average of the last 7 days, which shows whether "
+            "you're speeding up or slowing down. Very large days (like rent) are cut off at the top and labelled ▲.",
+        )
         pace = AnalyticsService.spending_pace(analysis, start_date, end_date)
         first, second, third = st.columns(3)
         first.metric("Average per day", format_currency(pace["average_daily"]),
@@ -1114,35 +1175,41 @@ def render_overview_trends(analysis, start_date: date, end_date: date) -> None:
             delta_color="inverse",
         )
         third.metric("Last 30 days, per day", format_currency(pace["last_30_days"]))
-        st.plotly_chart(
-            card_chart(make_daily_spending_chart(AnalyticsService.daily_spending(analysis, start_date, end_date))),
-            width="stretch",
-        )
+        show_chart(make_daily_spending_chart(AnalyticsService.daily_spending(analysis, start_date, end_date)))
 
     with st.container(border=True, key="fbcard_sankey"):
-        render_card_header("Where the money went", "Money in on the left, spending and savings on the right.")
-        st.plotly_chart(
-            card_chart(make_cash_flow_sankey(
-                AnalyticsService.income_sources(analysis), AnalyticsService.category_expenses(analysis)
-            )),
-            width="stretch",
+        render_card_header(
+            "Where the money went",
+            "Follow your money from left to right: where it came from, then what it paid for and what was left. "
+            "Thicker bands are bigger amounts.",
         )
+        show_chart(make_cash_flow_sankey(
+            AnalyticsService.income_sources(analysis), AnalyticsService.category_expenses(analysis),
+            dark=dark_theme(),
+        ))
 
     with st.container(border=True, key="fbcard_category_trend"):
-        title, picker = st.columns([1, 1], vertical_alignment="center")
-        with title:
-            render_card_header("Category by month")
+        # Heading first, style picker under it: side by side they squeeze each other in half-width cards.
+        title, picker = st.container(), st.container()
         with picker:
             style = chart_style("category_trend", ["Heat map", "Lines"])
+        with title:
+            render_card_header(
+                "Category by month",
+                "Each row is a category and each column a month. Stronger color means more spent, "
+                "so a row that gets stronger to the right is growing."
+                if style == "Heat map"
+                else "Your five biggest categories, one line each. A rising line is a category that is growing.",
+            )
         month_count = len({item.date.strftime("%Y-%m") for item in analysis})
         if month_count >= 2:
             monthly_categories = AnalyticsService.monthly_category_expenses(analysis)
             figure = (
-                make_category_heatmap(monthly_categories)
+                make_category_heatmap(monthly_categories, dark=dark_theme())
                 if style == "Heat map"
                 else make_category_trend_lines(monthly_categories)
             )
-            st.plotly_chart(card_chart(figure), width="stretch")
+            show_chart(figure)
         else:
             st.caption("Import at least two months to view this trend.")
 
@@ -1153,29 +1220,38 @@ def render_overview_habits(analysis, start_date: date, end_date: date) -> None:
     if split and split["weekday"]:
         direction = "more" if split["difference"] >= 0 else "less"
         st.info(
-            f"You spend {format_currency(split['weekend'])} per weekend day and "
+            plain_dollars(f"You spend {format_currency(split['weekend'])} per weekend day and "
             f"{format_currency(split['weekday'])} per weekday: {abs(split['difference']):.0f}% "
-            f"{direction} on weekends."
+            f"{direction} on weekends.")
         )
     left, right = st.columns(2)
     with left, st.container(border=True, key="fbcard_weekday"):
-        render_card_header("Day of the week", "Average spending per day.")
-        st.plotly_chart(card_chart(make_weekday_chart(weekday)), width="stretch")
-    with right, st.container(border=True, key="fbcard_week_of_month"):
-        render_card_header("Time of month", "Average spending per day in each part of the month.")
-        st.plotly_chart(
-            card_chart(make_week_of_month_chart(
-                AnalyticsService.week_of_month_spending(analysis, start_date, end_date)
-            )),
-            width="stretch",
+        render_card_header(
+            "Day of the week",
+            "What you spend on a typical Monday, Tuesday, and so on. Weekends are purple.",
         )
+        show_chart(make_weekday_chart(weekday))
+    with right, st.container(border=True, key="fbcard_week_of_month"):
+        month_parts = AnalyticsService.week_of_month_spending(analysis, start_date, end_date)
+        render_card_header(
+            "Time of month",
+            "Average spending per day in each part of the month. Rent and other first-of-month bills land in Days 1–7.",
+            week_of_month_takeaway(month_parts),
+        )
+        show_chart(make_week_of_month_chart(month_parts))
 
     st.header("Top merchants")
     merchants = AnalyticsService.merchant_summary(analysis, limit=10)
     if merchants:
+        st.markdown(
+            f'<p class="fb-takeaway">{html.escape(merchant_takeaway(merchants))}</p>'
+            '<p class="fb-card-sub">The ten places that received the most of your money in these dates. '
+            "Hover a bar for the number of purchases and the average.</p>",
+            unsafe_allow_html=True,
+        )
         style = chart_style("merchants", ["Bars", "Table"])
         if style == "Bars":
-            st.plotly_chart(card_chart(make_merchant_bar_chart(merchants)), width="stretch")
+            show_chart(make_merchant_bar_chart(merchants))
         else:
             _money_table(
                 pd.DataFrame(merchants).rename(
@@ -1265,7 +1341,14 @@ def render_cash_flow_timeline(active, income, history) -> None:
     if not events:
         st.caption("No recurring bills or paydays are expected in the next 30 days.")
     else:
-        st.plotly_chart(card_chart(make_cash_flow_timeline(events)), width="stretch")
+        st.markdown(
+            '<p class="fb-card-sub">Blue bars are expected paydays, orange bars are expected bills. The purple line is '
+            + ("your checking balance after each one." if starting is not None
+               else "how far ahead or behind today you'd be after each one. Add your starting cash below to see a real balance.")
+            + "</p>",
+            unsafe_allow_html=True,
+        )
+        show_chart(make_cash_flow_timeline(events))
         _money_table(
             pd.DataFrame(events)[["date", "label", "amount", "running"]].rename(columns={
                 "date": "Date", "label": "Expected", "amount": "Amount",
@@ -1306,8 +1389,8 @@ def render_overview_recurring(history) -> None:
         for item in active:
             if item["price_change"] > 0:
                 st.warning(
-                    f"{item['merchant']} went up from {format_currency(item['previous_amount'])} to "
-                    f"{format_currency(item['amount'])} ({item['cadence'].lower()})."
+                    plain_dollars(f"{item['merchant']} went up from {format_currency(item['previous_amount'])} to "
+                    f"{format_currency(item['amount'])} ({item['cadence'].lower()}).")
                 )
         _money_table(
             pd.DataFrame(active)[
@@ -1372,12 +1455,19 @@ def render_overview_recurring(history) -> None:
         ),
     )
     st.caption(
-        f"Average monthly income {format_currency(income['average_monthly'])} across "
-        f"{len(income['months'])} month(s) · Sources: "
-        + ", ".join(f"{item['source']} ({format_currency(item['amount'])})" for item in income["sources"])
+        (
+            f"Average monthly income {format_currency(income['average_monthly'])} across "
+            f"{len(income['months'])} month(s) · Sources: "
+            + ", ".join(f"{item['source']} ({format_currency(item['amount'])})" for item in income["sources"])
+        ).replace("$", "\\$")
     )
     if len(income["months"]) >= 2:
-        st.plotly_chart(make_income_chart(income["months"]), width="stretch")
+        with st.container(border=True, key="fbcard_income"):
+            render_card_header(
+                "Income by month",
+                "Everything categorized as Salary/Income, added up per month. Even bars mean steady pay.",
+            )
+            show_chart(make_income_chart(income["months"]))
 
 
 def render_overview_balances(accounts: list[dict], history: list[dict], all_transactions) -> None:
@@ -1437,7 +1527,12 @@ def render_overview_balances(accounts: list[dict], history: list[dict], all_tran
     st.caption("History uses recorded USD balances, including retained snapshots from disconnected accounts. It carries each account’s last known balance forward.")
     trend = AnalyticsService.net_worth_history(history)
     if len(trend) >= 2:
-        st.plotly_chart(make_net_worth_chart(trend), width="stretch")
+        with st.container(border=True, key="fbcard_net_worth"):
+            render_card_header(
+                "Net worth over time",
+                "The thick line is what you own minus what you owe. The thin lines show each side on its own.",
+            )
+            show_chart(make_net_worth_chart(trend))
     else:
         st.caption("A net worth trend appears after balances have been recorded on two different days.")
 
@@ -1514,6 +1609,8 @@ def render_overview(transactions, view: dict):
             render_overview_balances(balance_accounts, balance_history, view["all_transactions"])
         else:
             st.info("Connect a bank to see USD balances and net worth history.")
+            st.button("Connect a bank", key="balances_connect_bank", icon=":material/add_link:",
+                      on_click=navigate_to, args=("Accounts", "Bank connections"))
 
 
 def _finish_transaction_edit(message: str) -> None:
@@ -1918,8 +2015,8 @@ def render_budget_dialog(budgets, transactions, category=None) -> None:
     history = AnalyticsService.category_spend_history(transactions, category)
     if history:
         st.caption(
-            f"{history['last_label']}: {format_currency(history['last_month'])} · "
-            f"{history['months']}-month average: {format_currency(history['average'])}"
+            plain_dollars(f"{history['last_label']}: {format_currency(history['last_month'])} · "
+            f"{history['months']}-month average: {format_currency(history['average'])}")
         )
         st.button(f"Use the {history['months']}-month average", key="budget_use_average",
                   on_click=_use_suggested_limit, args=(limit_key, history["average"]),
@@ -1958,7 +2055,9 @@ def render_budgets(transactions) -> None:
     st.caption("Includes all accounts and categories for the selected month, regardless of dashboard filters.")
     budgets = repo.get_budgets()
     months = sorted({item.date.strftime("%Y-%m") for item in transactions})
-    selected_month = st.selectbox("Budget month", months, index=len(months) - 1) if months else None
+    selected_month = (
+        st.selectbox("Budget month", months, index=len(months) - 1, format_func=month_name) if months else None
+    )
     if budgets and selected_month:
         statuses = AnalyticsService.budget_status(budgets, transactions, selected_month, date.today())
         total_limit = sum(row["limit"] for row in statuses)
@@ -1999,8 +2098,8 @@ def render_budgets(transactions) -> None:
                 st.error(f"Over budget by {format_currency(row['spent'] - row['limit'])}")
             elif row["status"] == "Projected to go over":
                 st.warning(
-                    f"At this pace, {row['category']} reaches about {format_currency(row['projected'])} "
-                    f"by month end, {format_currency(row['projected'] - row['limit'])} over the limit."
+                    plain_dollars(f"At this pace, {row['category']} reaches about {format_currency(row['projected'])} "
+                    f"by month end, {format_currency(row['projected'] - row['limit'])} over the limit.")
                 )
     elif not budgets:
         st.info("Create a category budget to start tracking monthly limits.")
@@ -2023,7 +2122,9 @@ def render_budgets(transactions) -> None:
         with st.expander("Budget history", expanded=False):
             st.caption(f"How each budget held up over the last {len(history_months)} month(s) with activity.")
             st.dataframe(
-                pd.DataFrame(history["summary"]).rename(
+                pd.DataFrame(history["summary"]).assign(
+                    highest_month=lambda frame: frame["highest_month"].map(lambda value: month_name(value) if value else value)
+                ).rename(
                     columns={
                         "category": "Budget",
                         "limit": "Limit",
@@ -2037,12 +2138,17 @@ def render_budgets(transactions) -> None:
                 width="stretch",
                 hide_index=True,
                 column_config={
-                    "Limit": st.column_config.NumberColumn(format="$%.2f"),
-                    "Average spend": st.column_config.NumberColumn(format="$%.2f"),
-                    "Highest month spend": st.column_config.NumberColumn(format="$%.2f"),
+                    "Limit": st.column_config.NumberColumn(format="dollar"),
+                    "Average spend": st.column_config.NumberColumn(format="dollar"),
+                    "Highest month spend": st.column_config.NumberColumn(format="dollar"),
                 },
             )
-            st.plotly_chart(make_budget_history_chart(history["cells"]), width="stretch")
+            render_card_header(
+                "Budget used, month by month",
+                "Each cell is the share of that budget's limit you used. Blue stayed within the limit; "
+                "orange went over 100%.",
+            )
+            show_chart(make_budget_history_chart(history["cells"], dark=dark_theme()))
 
     if dialog := active_dialog("budget"):
         render_budget_dialog(budgets, transactions, dialog.get("category"))
@@ -2085,7 +2191,7 @@ def render_add_funds_dialog(goal_id) -> None:
     if goal is None:
         st.info("This goal no longer exists.")
         return
-    st.write(f"{goal.name}: {format_currency(goal.current_amount)} of {format_currency(goal.target_amount)} saved.")
+    st.write(plain_dollars(f"{goal.name}: {format_currency(goal.current_amount)} of {format_currency(goal.target_amount)} saved."))
     amount = st.number_input("Amount to add", min_value=0.01, value=50.0, step=10.0, key=f"goal_funds_amount_{goal_id}")
     if st.button("Add funds", key="goal_add_confirm", type="primary", width="stretch"):
         try:
@@ -2205,8 +2311,11 @@ def render_compare_saved() -> None:
         date.fromisoformat(catalog["min_date"]), date.fromisoformat(catalog["max_date"]), granularity
     )
     by_label = {item["label"]: item for item in periods}
+    # Start with full periods: a half-saved month next to a whole one always looks like a drop.
+    complete = [item["label"] for item in periods if not item["partial"]]
     chosen = st.multiselect(
-        "Periods to compare", list(by_label), default=list(by_label)[-2:], max_selections=6,
+        "Periods to compare", list(by_label),
+        default=complete[-2:] if len(complete) >= 2 else list(by_label)[-2:], max_selections=6,
         format_func=lambda label: label + (" (partial)" if by_label[label]["partial"] else ""),
         key=f"compare_periods_{granularity}",
         help="Partial periods are missing days at the start or end of your saved history.",
@@ -2218,6 +2327,13 @@ def render_compare_saved() -> None:
     # One read for the whole span, bucketed locally, instead of a query per period.
     rows = repo.get_filtered({"start": selected[0]["start"].isoformat(), "end": selected[-1]["end"].isoformat()})
     st.caption("Includes every saved account, regardless of Overview filters.")
+    partial = [item["label"] for item in selected if item["partial"]]
+    if partial and len(partial) < len(selected):
+        st.warning(
+            f"{', '.join(partial)} {'is' if len(partial) == 1 else 'are'} only partly saved, so "
+            f"{'it' if len(partial) == 1 else 'they'} will look lower than a full "
+            f"{granularity.lower()}. Differences below may just reflect the missing days."
+        )
     render_comparison([
         {"label": item["label"] + (" (partial)" if item["partial"] else ""), "start": item["start"],
          "transactions": [row for row in rows if item["start"] <= row.date <= item["end"]]}
@@ -2299,18 +2415,33 @@ def render_comparison(periods) -> None:
         width="stretch",
         hide_index=True,
         column_config={
-            "Money in": st.column_config.NumberColumn(format="$%.2f"),
-            "Money out": st.column_config.NumberColumn(format="$%.2f"),
-            "Net cash flow": st.column_config.NumberColumn(format="$%.2f"),
-            "Spending change": st.column_config.NumberColumn(format="$%.2f"),
+            "Money in": st.column_config.NumberColumn(format="dollar"),
+            "Money out": st.column_config.NumberColumn(format="dollar"),
+            "Net cash flow": st.column_config.NumberColumn(format="dollar"),
+            "Spending change": st.column_config.NumberColumn(format="dollar"),
         },
     )
     left, right = st.columns(2)
-    with left:
-        st.plotly_chart(make_comparison_summary_chart(comparisons), width="stretch")
-    with right:
-        st.plotly_chart(make_comparison_category_chart(comparisons), width="stretch")
-    st.plotly_chart(make_comparison_delta_chart(comparisons), width="stretch")
+    with left, st.container(border=True, key="fbcard_compare_summary"):
+        render_card_header(
+            "Money out and money kept",
+            "For each period: what you spent (orange) and what was left over (blue).",
+        )
+        show_chart(make_comparison_summary_chart(comparisons))
+    with right, st.container(border=True, key="fbcard_compare_categories"):
+        render_card_header(
+            "Spending by category",
+            "One bar per period for each category, so you can see which ones moved.",
+        )
+        show_chart(make_comparison_category_chart(comparisons))
+    if len(comparisons) >= 2:
+        with st.container(border=True, key="fbcard_compare_delta"):
+            render_card_header(
+                f"What changed: {comparisons[-1]['label']} vs {comparisons[-2]['label']}",
+                "Orange bars to the right are categories where you spent more; blue bars to the left, less.",
+                comparison_takeaway(comparisons),
+            )
+            show_chart(make_comparison_delta_chart(comparisons))
 
 
 def render_bank_connections() -> None:
@@ -2618,7 +2749,7 @@ def render_import_statement() -> None:
                 preview_frame,
                 width="stretch",
                 hide_index=True,
-                column_config={"Amount": st.column_config.NumberColumn(format="$%.2f")},
+                column_config={"Amount": st.column_config.NumberColumn(format="dollar")},
             )
             if len(parsed) > 20:
                 st.caption(f"Showing the first 20 of {len(parsed)} transactions in this preview.")
@@ -3048,8 +3179,6 @@ def render_filter_bar(catalog) -> dict:
     history_start = max(min_date, max_date - timedelta(days=366))
     history_filters = {**query_filters, "start": history_start.isoformat(), "end": max_date.isoformat()}
     history = repo.get_filtered(history_filters) if overview_filters and st.session_state.get("overview_view", "Summary") in ("Summary", "Recurring & income", "Balances") else []
-    if overview_filters:
-        st.caption("Recurring charges, income cadence, and forecasts use up to 12 months of matching history.")
     return {
         "filtered": filtered, "start_date": start_date, "end_date": end_date,
         "previous_range": previous_range,

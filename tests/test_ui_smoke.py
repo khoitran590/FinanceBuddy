@@ -351,7 +351,7 @@ def test_overview_tabs_balances_presets_and_budget_pace(tmp_path, monkeypatch):
     assert not app.exception
     app.segmented_control(key='overview_view').set_value('Recurring & income').run()
     assert not app.exception
-    assert any('Netflix went up from $15.49 to $17.99' in item.value for item in app.warning)
+    assert any(r'Netflix went up from \$15.49 to \$17.99' in item.value for item in app.warning)
     app.segmented_control(key='overview_view').set_value('Summary').run()
 
     # A main-chart selection must coexist with the deeper category explorer.

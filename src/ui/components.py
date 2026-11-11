@@ -52,6 +52,9 @@ def inject_app_styles() -> None:
         [data-testid="stMetricValue"] * { overflow: visible !important; text-overflow: clip !important; }
         [class*="st-key-fbcard"] { background: var(--fb-surface); }
         .fb-card-sub { color: var(--fb-muted); font-size: .85rem; margin: .1rem 0 0; }
+        /* The one-sentence reading of a chart, shown between its heading and the chart. */
+        .fb-takeaway { margin: .55rem 0 .15rem; padding-left: .7rem; line-height: 1.45;
+            border-left: 3px solid var(--fb-income); font-size: .95rem; }
 
         /* Overview: let the spending total and activity carry the hierarchy. */
         .st-key-overview_totals [data-testid="stMetric"] {
@@ -243,9 +246,11 @@ def render_page_header(title: str, description: str | None = None) -> None:
         st.markdown(f'<p class="fb-page-sub">{html.escape(description)}</p>', unsafe_allow_html=True)
 
 
-def render_card_header(title: str, subtitle: str | None = None) -> None:
+def render_card_header(title: str, subtitle: str | None = None, takeaway: str | None = None) -> None:
+    """A chart's heading: what it is, how to read it, and what it says right now."""
     sub = f'<p class="fb-card-sub">{html.escape(subtitle)}</p>' if subtitle else ""
-    st.markdown(f'<h3 class="fb-card-title">{html.escape(title)}</h3>{sub}', unsafe_allow_html=True)
+    point = f'<p class="fb-takeaway">{html.escape(takeaway)}</p>' if takeaway else ""
+    st.markdown(f'<h3 class="fb-card-title">{html.escape(title)}</h3>{sub}{point}', unsafe_allow_html=True)
 
 
 def format_currency(value: float) -> str:

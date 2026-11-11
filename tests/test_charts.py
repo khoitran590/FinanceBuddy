@@ -28,7 +28,7 @@ def test_profit_loss_chart_connects_sign_changes_at_zero(number, direction):
         ]
     )
 
-    assert [trace.name for trace in figure.data] == ["Gain", "Loss"]
+    assert [trace.name for trace in figure.data] == ["Ahead", "Behind"]
     assert 0.0 in list(figure.data[0].y)
     assert 0.0 in list(figure.data[1].y)
     assert figure.data[0].x[1] == datetime(2026, 1, 1, 16)
@@ -94,12 +94,14 @@ def test_sankey_balances_income_spending_and_savings():
     from src.ui.charts import make_cash_flow_sankey
 
     saved = make_cash_flow_sankey({"Salary/Income": 1000.0}, {"Housing": 600.0, "Dining": 100.0})
-    labels = list(saved.data[0].node.label)
+    labels = list(saved.data[0].node.customdata)
     assert "Saved" in labels
+    # Amounts are written on the nodes, so reading them doesn't depend on hovering.
+    assert "Saved · $300" in list(saved.data[0].node.label)
     assert saved.data[0].link.value[labels.index("Saved") - 1] == 300.0
 
     deficit = make_cash_flow_sankey({"Salary/Income": 100.0}, {"Housing": 600.0})
-    assert "Drawn from savings" in list(deficit.data[0].node.label)
+    assert "Drawn from savings" in list(deficit.data[0].node.customdata)
 
 
 def test_alternative_chart_styles_render_with_data_and_when_empty():
@@ -171,3 +173,87 @@ def test_cash_flow_timeline_chart_separates_paydays_and_bills():
     assert [trace.name for trace in figure.data] == ["Payday", "Bill", "Running balance"]
     assert list(figure.data[2].y) == [2000.0, 500.0]
     assert make_cash_flow_timeline([]).layout.title.text == "No bills or paydays expected"
+
+
+def test_month_charts_use_one_axis_and_readable_month_labels():
+    from src.ui.charts import make_monthly_bar_chart, make_savings_rate_chart
+
+    monthly = [
+        {"month": "2026-08", "inflow": 100.0, "outflow": 50.0, "net": 50.0, "savings_rate": 50.0},
+        {"month": "2026-09", "inflow": 100.0, "outflow": 150.0, "net": -50.0, "savings_rate": -50.0},
+    ]
+    for figure in (make_monthly_bar_chart(monthly), make_savings_rate_chart(monthly)):
+        # Months stay categories (not a date axis) and keep the raw key for click-to-filter.
+        assert figure.layout.xaxis.type == "category"
+        assert list(figure.layout.xaxis.ticktext) == ["Aug 2026", "Sep 2026"]
+        assert list(figure.data[0].x) == ["2026-08", "2026-09"]
+        assert "yaxis2" not in figure.layout
+    rate = make_savings_rate_chart(monthly)
+    assert list(rate.data[0].text) == ["50%", "-50%"]
+    assert rate.data[0].marker.color[0] != rate.data[0].marker.color[1]
+
+
+def test_daily_chart_keeps_ordinary_days_readable_next_to_a_rent_payment():
+    from datetime import timedelta
+    from src.ui.charts import make_daily_spending_chart
+
+    days = [{"date": date(2026, 9, 1) + timedelta(days=index), "spend": 20.0 + index, "rolling_7": 25.0}
+            for index in range(20)]
+    assert make_daily_spending_chart(days).layout.yaxis.range is None
+    days[3]["spend"] = 1650.0
+    clipped = make_daily_spending_chart(days)
+    assert clipped.layout.yaxis.range[1] < 200
+    assert [note.text for note in clipped.layout.annotations] == ["▲ $1,650"]
+
+
+def test_donut_folds_small_categories_into_other():
+    figure = make_category_donut_chart({f"Category {index}": 100.0 - index for index in range(9)})
+    assert len(figure.data[0].labels) == 6
+    assert figure.data[0].labels[-1] == "Other"
+    assert sum(figure.data[0].values) == sum(100.0 - index for index in range(9))
+
+
+def test_heatmaps_label_cells_and_follow_the_theme():
+    from src.ui.charts import make_budget_history_chart, make_category_heatmap
+
+    rows = [{"month": "2026-08", "category": "Dining", "amount": 40.0},
+            {"month": "2026-09", "category": "Housing", "amount": 900.0}]
+    light, dark = make_category_heatmap(rows), make_category_heatmap(rows, dark=True)
+    assert list(light.data[0].y) == ["Housing", "Dining"]
+    assert [note.text for note in light.layout.annotations] == ["–", "$900", "$40", "–"]
+    assert light.data[0].colorscale != dark.data[0].colorscale
+    # Labels flip between black and white with the fill behind them.
+    assert {note.font.color for note in light.layout.annotations} == {"#000000", "#FFFFFF"}
+    budget = make_budget_history_chart(
+        [{"category": "Dining", "month": "2026-09", "spent": 150.0, "limit": 100.0, "ratio": 150.0}])
+    assert budget.layout.annotations[0].text == "150%"
+
+
+def test_takeaways_say_what_each_chart_shows():
+    from src.ui import charts
+
+    monthly = [
+        {"month": "2026-08", "inflow": 1000.0, "outflow": 400.0, "net": 600.0, "savings_rate": 60.0},
+        {"month": "2026-09", "inflow": 1000.0, "outflow": 1200.0, "net": -200.0, "savings_rate": -20.0},
+    ]
+    assert charts.cash_flow_takeaway(monthly) == (
+        "More came in than went out in 1 of 2 months. Best month: Aug 2026 (+$600).")
+    assert charts.cash_flow_takeaway(monthly[1:]) == "In Sep 2026 you spent $200 more than came in."
+    assert charts.savings_rate_takeaway(monthly) == (
+        "In Sep 2026 you spent 20% more than you earned. Your average across 2 months is 20%.")
+    assert charts.category_takeaway([{"category": "Housing", "amount": 750.0}, {"category": "Dining", "amount": 250.0}]) == (
+        "Housing is your biggest category: $750, 75% of spending.")
+    assert charts.running_total_takeaway([{"date": date(2026, 9, 1), "pnl": Decimal("-30")}]) == (
+        "Across these dates, $30 more went out than came in.")
+    assert charts.merchant_takeaway([{"merchant": "Cafe", "amount": 10.0, "share": 40.0}]).startswith("Cafe is where")
+    assert charts.week_of_month_takeaway([
+        {"bucket": "Days 1–7", "average_per_day": 90.0}, {"bucket": "Days 8–14", "average_per_day": 20.0},
+    ]) == "Days 1–7 is your most expensive stretch, at $90 a day."
+    assert charts.fixed_flexible_takeaway([{"month": "2026-09", "fixed": 75.0, "flexible": 25.0}]).startswith("75% of")
+    comparisons = [{"label": "Aug 2026", "categories": {"Dining": 100.0, "Fuel": 50.0}},
+                   {"label": "Sep 2026", "categories": {"Dining": 140.0, "Fuel": 20.0}}]
+    assert charts.comparison_takeaway(comparisons) == "Biggest increase: Dining (+$40). Biggest drop: Fuel (-$30)."
+    for empty in (charts.cash_flow_takeaway, charts.category_takeaway, charts.savings_rate_takeaway,
+                  charts.running_total_takeaway, charts.merchant_takeaway, charts.week_of_month_takeaway,
+                  charts.fixed_flexible_takeaway, charts.comparison_takeaway):
+        assert empty([]) == ""

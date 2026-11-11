@@ -165,3 +165,19 @@ def test_duplicates_ignore_split_parts_other_accounts_and_dismissed_groups():
     groups = AnalyticsService.duplicate_candidates(rows)
     assert [[item.id for item in group] for group in groups] == [["a", "c"]]
     assert AnalyticsService.duplicate_candidates(rows, dismissed={AnalyticsService.duplicate_group_key(groups[0])}) == []
+
+
+def test_unusual_expenses_leave_out_regular_bills_like_rent():
+    rows = []
+    for month in range(1, 7):
+        rows.append(make_transaction(f"rent{month}", date(2026, month, 1), -1650.0, "Maple Property Rent", "Housing"))
+        for day in (5, 12, 19):
+            rows.append(make_transaction(f"c{month}-{day}", date(2026, month, day), -6.0 - day / 10, f"Corner shop {day}", "Dining"))
+    rows.append(make_transaction("sofa", date(2026, 6, 20), -900.0, "Furniture Barn", "Shopping"))
+
+    assert [item.id for item in AnalyticsService.unusual_expenses(rows)] == ["sofa"]
+    # A short date range still recognizes rent from the longer history.
+    june = [item for item in rows if item.date.month == 6]
+    assert [item.id for item in AnalyticsService.unusual_expenses(june, rows)] == ["sofa"]
+    # Once the person says rent isn't a recurring bill, it counts again.
+    assert "rent6" in [item.id for item in AnalyticsService.unusual_expenses(june, rows, ["maple property rent"])]

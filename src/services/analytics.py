@@ -960,14 +960,32 @@ class AnalyticsService:
         return value + timedelta(days=max(round(cadence["interval_days"]), 1))
 
     @staticmethod
-    def unusual_expenses(transactions: List[Transaction]) -> List[Transaction]:
+    def unusual_expenses(
+        transactions: List[Transaction],
+        history: Optional[List[Transaction]] = None,
+        excluded: Iterable[str] = (),
+    ) -> List[Transaction]:
+        """Expenses far larger than a typical one, leaving out regular bills.
+
+        Rent is large every month, which makes it expected rather than unusual, so
+        charges that repeat on a schedule are skipped. ``history`` is the longer
+        record used to spot those; it defaults to ``transactions``.
+        """
         expenses = [transaction for transaction in transactions if transaction.amount < 0]
         if len(expenses) < 4:
             return []
         typical = median(abs(transaction.amount) for transaction in expenses)
         threshold = max(typical * 3, 100)
+        recurring_ids = {
+            item.id
+            for _, cluster in AnalyticsService._recurring_groups(history or transactions, excluded)
+            for item in cluster
+        }
         return sorted(
-            [transaction for transaction in expenses if abs(transaction.amount) >= threshold],
+            [
+                transaction for transaction in expenses
+                if abs(transaction.amount) >= threshold and transaction.id not in recurring_ids
+            ],
             key=lambda transaction: abs(transaction.amount),
             reverse=True,
         )[:5]
